@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0f172a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Copy Bot">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+    <title>Polymarket Copy Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+    <div x-data="dashboard()" x-init="init()" class="pb-24">
+
+        <!-- Header sticky -->
+        <header class="sticky top-0 z-30 bg-slate-950/90 backdrop-blur border-b border-slate-800 px-4 py-3">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 class="text-base font-bold">Polymarket Copy Bot</h1>
+                    <p class="text-xs text-slate-400 flex items-center gap-1">
+                        <span class="inline-block w-1.5 h-1.5 rounded-full"
+                              :class="loading ? 'bg-emerald-400 animate-pulse' : 'bg-emerald-500'"></span>
+                        <span x-show="!loading">en vivo · próx. en <span x-text="countdown"></span>s</span>
+                        <span x-show="loading" class="text-emerald-400">actualizando…</span>
+                        <span class="text-slate-600 mx-1">·</span>
+                        <span class="text-slate-500" x-text="lastUpdate"></span>
+                    </p>
+                </div>
+                <button @click="refresh(); loadChart()" class="p-2 -mr-2 rounded-lg active:bg-slate-800">
+                    <svg class="w-5 h-5" :class="loading && 'animate-spin'" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.582m0 0a8.003 8.003 0 01-15.356-2m15.356 2H15"/>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- TAB: HOME ---------- -->
+        <section x-show="tab==='home'" class="px-4 py-4 space-y-4">
+
+            <!-- KILL SWITCH banner -->
+            <div x-show="summary?.kill_switch?.active"
+                 class="bg-rose-900/40 border border-rose-700 rounded-2xl p-4">
+                <div class="flex items-start gap-3">
+                    <span class="text-3xl">⛔</span>
+                    <div class="flex-1">
+                        <p class="font-bold text-rose-300">Bot pausado por seguridad</p>
+                        <p class="text-xs text-rose-200/80 mt-1" x-text="summary?.kill_switch?.reason"></p>
+                        <p class="text-[10px] text-rose-300/70 mt-2">
+                            No se abrirán nuevas posiciones hasta intervención manual.
+                            Las abiertas siguen siendo monitoreadas (stop-loss activo).
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Capital usage bar -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-300">Capital del bot</h2>
+                    <span class="text-xs text-slate-500"
+                          x-text="fmtUsd(summary?.capital?.total_usdc ?? 100) + ' total'"></span>
+                </div>
+                <div class="space-y-2">
+                    <div class="flex justify-between items-baseline text-xs">
+                        <span class="text-slate-400">En posiciones abiertas</span>
+                        <strong class="text-slate-100"
+                                x-text="fmtUsd(summary?.capital?.in_open_positions_usdc ?? 0) + ' (' + (summary?.capital?.usage_pct ?? 0).toFixed(0) + '%)'"></strong>
+                    </div>
+                    <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                        <div class="h-full transition-all"
+                             :class="(summary?.capital?.usage_pct ?? 0) > 80 ? 'bg-amber-500' : 'bg-indigo-500'"
+                             :style="`width: ${Math.min(100, summary?.capital?.usage_pct ?? 0)}%`"></div>
+                    </div>
+                    <div class="flex justify-between items-baseline text-xs">
+                        <span class="text-slate-400">Disponible para nuevas copias</span>
+                        <strong class="text-emerald-400" x-text="fmtUsd(summary?.capital?.available_usdc ?? 0)"></strong>
+                    </div>
+                </div>
+                <div class="mt-3 pt-3 border-t border-slate-800 grid grid-cols-3 gap-2 text-xs">
+                    <div>
+                        <p class="text-slate-500">Hoy PnL</p>
+                        <p :class="(summary?.today?.pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                           class="font-bold" x-text="fmtUsdSigned(summary?.today?.pnl_usdc ?? 0)"></p>
+                    </div>
+                    <div>
+                        <p class="text-slate-500">Hoy wins</p>
+                        <p class="text-emerald-400 font-bold" x-text="summary?.today?.wins ?? 0"></p>
+                    </div>
+                    <div>
+                        <p class="text-slate-500">Hoy losses</p>
+                        <p class="text-rose-400 font-bold" x-text="summary?.today?.losses ?? 0"></p>
+                    </div>
+                </div>
+                <p class="text-[10px] text-slate-500 mt-2">
+                    Si el PnL del día cae a
+                    <span x-text="fmtUsdSigned(-(summary?.capital?.total_usdc ?? 100) * (summary?.capital?.kill_threshold_pct ?? 10) / 100)"></span>
+                    el bot se pausa automáticamente.
+                </p>
+            </div>
+
+            <!-- Big stats grid -->
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-gradient-to-br from-emerald-900/40 to-emerald-950 border border-emerald-800/50 rounded-2xl p-4">
+                    <p class="text-xs text-emerald-300 uppercase tracking-wide">Wins</p>
+                    <p class="text-3xl font-bold text-emerald-400 mt-1" x-text="summary?.paper?.wins ?? 0"></p>
+                    <p class="text-xs text-slate-400 mt-1">trades positivas</p>
+                </div>
+                <div class="bg-gradient-to-br from-rose-900/40 to-rose-950 border border-rose-800/50 rounded-2xl p-4">
+                    <p class="text-xs text-rose-300 uppercase tracking-wide">Losses</p>
+                    <p class="text-3xl font-bold text-rose-400 mt-1" x-text="summary?.paper?.losses ?? 0"></p>
+                    <p class="text-xs text-slate-400 mt-1">trades negativas</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 col-span-2">
+                    <p class="text-xs text-slate-400 uppercase tracking-wide">Ganancia neta</p>
+                    <div class="flex items-baseline gap-2 mt-1">
+                        <p class="text-3xl font-bold"
+                           :class="(summary?.paper?.realized_pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                           x-text="fmtUsdSigned(summary?.paper?.realized_pnl_usdc ?? 0)"></p>
+                        <span class="text-sm text-slate-400"
+                              x-text="'(' + fmtPctSigned(summary?.paper?.roi_pct ?? 0) + ')'"></span>
+                    </div>
+                    <p class="text-xs text-slate-400 mt-1">
+                        sobre <strong class="text-slate-200" x-text="fmtUsd(summary?.paper?.closed_invested_usdc ?? 0)"></strong>
+                        invertidos en trades cerrados · win rate
+                        <strong class="text-slate-200" x-text="fmtPct(summary?.paper?.win_rate ?? 0)"></strong>
+                    </p>
+                </div>
+            </div>
+
+            <!-- Capital comprometido (explica de dónde sale el PnL) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-300 mb-3">¿De qué se trata este número?</h2>
+                <div class="space-y-2 text-xs">
+                    <div class="flex justify-between items-baseline">
+                        <span class="text-slate-400">Cada trade copiado, el bot apuesta de base</span>
+                        <strong class="text-slate-100 text-base" x-text="fmtUsd(summary?.paper?.base_bet_usdc ?? 5)"></strong>
+                    </div>
+                    <div class="flex justify-between items-baseline">
+                        <span class="text-slate-400">Ya está jugando ahora mismo (abiertas)</span>
+                        <strong class="text-slate-100 text-base" x-text="fmtUsd(summary?.paper?.open_invested_usdc ?? 0)"></strong>
+                    </div>
+                    <div class="flex justify-between items-baseline">
+                        <span class="text-slate-400">Ya jugó en trades terminados (cerradas)</span>
+                        <strong class="text-slate-100 text-base" x-text="fmtUsd(summary?.paper?.closed_invested_usdc ?? 0)"></strong>
+                    </div>
+                    <div class="border-t border-slate-800 pt-2 flex justify-between items-baseline">
+                        <span class="text-slate-300">Resultado de las cerradas</span>
+                        <strong class="text-base"
+                                :class="(summary?.paper?.realized_pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                                x-text="fmtUsdSigned(summary?.paper?.realized_pnl_usdc ?? 0)"></strong>
+                    </div>
+                </div>
+                <p class="text-[11px] text-slate-500 leading-relaxed mt-3 pt-3 border-t border-slate-800">
+                    💡 Esto es <strong class="text-slate-300">paper trading</strong> — simulación con dinero ficticio para validar
+                    la estrategia sin riesgo. El bot empezó con apuestas de
+                    <span x-text="fmtUsd(summary?.paper?.base_bet_usdc ?? 5)"></span> por cada copia. Cuando un trader gana,
+                    el bot le sube el size; cuando pierde, lo baja. Después de 5 pérdidas seguidas, lo deja de copiar.
+                </p>
+            </div>
+
+            <!-- Gráfico PnL acumulado -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-300">PnL acumulado</h2>
+                    <div class="flex gap-1 text-[11px]">
+                        <button @click="chartBucket='hour'; loadChart()"
+                                :class="chartBucket==='hour' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400'"
+                                class="px-2 py-1 rounded">Hora</button>
+                        <button @click="chartBucket='day'; loadChart()"
+                                :class="chartBucket==='day' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400'"
+                                class="px-2 py-1 rounded">Día</button>
+                    </div>
+                </div>
+                <div class="h-48 relative">
+                    <canvas id="pnlChart"></canvas>
+                    <div x-show="!hasChartData" class="absolute inset-0 flex items-center justify-center text-xs text-slate-500">
+                        Aún sin trades cerrados. Aparecerá cuando los wallets copiados hagan SELL.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Aprendizaje del bot -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-300">Auto-aprendizaje</h2>
+                    <span class="text-xs text-slate-500" x-text="(summary?.copying?.active ?? 0) + ' copiando'"></span>
+                </div>
+                <div class="grid grid-cols-3 gap-2 mb-3">
+                    <div class="bg-slate-800/50 rounded-lg p-3 text-center">
+                        <p class="text-2xl font-bold text-emerald-400" x-text="summary?.learning?.size_increases ?? 0"></p>
+                        <p class="text-[11px] text-slate-400 mt-1">↑ size up</p>
+                    </div>
+                    <div class="bg-slate-800/50 rounded-lg p-3 text-center">
+                        <p class="text-2xl font-bold text-amber-400" x-text="summary?.learning?.size_decreases ?? 0"></p>
+                        <p class="text-[11px] text-slate-400 mt-1">↓ size down</p>
+                    </div>
+                    <div class="bg-slate-800/50 rounded-lg p-3 text-center">
+                        <p class="text-2xl font-bold text-rose-400" x-text="summary?.learning?.drops ?? 0"></p>
+                        <p class="text-[11px] text-slate-400 mt-1">⊘ drops</p>
+                    </div>
+                </div>
+                <p class="text-[11px] text-slate-500 leading-relaxed">
+                    El bot ajusta el sizing por trader en cada cierre: WIN → ×1.05 (cap 2.0), LOSS → ×0.85 (floor 0.1).
+                    5 pérdidas seguidas → drop automático.
+                </p>
+            </div>
+
+            <!-- Eventos recientes de aprendizaje -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-300">Lo que hizo el bot</h2>
+                    <span class="text-xs text-slate-500" x-text="learning.length + ' acciones'"></span>
+                </div>
+                <div class="divide-y divide-slate-800 max-h-96 overflow-y-auto">
+                    <template x-for="ev in learning.slice(0,20)" :key="ev.id">
+                        <div class="px-4 py-3">
+                            <div class="flex items-start gap-3">
+                                <span class="text-2xl leading-none" x-text="evIcon(ev.event_type)"></span>
+                                <div class="flex-1 min-w-0">
+                                    <p class="text-sm text-slate-200" x-text="evMessage(ev)"></p>
+                                    <p class="text-xs text-slate-400 mt-0.5" x-text="evDetail(ev)"></p>
+                                    <p class="text-[10px] text-slate-500 mt-1">
+                                        <span x-text="shortWallet(ev.wallet)"></span> ·
+                                        <span x-text="timeAgo(ev.created_at)"></span>
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="learning.length === 0">
+                        <div class="px-4 py-8 text-center text-sm text-slate-500">
+                            Aún sin actividad. Aparecerá cuando los traders copiados cierren posiciones.
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB: COPYING ---------- -->
+        <section x-show="tab==='copying'" class="px-4 py-4 space-y-3">
+            <div class="flex items-center justify-between mb-1">
+                <h2 class="text-base font-semibold">Traders copiados</h2>
+                <button @click="runSelect()" class="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg font-medium">
+                    Re-seleccionar top
+                </button>
+            </div>
+            <p class="text-xs text-slate-400 mb-3">
+                El bot copia los <span class="text-slate-200 font-medium" x-text="copying.length"></span> traders con mejor score que cumplen los filtros.
+                Cada uno tiene su propio multiplicador de tamaño que se ajusta automáticamente.
+            </p>
+
+            <template x-for="t in copying" :key="t.wallet">
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <div class="flex items-start justify-between gap-2 mb-2">
+                        <div class="min-w-0 flex-1">
+                            <p class="font-mono text-xs text-slate-400 truncate" x-text="t.wallet"></p>
+                            <p class="text-base font-bold mt-1">
+                                <span class="text-emerald-400" x-text="fmtUsd(t.realized_pnl_usdc)"></span>
+                                <span class="text-xs text-slate-400 font-normal ml-2" x-text="'win ' + fmtPct(t.win_rate)"></span>
+                            </p>
+                        </div>
+                        <div class="text-right shrink-0">
+                            <p class="text-xs text-slate-400">score</p>
+                            <p class="text-lg font-bold text-indigo-400" x-text="(t.score ?? 0).toFixed(2)"></p>
+                        </div>
+                    </div>
+
+                    <div class="bg-indigo-950/40 border border-indigo-900/50 rounded-lg px-3 py-2 mb-3">
+                        <p class="text-[10px] uppercase tracking-wide text-indigo-300 font-semibold mb-0.5">Por qué lo copia</p>
+                        <p class="text-xs text-slate-200" x-text="t.reason"></p>
+                    </div>
+
+                    <div class="grid grid-cols-4 gap-2 text-center text-xs">
+                        <div>
+                            <p class="text-slate-500">size×</p>
+                            <p class="font-bold" x-text="(t.sizing_mult ?? 1).toFixed(2)"></p>
+                        </div>
+                        <div>
+                            <p class="text-slate-500">wins</p>
+                            <p class="font-bold text-emerald-400" x-text="t.paper_wins ?? 0"></p>
+                        </div>
+                        <div>
+                            <p class="text-slate-500">losses</p>
+                            <p class="font-bold text-rose-400" x-text="t.paper_losses ?? 0"></p>
+                        </div>
+                        <div>
+                            <p class="text-slate-500">abiertas</p>
+                            <p class="font-bold" x-text="t.paper_open ?? 0"></p>
+                        </div>
+                    </div>
+                </div>
+            </template>
+
+            <template x-if="copying.length === 0 && !loading">
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center">
+                    <p class="text-sm text-slate-400">Ningún trader seleccionado todavía.</p>
+                    <button @click="runSelect()" class="mt-3 text-xs px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg font-medium">
+                        Ejecutar selección
+                    </button>
+                </div>
+            </template>
+        </section>
+
+        <!-- TAB: TOP ---------- -->
+        <section x-show="tab==='top'" class="px-4 py-4 space-y-2">
+            <h2 class="text-base font-semibold mb-3">Top 50 del leaderboard</h2>
+            <template x-for="(t, i) in topTraders" :key="t.wallet">
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center gap-3">
+                    <div class="text-xs font-bold text-slate-500 w-6 text-center" x-text="'#' + (i+1)"></div>
+                    <div class="min-w-0 flex-1">
+                        <p class="font-mono text-xs text-slate-400 truncate" x-text="shortWallet(t.wallet)"></p>
+                        <p class="text-sm font-medium">
+                            <span class="text-emerald-400" x-text="fmtUsd(t.realized_pnl_usdc)"></span>
+                            <span class="text-xs text-slate-400 ml-2" x-text="'win ' + fmtPct(t.win_rate)"></span>
+                        </p>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <p class="text-[10px] text-slate-500">score</p>
+                        <p class="text-base font-bold text-indigo-400" x-text="(t.score ?? 0).toFixed(2)"></p>
+                    </div>
+                </div>
+            </template>
+        </section>
+
+        <!-- TAB: MARKETS ---------- -->
+        <section x-show="tab==='markets'" class="px-4 py-4 space-y-2">
+            <h2 class="text-base font-semibold mb-3">Mercados con más volumen</h2>
+            <template x-for="m in markets" :key="m.condition_id">
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                    <p class="text-sm font-medium leading-tight mb-2" x-text="m.question"></p>
+                    <div class="flex items-center gap-3 text-xs text-slate-400">
+                        <span>vol <strong class="text-slate-200" x-text="fmtUsd(m.volume)"></strong></span>
+                        <span>liq <strong class="text-slate-200" x-text="fmtUsd(m.liquidity)"></strong></span>
+                    </div>
+                </div>
+            </template>
+        </section>
+
+        <!-- Bottom nav (mobile) -->
+        <nav class="fixed bottom-0 inset-x-0 bg-slate-950/95 backdrop-blur border-t border-slate-800 grid grid-cols-4 z-30 pb-[env(safe-area-inset-bottom)]">
+            <button @click="tab='home'" :class="tab==='home' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
+                <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
+                Resumen
+            </button>
+            <button @click="tab='copying'" :class="tab==='copying' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
+                <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                Copiando
+            </button>
+            <button @click="tab='top'" :class="tab==='top' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
+                <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>
+                Top
+            </button>
+            <button @click="tab='markets'" :class="tab==='markets' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
+                <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/></svg>
+                Mercados
+            </button>
+        </nav>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
