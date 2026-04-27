@@ -1,0 +1,22 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+    command: python copybot.py serve --port 8000
+    restart: unless-stopped
+
+  runner:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+    command: python copybot.py run-paper
+    restart: unless-stopped
+    depends_on:
+      - server
