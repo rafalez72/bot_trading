@@ -10,6 +10,9 @@ services:
       - ./.env:/app/.env:ro
     command: python copybot.py serve --port 8000
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
 
   runner:
     image: ghcr.io/rafalez72/bot_trading:latest
@@ -22,3 +25,6 @@ services:
     restart: unless-stopped
     depends_on:
       - server
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
