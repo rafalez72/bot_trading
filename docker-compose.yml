@@ -1,6 +1,7 @@
 services:
   server:
-    build: .
+    image: ghcr.io/rafalez72/bot_trading:latest
+    pull_policy: always
     ports:
       - "8000:8000"
     volumes:
@@ -11,7 +12,8 @@ services:
     restart: unless-stopped
 
   runner:
-    build: .
+    image: ghcr.io/rafalez72/bot_trading:latest
+    pull_policy: always
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
