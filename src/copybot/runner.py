@@ -42,6 +42,19 @@ console = Console()
 SETTLE_EVERY_N_CYCLES = max(1, 600 // max(COPY_POLL_SECONDS, 1))  # cada ~10 min
 
 
+def _git_short_sha() -> str | None:
+    """Devuelve el hash corto del commit actual si estamos en un repo git."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return out.decode().strip() or None
+    except Exception:
+        return None
+
+
 def _get_cursor(wallet: str) -> int | None:
     with db() as conn:
         r = conn.execute(
@@ -248,6 +261,18 @@ async def run_loop(*, once: bool = False) -> None:
             "[red]Las órdenes se mandan al CLOB de Polymarket. "
             "Esto consume USDC reales si dry_run=false.[/red]"
         )
+
+    # Instalar el handler de errores → Telegram (rate-limited)
+    try:
+        from src.copybot.notifier import install_error_handler, startup
+        install_error_handler()
+        # Notif de arranque (incluye commit si está disponible vía env)
+        import os
+        commit = os.getenv("GIT_COMMIT_SHORT") or _git_short_sha()
+        startup(mode=TRADEBOOK_MODE, commit=commit)
+    except Exception as e:
+        log.warning("no se pudo instalar telegram error handler: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

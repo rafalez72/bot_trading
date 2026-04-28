@@ -37,9 +37,12 @@ MAX_LEN = 4000  # límite real es 4096, dejamos margen
 # Pedido del usuario: solo gain/loss + kill_switch (safety override).
 # Live notifs (live_open, live_close) están activas por default en LIVE_MODE
 # para que el usuario sepa SIEMPRE qué pasa con su plata real.
+# log_error: errores ERROR+ del logger se mandan a Telegram con rate-limit.
+# startup: aviso cuando el runner arranca (post-restart).
 ENABLED_NOTIFICATIONS = {
     "gain", "loss", "kill_switch",
     "live_open", "live_close", "live_error",
+    "log_error", "startup",
 }
 
 
@@ -196,6 +199,92 @@ def live_error(*, stage: str, error: str) -> None:
         f"Stage: `{stage}`\n"
         f"Error: {error[:300]}"
     )
+
+
+# ---------- Startup + error log forwarder ----------
+
+def startup(*, mode: str, commit: str | None = None) -> None:
+    """Notif cuando el runner arranca (post-restart o boot)."""
+    if "startup" not in ENABLED_NOTIFICATIONS:
+        return
+    txt = f"🤖 *Bot iniciado* — modo `{mode}`"
+    if commit:
+        txt += f"\nCommit: `{commit}`"
+    send(txt, silent=True)
+
+
+# Rate limiter en memoria: (key) -> last_sent_unix.
+# Evita spam si se repite el mismo error N veces seguidas.
+_THROTTLE_WINDOW_SEC = 300  # 5 min
+_last_sent: dict[str, float] = {}
+
+
+def _throttle_key(record_msg: str, logger_name: str) -> str:
+    """Key estable: primeros 80 chars del msg + nombre del logger."""
+    return f"{logger_name}:{record_msg[:80]}"
+
+
+class TelegramErrorHandler(logging.Handler):
+    """Logging handler que manda ERROR+ a Telegram con rate-limit.
+
+    Se instala una vez en el runner (no en imports de módulos), para evitar
+    duplicados. Rate-limita por (logger_name, mensaje_truncado): mismo error
+    repetido en <5 min no genera más notifs.
+    """
+
+    def __init__(self, level: int = logging.ERROR) -> None:
+        super().__init__(level=level)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "log_error" not in ENABLED_NOTIFICATIONS:
+            return
+        # Filtros: ignorar warnings frecuentes que no son críticos
+        msg = record.getMessage()
+        if any(skip in msg.lower() for skip in (
+            "polling", "name or service not known", "timeout",
+        )):
+            return
+
+        import time
+        key = _throttle_key(msg, record.name)
+        now = time.time()
+        last = _last_sent.get(key, 0)
+        if now - last < _THROTTLE_WINDOW_SEC:
+            return
+        _last_sent[key] = now
+
+        # Texto: nivel + logger + mensaje + traceback si hay
+        level = record.levelname
+        body = (
+            f"🚨 *Error en bot*\n"
+            f"Nivel: `{level}`\n"
+            f"Origen: `{record.name}`\n"
+            f"```\n{msg[:600]}\n```"
+        )
+        if record.exc_info:
+            import traceback
+            tb = "".join(traceback.format_exception(*record.exc_info))
+            body += f"\n```\n{tb[-400:]}\n```"
+        try:
+            send(body)
+        except Exception:
+            pass  # nunca dejamos que un fallo de Telegram rompa el logger
+
+
+def install_error_handler(level: int = logging.ERROR) -> TelegramErrorHandler:
+    """Instala el handler en el root logger. Idempotente.
+
+    Llamar una vez al inicio del runner. Devuelve el handler instalado
+    (útil si después querés cambiar el nivel o desinstalarlo).
+    """
+    root = logging.getLogger()
+    # Si ya hay uno instalado, lo reusamos
+    for h in root.handlers:
+        if isinstance(h, TelegramErrorHandler):
+            return h
+    handler = TelegramErrorHandler(level=level)
+    root.addHandler(handler)
+    return handler
 
 
 def test_message() -> bool:
