@@ -109,6 +109,99 @@ def cmd_run_paper(args: argparse.Namespace) -> None:
     asyncio.run(run_loop(once=args.once))
 
 
+def cmd_run_live(args: argparse.Namespace) -> None:
+    """Loop con plata real (Fase 5).
+
+    Activa LIVE_MODE=true en runtime y arranca el runner. Si --dry-run,
+    fuerza LIVE_DRY_RUN=true (las ordenes se loguean pero no se mandan).
+    """
+    import os
+    os.environ["LIVE_MODE"] = "true"
+    if args.dry_run:
+        os.environ["LIVE_DRY_RUN"] = "true"
+    elif args.real:
+        os.environ["LIVE_DRY_RUN"] = "false"
+    # else: respeta lo que esté en .env
+
+    # Importar después de setear el env para que tradebook elija live
+    from src.copybot.runner import run_loop
+    from src.config import LIVE_DRY_RUN as _DRY
+
+    if not _DRY and not args.yes:
+        console.print(
+            "\n[bold red]⚠️  ESTÁS POR EJECUTAR ÓRDENES REALES CON USDC ⚠️[/bold red]\n"
+        )
+        console.print(
+            "Esto va a colocar órdenes en Polymarket usando tu wallet.\n"
+            "[bold]Re-lanzá con --yes para confirmar, o con --dry-run para simular.[/bold]"
+        )
+        return
+
+    asyncio.run(run_loop(once=args.once))
+
+
+def cmd_check_live(_args: argparse.Namespace) -> None:
+    """Verifica que las credenciales de Polymarket funcionen sin mandar órdenes."""
+    from src.polymarket.clob_client import health_check
+
+    res = health_check()
+    if not res.get("ok"):
+        console.print(
+            f"[red]✗ Health check falló en stage='{res.get('stage')}':[/red] "
+            f"{res.get('error')}"
+        )
+        console.print(
+            "\nConfiguración requerida en .env:\n"
+            "  POLYMARKET_API_KEY=...\n"
+            "  POLYMARKET_API_SECRET=...\n"
+            "  POLYMARKET_API_PASSPHRASE=...\n"
+            "  POLYMARKET_FUNDER_ADDRESS=0x...\n"
+            "  POLYMARKET_SIG_TYPE=2  (default; 0 si usás EOA)\n\n"
+            "Para generar las API creds: "
+            "[cyan]python scripts/generate_api_creds.py[/cyan]"
+        )
+        return
+
+    console.print("[green]✓ CLOB conectado[/green]")
+    t = Table(show_header=False)
+    t.add_column(style="cyan", no_wrap=True)
+    t.add_column(style="bold")
+    t.add_row("Funder wallet", res["funder"])
+    t.add_row("Balance USDC", f"${res['balance_usdc']:.2f}")
+    t.add_row("Sig type", str(res["sig_type"]))
+    t.add_row("Host", res["host"])
+    console.print(t)
+
+
+def cmd_live_status(_args: argparse.Namespace) -> None:
+    """Resumen de live_trades."""
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) as n, ROUND(SUM(pnl_usdc),2) as pnl,
+                   SUM(dry_run) as drys
+            FROM live_trades GROUP BY status
+            """
+        ).fetchall()
+    if not rows:
+        console.print("[yellow]Sin live_trades todavía.[/yellow]")
+        return
+    t = Table(title="Live trades por estado")
+    t.add_column("Estado", style="cyan")
+    t.add_column("N", justify="right")
+    t.add_column("PnL USDC", justify="right")
+    t.add_column("Dry-run", justify="right")
+    for r in rows:
+        t.add_row(
+            r["status"],
+            str(r["n"]),
+            f"${(r['pnl'] or 0):+.2f}",
+            str(r["drys"] or 0),
+        )
+    console.print(t)
+
+
 def cmd_settle_paper(_args: argparse.Namespace) -> None:
     from src.copybot.paper import settle_resolved
 
@@ -414,6 +507,38 @@ def main() -> None:
     p_run = sub.add_parser("run-paper", help="Loop de paper-trading (polling)")
     p_run.add_argument("--once", action="store_true", help="Una sola pasada y sale")
     p_run.set_defaults(func=cmd_run_paper)
+
+    p_live = sub.add_parser(
+        "run-live",
+        help="Loop con plata real en Polymarket CLOB (Fase 5)",
+    )
+    p_live.add_argument("--once", action="store_true")
+    p_live.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simula órdenes sin mandarlas (testing)",
+    )
+    p_live.add_argument(
+        "--real",
+        action="store_true",
+        help="Fuerza el envío real de órdenes (override de LIVE_DRY_RUN del .env)",
+    )
+    p_live.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirma que querés mandar órdenes reales (no preguntar)",
+    )
+    p_live.set_defaults(func=cmd_run_live)
+
+    sub.add_parser(
+        "check-live",
+        help="Health check del CLOB de Polymarket (verifica creds + balance)",
+    ).set_defaults(func=cmd_check_live)
+
+    sub.add_parser(
+        "live-status",
+        help="Resumen de live_trades (real + dry-run)",
+    ).set_defaults(func=cmd_live_status)
 
     sub.add_parser(
         "settle-paper",

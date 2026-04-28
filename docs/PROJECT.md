@@ -112,6 +112,7 @@ polymarket_copybot/
 | `trader_metrics` | Métricas calculadas: PnL, ROI, Sharpe, win_rate, drawdown, score |
 | `copy_subscriptions` | Traders que el bot está copiando (active / paused / dropped) + sizing_mult |
 | `paper_trades` | Trades simulados del bot (entry/exit/pnl/status/exit_reason/asset) |
+| `live_trades` | Trades **reales** en Polymarket CLOB (Fase 5). Mirror de paper_trades + token_id, order_id, tx_hash, fees, dry_run flag |
 | `learning_events` | Log de cada decisión de aprendizaje (size_up, size_down, drop, etc.) |
 | `category_perf` | Performance acumulada por categoría de mercado + status (allowed/blocked) |
 | `cluster_perf` | Performance por cluster (K-means de wallets) |
@@ -201,6 +202,12 @@ python copybot.py discover-now               # cycle completo de discovery
 # Paper trading
 python copybot.py run-paper [--once]         # loop de paper trading
 python copybot.py settle-paper               # liquidar mercados resueltos
+
+# Live trading — Fase 5 (plata real)
+python copybot.py check-live                 # health check del CLOB de Polymarket
+python copybot.py run-live --dry-run         # loop con orden simulada (sin gastar)
+python copybot.py run-live --real --yes      # ÓRDENES REALES con USDC
+python copybot.py live-status                # resumen de live_trades
 
 # Backtest
 python copybot.py backtest [--hours 168]     # replay histórico
@@ -412,7 +419,7 @@ ssh melina@100.98.174.60 "cat ~/polymarket_copybot/logs/deploy.log"
 7. **Cloudflare Tunnel temporal cambia URL** al reiniciar `cloudflared`. Para fija: Cloudflare account + dominio.
 8. **Trader rehabilitado**: si dropped trader vuelve a pasar filtros, se reactiva automáticamente (status='active'); el bandit recuerda su mala racha vía sum_reward negativo, así que arranca con sizing reducido.
 9. **No hay ML real con features** (LightGBM/etc.) — pateado a Fase 6c, requiere ≥200 closes acumulados (~30 días).
-10. **No hay execution path real** — bot es 100% paper. Fase 5 sin construir.
+10. ~~No hay execution path real — bot es 100% paper. Fase 5 sin construir.~~ **CONSTRUIDO** (2026-04-28). Pero default es `LIVE_MODE=false` y `LIVE_DRY_RUN=true`. Para activar requiere setup manual del usuario (API creds + USDC en proxy wallet). Settlement es semi-manual: el bot marca el trade como settled pero el "Redeem" de las shares ganadoras hay que hacerlo desde polymarket.com (1 click).
 
 ---
 
@@ -427,8 +434,68 @@ ssh melina@100.98.174.60 "cat ~/polymarket_copybot/logs/deploy.log"
 | 🟡 Media | Notif "trader rehabilitado" cuando dropped vuelve | 15 min |
 | 🟢 Baja | Más fuentes de discovery (leaderboard público) | 2-3h |
 | 🟢 Baja | Fase 6c: feature pipeline + LightGBM (cuando haya 200+ closes) | 2-3 días |
-| 🟢 Baja | Fase 5: execution real (API key + wallet + signing) | 3-5 días |
+| 🟢 Baja | ~~Fase 5: execution real~~ → **construida 2026-04-28**. Falta setup del usuario (API creds + USDC en cuenta) y validación con dry-run + 1 trade real chico antes de activar normal. |
 | 🟢 Baja | Compounding (cuando 30+ días positive) | 1h |
+
+---
+
+## 13.bis Fase 5 — Live Trading (módulo construido, NO activo)
+
+### Arquitectura
+
+El bot tiene un dispatcher en `src/copybot/tradebook.py` que elige paper o live según `LIVE_MODE`:
+
+```
+runner.py / risk.py
+       │
+       ▼
+tradebook.py ──► (LIVE_MODE=false) ──► paper.py    ──► tabla paper_trades
+                  (LIVE_MODE=true)  ──► executor.py ──► tabla live_trades + CLOB
+```
+
+`executor.py` reusa toda la lógica de validación de `paper.py` (kill switch, suscripción, duplicados, market caps, category blocks, policy, extreme price). Solo cambia: el size base (LIVE_BASE_USDC), el cap global (LIVE_CAPITAL_USDC), la persistencia (live_trades) y el "execution" (orden real al CLOB vs INSERT).
+
+### Setup inicial (una vez)
+
+1. **Crear cuenta en Polymarket** (polymarket.com → email signup)
+2. **Cargar USDC** (≥$50) en la proxy wallet (MoonPay o transfer desde exchange)
+3. **Aprobar contratos** desde la UI de Polymarket (USDC + Conditional Tokens)
+4. **Generar API creds**: `python scripts/generate_api_creds.py`
+   - Pide tu private key SOLO en memoria (no se guarda)
+   - Imprime API_KEY, API_SECRET, API_PASSPHRASE
+5. **Pegar al .env de Lenovo**:
+   ```
+   POLYMARKET_API_KEY=...
+   POLYMARKET_API_SECRET=...
+   POLYMARKET_API_PASSPHRASE=...
+   POLYMARKET_FUNDER_ADDRESS=0x... (proxy wallet)
+   POLYMARKET_SIG_TYPE=2
+   LIVE_MODE=true
+   LIVE_DRY_RUN=true   # ← arrancar SIEMPRE con dry-run primero
+   ```
+
+### Flujo de validación recomendado
+
+1. `python copybot.py check-live` → verifica creds + balance
+2. `python copybot.py run-live --dry-run` → corre 24h en dry-run, mira `live_status`
+3. Si dry-run muestra trades sanos → cambiar `LIVE_DRY_RUN=false` en .env
+4. `python copybot.py run-live --real --yes` → ¡plata real!
+
+### Modos de ejecución
+
+| Modo | LIVE_MODE | LIVE_DRY_RUN | Comportamiento |
+|------|-----------|--------------|----------------|
+| Paper | false | (irrelevante) | INSERT en paper_trades, no toca CLOB |
+| Live dry-run | true | true | Loguea órdenes + INSERT en live_trades con dry_run=1, NO toca CLOB |
+| Live real | true | false | **Manda órdenes al CLOB, gasta USDC** |
+
+### Settlement
+
+Para mercados resueltos, `settle_resolved()` marca los live_trades como `settled_win/loss` con el payout teórico. **NO redime las shares automáticamente** — eso requiere llamar al contrato CTF de Polygon. El usuario debe hacer el "Redeem" desde polymarket.com (1 click).
+
+### Notificaciones live (Telegram)
+
+Activadas por default en LIVE_MODE: `live_open`, `live_close`, `live_error`. Incluyen tx_hash con link a Polygonscan cuando aplica.
 
 ---
 

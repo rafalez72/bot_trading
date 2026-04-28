@@ -18,11 +18,16 @@ from src.config import (
     BOT_CAPITAL_USDC,
     DAILY_KILL_SWITCH_PCT,
     DATA_API,
+    LIVE_CAPITAL_USDC,
+    LIVE_MODE,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
 )
-from src.copybot.paper import force_close
+from src.copybot.tradebook import TABLE as TRADES_TABLE, force_close
 from src.db.schema import db, tx
+
+# Cap efectivo según modo: usado por kill_switch para calcular el threshold.
+EFFECTIVE_CAPITAL_USDC = LIVE_CAPITAL_USDC if LIVE_MODE else BOT_CAPITAL_USDC
 
 log = logging.getLogger(__name__)
 
@@ -71,18 +76,17 @@ def kill_switch_status() -> dict:
 def check_kill_switch() -> bool:
     """Recalcula. Devuelve True si quedó (o sigue) activo."""
     today_start = int(time.time()) - 86400  # rolling 24h
+    # Lee de la tabla activa (paper_trades en paper, live_trades en live)
+    sql = f"""
+        SELECT COALESCE(SUM(pnl_usdc), 0) as pnl
+        FROM {TRADES_TABLE}
+        WHERE exit_at >= ?
+          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+    """
     with db() as conn:
-        r = conn.execute(
-            """
-            SELECT COALESCE(SUM(pnl_usdc), 0) as pnl
-            FROM paper_trades
-            WHERE exit_at >= ?
-              AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-            """,
-            (today_start,),
-        ).fetchone()
+        r = conn.execute(sql, (today_start,)).fetchone()
     pnl = r["pnl"] or 0
-    threshold = -BOT_CAPITAL_USDC * DAILY_KILL_SWITCH_PCT
+    threshold = -EFFECTIVE_CAPITAL_USDC * DAILY_KILL_SWITCH_PCT
     if pnl <= threshold:
         prev = kill_switch_status()["active"]
         reason = f"PnL 24h ${pnl:.2f} <= -{DAILY_KILL_SWITCH_PCT*100:.0f}% del capital"
@@ -127,15 +131,14 @@ async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
 
 
 async def sweep_stops() -> dict:
-    """Recorre todas las paper_trades open y cierra las que disparen stop/tp."""
+    """Recorre todas las posiciones open (paper o live) y cierra las que disparen stop/tp."""
+    sql = f"""
+        SELECT id, asset, entry_price, entry_size_usdc, source_wallet
+        FROM {TRADES_TABLE}
+        WHERE status='open' AND asset IS NOT NULL
+    """
     with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, asset, entry_price, entry_size_usdc, source_wallet
-            FROM paper_trades
-            WHERE status='open' AND asset IS NOT NULL
-            """,
-        ).fetchall()
+        rows = conn.execute(sql).fetchall()
 
     if not rows:
         return {"checked": 0, "stop_loss": 0, "take_profit": 0}

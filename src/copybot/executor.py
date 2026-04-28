@@ -1,0 +1,406 @@
+"""Live execution con USDC reales en Polymarket CLOB (Fase 5).
+
+Mirror de paper.py con la MISMA interfaz pública:
+  - open_position(...)
+  - close_position(...)
+  - force_close(...)
+  - settle_resolved()
+
+Diferencia clave: en vez de simular el trade, manda una orden FOK al CLOB.
+Si la orden no matchea (sin liquidez al precio), no se abre nada.
+
+Reusa toda la lógica de validación de paper.py (kill switch, suscripción,
+duplicados, market caps, category blocks, policy, etc.). Solo cambia:
+  1. el size base (LIVE_BASE_USDC en vez de COPY_BASE_USDC)
+  2. el cap global (LIVE_CAPITAL_USDC en vez de BOT_CAPITAL_USDC)
+  3. la persistencia (live_trades en vez de paper_trades)
+  4. el "execution": orden real vs INSERT de paper
+
+Modo dry-run: si LIVE_DRY_RUN=true, simula la orden (no la manda) pero
+sí la persiste en live_trades con dry_run=1. Útil para validar el flow.
+"""
+from __future__ import annotations
+
+import json
+import logging
+
+from src.config import (
+    LIVE_BASE_USDC,
+    LIVE_CAPITAL_USDC,
+    LIVE_DRY_RUN,
+    MAX_PER_MARKET_PCT,
+    MIN_MARKET_LIQUIDITY_USDC,
+    MIN_MARKET_VOLUME_USDC,
+)
+from src.copybot.learning import on_paper_trade_closed
+from src.copybot.paper import EPSILON, _check_kill_switch, _ensure_market_stub
+from src.copybot.realism import post_close_costs
+from src.db.schema import db, tx
+
+log = logging.getLogger(__name__)
+
+
+def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_id,
+                            outcome_index, price, timestamp, raw):
+    """Reusa toda la validación de paper.open_position.
+
+    Devuelve (size_usdc, market_row, category, category_allowed) si pasa, o
+    (None, reject_reason) si rechaza. Es deliberadamente similar a paper para
+    mantener simetría — cualquier mejora a los filtros se aplica a ambos.
+    """
+    if _check_kill_switch(conn):
+        return None, "kill_switch"
+
+    sub = conn.execute(
+        "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
+        (source_wallet,),
+    ).fetchone()
+    if not sub:
+        return None, "no_subscription"
+    if sub["status"] != "active":
+        return None, "inactive"
+    sizing = sub["sizing_mult"] or 1.0
+    if sizing <= EPSILON:
+        return None, "inactive"
+
+    cs = conn.execute(
+        """
+        SELECT cp.status FROM wallet_clusters wc
+        JOIN cluster_perf cp ON cp.cluster_id = wc.cluster_id
+        WHERE wc.wallet=?
+        """,
+        (source_wallet,),
+    ).fetchone()
+    if cs and cs["status"] == "blocked":
+        return None, "cluster_blocked"
+    if cs and cs["status"] == "penalized":
+        sizing = sizing * 0.5
+
+    dup = conn.execute(
+        "SELECT id FROM live_trades WHERE source_trade_id=?",
+        (source_trade_id,),
+    ).fetchone()
+    if dup:
+        return None, "duplicate"
+
+    m = _ensure_market_stub(conn, condition_id, raw)
+    cat = None
+    if m:
+        liq = m["liquidity"]
+        vol = m["volume"]
+        if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
+            return None, "low_liquidity"
+        if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
+            return None, "low_volume"
+        cat = m["category"]
+        if cat:
+            cat_row = conn.execute(
+                "SELECT status FROM category_perf WHERE category=?", (cat,)
+            ).fetchone()
+            if cat_row and cat_row["status"] == "blocked":
+                return None, "category_blocked"
+
+    from src.copybot.policy import is_blocked as policy_blocked
+    if policy_blocked(category=cat, entry_at=timestamp, entry_price=price):
+        return None, "policy_blocked"
+
+    if price < 0.05 or price > 0.95:
+        return None, "extreme_price"
+
+    size_usdc = LIVE_BASE_USDC * sizing
+
+    per_market_cap = LIVE_CAPITAL_USDC * MAX_PER_MARKET_PCT
+    market_open = conn.execute(
+        """
+        SELECT COALESCE(SUM(entry_size_usdc), 0) as v
+        FROM live_trades
+        WHERE condition_id=? AND status='open'
+        """,
+        (condition_id,),
+    ).fetchone()["v"]
+    if market_open + size_usdc > per_market_cap + EPSILON:
+        return None, "market_concentration"
+
+    global_open = conn.execute(
+        "SELECT COALESCE(SUM(entry_size_usdc), 0) as v FROM live_trades WHERE status='open'"
+    ).fetchone()["v"]
+    if global_open + size_usdc > LIVE_CAPITAL_USDC + EPSILON:
+        return None, "capital_full"
+
+    return (size_usdc, m, cat), None
+
+
+def open_position(
+    *,
+    source_wallet: str,
+    source_trade_id: str,
+    condition_id: str,
+    outcome: str | None,
+    outcome_index: int | None,
+    price: float,
+    timestamp: int,
+    raw: dict | None = None,
+) -> tuple[int | None, str | None]:
+    """Abre un live_trade ejecutando una orden BUY real en el CLOB."""
+    # Lazy import: no cargar py-clob-client si nunca se llama
+    from src.polymarket.clob_client import get_token_id, place_market_order
+
+    with tx() as conn:
+        result, reject = _open_position_validate(
+            conn,
+            source_wallet=source_wallet,
+            source_trade_id=source_trade_id,
+            condition_id=condition_id,
+            outcome_index=outcome_index,
+            price=price,
+            timestamp=timestamp,
+            raw=raw,
+        )
+        if reject:
+            return None, reject
+        size_usdc, _market, _cat = result
+
+    # Resolver token_id desde el CLOB (fuera de la tx, llama a la API)
+    token_id = (raw or {}).get("asset")
+    if not token_id:
+        token_id = get_token_id(condition_id, outcome_index)
+    if not token_id:
+        log.warning("no se pudo resolver token_id para cid=%s oi=%s", condition_id[:10], outcome_index)
+        return None, "no_token_id"
+
+    # Ejecutar la orden
+    order = place_market_order(
+        token_id=token_id,
+        side="BUY",
+        size_usdc=size_usdc,
+        price=price,
+        dry_run=LIVE_DRY_RUN,
+    )
+    if not order.ok:
+        log.warning("BUY no matcheada: %s (cid=%s.. price=%.3f)",
+                    order.error, condition_id[:10], price)
+        return None, "order_unmatched"
+
+    actual_price = order.avg_price or price
+    actual_shares = order.filled_size or (size_usdc / actual_price if actual_price > 0 else 0)
+
+    market_slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
+    with tx() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO live_trades
+                (source_wallet, source_trade_id, condition_id, token_id, outcome,
+                 outcome_index, side, entry_price, entry_size_usdc, entry_shares,
+                 entry_at, entry_order_id, entry_tx_hash, status, raw, asset, dry_run)
+            VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (
+                source_wallet, source_trade_id, condition_id, token_id, outcome,
+                outcome_index, actual_price, size_usdc, actual_shares,
+                timestamp, order.order_id, order.tx_hash,
+                json.dumps(raw, separators=(",", ":")) if raw else None,
+                token_id,
+                1 if LIVE_DRY_RUN else 0,
+            ),
+        )
+        live_id = cur.lastrowid
+
+    try:
+        from src.copybot.notifier import live_open
+        live_open(
+            source_wallet=source_wallet, market_slug=market_slug,
+            size_usdc=size_usdc, price=actual_price,
+            order_id=order.order_id, tx_hash=order.tx_hash,
+            dry_run=LIVE_DRY_RUN,
+        )
+    except Exception:
+        pass
+    return live_id, None
+
+
+def _settle_pnl_shares(entry_price: float, shares: float, exit_price: float) -> float:
+    """PnL en USDC dadas las shares ejecutadas."""
+    if shares <= EPSILON:
+        return 0.0
+    return shares * (exit_price - entry_price)
+
+
+def close_position(
+    *,
+    source_wallet: str,
+    condition_id: str,
+    outcome_index: int | None,
+    price: float,
+    timestamp: int,
+    reason: str = "source_sell",
+) -> int | None:
+    """Cierra la posición FIFO matcheando (wallet, cid, outcome) con orden SELL real."""
+    from src.polymarket.clob_client import place_market_order
+
+    with tx() as conn:
+        row = conn.execute(
+            """
+            SELECT id, entry_price, entry_shares, token_id, dry_run
+            FROM live_trades
+            WHERE source_wallet=? AND condition_id=? AND outcome_index=? AND status='open'
+            ORDER BY entry_at ASC LIMIT 1
+            """,
+            (source_wallet, condition_id, outcome_index),
+        ).fetchone()
+        if not row:
+            return None
+        trade_id = row["id"]
+        entry_price = row["entry_price"]
+        shares = row["entry_shares"]
+        token_id = row["token_id"]
+        is_dry = bool(row["dry_run"])
+
+    # SELL: notional aprox para el wrapper (que internamente convierte a shares)
+    sell_size_usdc = shares * price
+    order = place_market_order(
+        token_id=token_id,
+        side="SELL",
+        size_usdc=sell_size_usdc,
+        price=price,
+        dry_run=is_dry or LIVE_DRY_RUN,
+    )
+    if not order.ok:
+        log.warning("SELL no matcheada para live_trade #%d: %s", trade_id, order.error)
+        return None
+
+    actual_exit_price = order.avg_price or price
+    actual_exit_shares = order.filled_size or shares
+    gross_pnl = _settle_pnl_shares(entry_price, actual_exit_shares, actual_exit_price)
+    fee_usdc, _gas, net_pnl = post_close_costs(gross_pnl)
+    status = "closed_win" if net_pnl > 0 else "closed_loss"
+
+    with tx() as conn:
+        conn.execute(
+            """
+            UPDATE live_trades
+            SET exit_price=?, exit_at=?, exit_order_id=?, exit_tx_hash=?,
+                exit_shares=?, fees_usdc=?, pnl_usdc=?, status=?, exit_reason=?
+            WHERE id=?
+            """,
+            (actual_exit_price, timestamp, order.order_id, order.tx_hash,
+             actual_exit_shares, fee_usdc, net_pnl, status, reason, trade_id),
+        )
+        accum = conn.execute(
+            "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+        ).fetchone()["a"]
+        slug_row = conn.execute(
+            "SELECT slug FROM markets WHERE condition_id=?", (condition_id,)
+        ).fetchone()
+        market_slug = slug_row["slug"] if slug_row else None
+
+    try:
+        from src.copybot.notifier import live_close
+        live_close(
+            source_wallet=source_wallet, market_slug=market_slug,
+            pnl_usdc=net_pnl, accumulated=accum,
+            exit_reason=reason, tx_hash=order.tx_hash, dry_run=is_dry,
+        )
+    except Exception:
+        pass
+    return trade_id
+
+
+def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
+    """Fuerza el cierre (stop-loss / take-profit) con orden SELL real."""
+    from src.polymarket.clob_client import place_market_order
+
+    with tx() as conn:
+        row = conn.execute(
+            """
+            SELECT entry_price, entry_shares, token_id, dry_run, status
+            FROM live_trades WHERE id=?
+            """,
+            (live_trade_id,),
+        ).fetchone()
+        if not row or row["status"] != "open":
+            return
+        entry_price = row["entry_price"]
+        shares = row["entry_shares"]
+        token_id = row["token_id"]
+        is_dry = bool(row["dry_run"])
+
+    sell_size_usdc = shares * exit_price
+    order = place_market_order(
+        token_id=token_id, side="SELL", size_usdc=sell_size_usdc,
+        price=exit_price, dry_run=is_dry or LIVE_DRY_RUN,
+    )
+    if not order.ok:
+        log.warning("force_close SELL no matcheada para live #%d: %s",
+                    live_trade_id, order.error)
+        return
+
+    actual_price = order.avg_price or exit_price
+    actual_shares = order.filled_size or shares
+    gross = _settle_pnl_shares(entry_price, actual_shares, actual_price)
+    fee, _gas, net = post_close_costs(gross)
+    status = "closed_win" if net > 0 else "closed_loss"
+
+    with tx() as conn:
+        conn.execute(
+            """
+            UPDATE live_trades
+            SET exit_price=?, exit_at=strftime('%s','now'), exit_order_id=?,
+                exit_tx_hash=?, exit_shares=?, fees_usdc=?, pnl_usdc=?,
+                status=?, exit_reason=?
+            WHERE id=?
+            """,
+            (actual_price, order.order_id, order.tx_hash, actual_shares,
+             fee, net, status, reason, live_trade_id),
+        )
+
+
+def settle_resolved() -> int:
+    """Para mercados resueltos: marca live_trades como settled.
+
+    NO redime las shares automáticamente — eso requiere llamar al contrato
+    CTF (ConditionalTokensFramework). Por ahora dejamos al usuario hacer
+    el "Redeem" manual desde polymarket.com (toma 1 click).
+
+    Marca el trade como `settled_win` o `settled_loss` con el payout teórico.
+    """
+    settled = 0
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT lt.id, lt.entry_price, lt.entry_shares, lt.outcome_index,
+                   m.outcome_prices
+            FROM live_trades lt
+            JOIN markets m ON m.condition_id = lt.condition_id
+            WHERE lt.status='open' AND m.closed=1
+            """,
+        ).fetchall()
+
+    to_settle = []
+    for r in rows:
+        try:
+            prices = json.loads(r["outcome_prices"] or "[]")
+            payout = float(prices[r["outcome_index"]]) if r["outcome_index"] is not None else 0
+        except Exception:
+            continue
+        gross = (r["entry_shares"] or 0) * (payout - r["entry_price"])
+        fee, _gas, net = post_close_costs(gross)
+        status = "settled_win" if net > 0 else "settled_loss"
+        to_settle.append((payout, fee, net, status, r["id"]))
+
+    if not to_settle:
+        return 0
+
+    with tx() as conn:
+        conn.executemany(
+            """
+            UPDATE live_trades
+            SET exit_price=?, exit_at=strftime('%s','now'),
+                fees_usdc=?, pnl_usdc=?, status=?, exit_reason='market_resolved'
+            WHERE id=?
+            """,
+            to_settle,
+        )
+    settled = len(to_settle)
+    log.info("settled %d live_trades (recordá hacer Redeem en polymarket.com)", settled)
+    return settled

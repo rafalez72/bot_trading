@@ -22,7 +22,12 @@ import time
 from rich.console import Console
 
 from src.config import COPY_POLL_SECONDS, STOPLOSS_SWEEP_SECONDS
-from src.copybot.paper import close_position, open_position, settle_resolved
+from src.copybot.tradebook import (
+    MODE as TRADEBOOK_MODE,
+    close_position,
+    open_position,
+    settle_resolved,
+)
 from src.copybot.auto_filter import maybe_tune
 from src.copybot.clusters import update_cluster_perf
 from src.copybot.discovery import run_cycle as discovery_cycle
@@ -236,6 +241,13 @@ async def _maybe_trigger_on_demand_discovery(state: dict) -> None:
 
 async def run_loop(*, once: bool = False) -> None:
     init_db()
+    log.info("runner arranca en modo tradebook=%s", TRADEBOOK_MODE)
+    if TRADEBOOK_MODE.startswith("live"):
+        console.print(
+            f"[bold red]⚠️  TRADEBOOK MODE: {TRADEBOOK_MODE.upper()} ⚠️[/bold red]\n"
+            "[red]Las órdenes se mandan al CLOB de Polymarket. "
+            "Esto consume USDC reales si dry_run=false.[/red]"
+        )
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

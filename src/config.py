@@ -25,5 +25,38 @@ MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "10000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
+# ---------- Live trading (Fase 5 - plata real) ----------
+# LIVE_MODE=false → paper trading (default).
+# LIVE_MODE=true  → ejecuta órdenes reales en Polymarket CLOB.
+LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
+
+# LIVE_DRY_RUN=true → loguea las órdenes pero no las manda al CLOB.
+# Útil para validar el flujo sin gastar plata. Funciona solo si LIVE_MODE=true.
+LIVE_DRY_RUN = os.getenv("LIVE_DRY_RUN", "true").lower() == "true"
+
+# Capital real disponible para trading live (en USDC).
+# Es el cap operativo del bot, NO el balance total de la wallet.
+LIVE_CAPITAL_USDC = float(os.getenv("LIVE_CAPITAL_USDC", "50.0"))
+
+# Tamaño base por copia en modo live (suele ser menor que paper).
+LIVE_BASE_USDC = float(os.getenv("LIVE_BASE_USDC", "2.5"))
+
+# Polymarket CLOB credentials (generadas con scripts/generate_api_creds.py)
+POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
+POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
+POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+
+# Dirección de la proxy wallet (la que tiene tu USDC en Polymarket)
+POLYMARKET_FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+
+# Private key de la wallet que controla la proxy.
+# OPCIONAL: solo necesaria si necesitas firmar L1 ops o regenerar API creds.
+# Para placement de órdenes con creds L2, NO es necesaria.
+POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+
+# Tipo de firma de Polymarket: 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
+# Default 2 — es lo que usa la cuenta creada via email/Magic en polymarket.com
+POLYMARKET_SIG_TYPE = int(os.getenv("POLYMARKET_SIG_TYPE", "2"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

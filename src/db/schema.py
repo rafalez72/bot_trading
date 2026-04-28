@@ -204,6 +204,42 @@ _MIGRATIONS = [
         status              TEXT DEFAULT 'allowed',  -- allowed | penalized | blocked
         updated_at          TEXT DEFAULT (datetime('now'))
     )""",
+    # Live trades: trades reales ejecutados en Polymarket CLOB (Fase 5).
+    # Esquema mirror de paper_trades + campos de execution real:
+    #   token_id, entry_order_id, exit_order_id, entry_shares, exit_shares,
+    #   entry_tx_hash, exit_tx_hash, fees_usdc.
+    """CREATE TABLE IF NOT EXISTS live_trades (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_wallet     TEXT NOT NULL,
+        source_trade_id   TEXT,
+        condition_id      TEXT NOT NULL,
+        token_id          TEXT,           -- ERC1155 token id en Polymarket
+        outcome           TEXT,
+        outcome_index     INTEGER,
+        side              TEXT NOT NULL,
+        entry_price       REAL,
+        entry_size_usdc   REAL,
+        entry_shares      REAL,           -- shares compradas
+        entry_at          INTEGER,
+        entry_order_id    TEXT,           -- order ID del CLOB
+        entry_tx_hash     TEXT,           -- tx hash en Polygon (cuando matchea)
+        exit_price        REAL,
+        exit_at           INTEGER,
+        exit_order_id     TEXT,
+        exit_tx_hash      TEXT,
+        exit_shares       REAL,
+        fees_usdc         REAL DEFAULT 0,
+        pnl_usdc          REAL,
+        status            TEXT DEFAULT 'open',
+        exit_reason       TEXT,
+        asset             TEXT,
+        raw               TEXT,
+        dry_run           INTEGER DEFAULT 0
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_live_status ON live_trades(status)",
+    "CREATE INDEX IF NOT EXISTS idx_live_source ON live_trades(source_wallet)",
+    "CREATE INDEX IF NOT EXISTS idx_live_entry ON live_trades(entry_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_live_token ON live_trades(token_id)",
 ]
 
 

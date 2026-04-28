@@ -35,7 +35,12 @@ MAX_LEN = 4000  # límite real es 4096, dejamos margen
 
 # Tipos de notif activos. Para reactivar uno, agregalo a este set.
 # Pedido del usuario: solo gain/loss + kill_switch (safety override).
-ENABLED_NOTIFICATIONS = {"gain", "loss", "kill_switch"}
+# Live notifs (live_open, live_close) están activas por default en LIVE_MODE
+# para que el usuario sepa SIEMPRE qué pasa con su plata real.
+ENABLED_NOTIFICATIONS = {
+    "gain", "loss", "kill_switch",
+    "live_open", "live_close", "live_error",
+}
 
 
 def _enabled() -> bool:
@@ -138,6 +143,59 @@ def big_take_profit(*args, **kwargs) -> None:
 def daily_summary(**kwargs) -> None:
     if "daily_summary" in ENABLED_NOTIFICATIONS:
         pass
+
+
+# ---------- Live trading (Fase 5) ----------
+
+def live_open(*, source_wallet: str, market_slug: str | None,
+              size_usdc: float, price: float, order_id: str | None,
+              tx_hash: str | None = None, dry_run: bool = False) -> None:
+    """Notif al abrir una posición real."""
+    if "live_open" not in ENABLED_NOTIFICATIONS:
+        return
+    prefix = "🧪 *DRY-RUN* " if dry_run else "💰 *LIVE OPEN*"
+    txt = (
+        f"{prefix}\n"
+        f"Trader: `{source_wallet[:12]}...`\n"
+        f"Mercado: {market_slug or '(sin slug)'}\n"
+        f"Size: ${size_usdc:.2f}  @  {price:.3f}\n"
+    )
+    if order_id:
+        txt += f"Orden: `{order_id[:20]}`\n"
+    if tx_hash:
+        txt += f"[Ver tx](https://polygonscan.com/tx/{tx_hash})\n"
+    send(txt)
+
+
+def live_close(*, source_wallet: str, market_slug: str | None,
+               pnl_usdc: float, accumulated: float, exit_reason: str,
+               tx_hash: str | None = None, dry_run: bool = False) -> None:
+    """Notif al cerrar una posición real."""
+    if "live_close" not in ENABLED_NOTIFICATIONS:
+        return
+    prefix = "🧪 *DRY-RUN* " if dry_run else ("💵" if pnl_usdc > 0 else "🩸")
+    sign = "+" if pnl_usdc > 0 else ""
+    txt = (
+        f"{prefix} *LIVE CLOSE*\n"
+        f"Trader: `{source_wallet[:12]}...`\n"
+        f"Mercado: {market_slug or '(sin slug)'}\n"
+        f"PnL: *{sign}${pnl_usdc:.2f}*  (motivo: {exit_reason})\n"
+        f"Acumulado live: ${accumulated:+.2f}"
+    )
+    if tx_hash:
+        txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
+    send(txt)
+
+
+def live_error(*, stage: str, error: str) -> None:
+    """Notif cuando algo falla en live (CLOB caído, balance bajo, etc.)."""
+    if "live_error" not in ENABLED_NOTIFICATIONS:
+        return
+    send(
+        f"⚠️ *LIVE ERROR*\n"
+        f"Stage: `{stage}`\n"
+        f"Error: {error[:300]}"
+    )
 
 
 def test_message() -> bool:
