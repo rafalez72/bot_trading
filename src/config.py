@@ -58,5 +58,24 @@ POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 # Default 2 — es lo que usa la cuenta creada via email/Magic en polymarket.com
 POLYMARKET_SIG_TYPE = int(os.getenv("POLYMARKET_SIG_TYPE", "2"))
 
+# ---------- Live trading: mejoras de fricción ----------
+# Cap por wallet copiado en live (forzosa diversificación).
+# Default $10 con cap total $30 → max 3 wallets concurrentes con full size.
+LIVE_MAX_PER_WALLET_USDC = float(os.getenv("LIVE_MAX_PER_WALLET_USDC", "10.0"))
+
+# Mínimo de PnL esperado para que valga la pena el trade (filtro anti-fees).
+# Si el size del trade es tan chico que el PnL esperado no cubre fees, skip.
+# Heurística: expected_gross = size * 0.20 (20% gain promedio en wins).
+LIVE_MIN_EXPECTED_PNL_USDC = float(os.getenv("LIVE_MIN_EXPECTED_PNL_USDC", "0.50"))
+
+# Slippage máximo aceptable al pre-checkear el orderbook.
+# Si la VWAP del orderbook al size que queremos comprar > target_price * (1+X),
+# no mandamos la orden (no vale el slippage).
+LIVE_MAX_SLIPPAGE_PCT = float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03"))  # 3%
+
+# Bump de precio para el retry de IOC. Si la primera orden no fillea,
+# re-intentamos con price * (1 + X) en BUY (peor para nosotros, mejor chance).
+LIVE_RETRY_PRICE_BUMP_PCT = float(os.getenv("LIVE_RETRY_PRICE_BUMP_PCT", "0.01"))  # 1%
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

@@ -497,6 +497,18 @@ Para mercados resueltos, `settle_resolved()` marca los live_trades como `settled
 
 Activadas por default en LIVE_MODE: `live_open`, `live_close`, `live_error`. Incluyen tx_hash con link a Polygonscan cuando aplica.
 
+### Mejoras anti-fricción (Tier 1)
+
+Aplicadas para reducir el gap entre paper y plata real:
+
+| Mejora | Dónde | Default |
+|--------|-------|---------|
+| **IOC + retry escalonado** | `clob_client.place_market_order` cambia FOK→FAK (Fill-And-Kill, IOC); si fillea <50% retry 1 vez con precio +1% peor (BUY) | `LIVE_RETRY_PRICE_BUMP_PCT=0.01` |
+| **Pre-check orderbook** | `clob_client.estimate_slippage` consulta el libro antes de mandar orden, calcula VWAP esperada al size deseado, aborta si slippage > umbral | `LIVE_MAX_SLIPPAGE_PCT=0.03` |
+| **Cap por wallet** | `executor._open_position_validate` rechaza con `wallet_concentration` si el wallet ya tiene > X open. Forza diversificación entre traders | `LIVE_MAX_PER_WALLET_USDC=10.0` |
+| **Filter expected_pnl** | `executor` calcula `realism.expected_net_pnl(size)` y rechaza con `expected_pnl_too_low` si está por debajo del mínimo. Evita trades donde fees+gas se comen el upside | `LIVE_MIN_EXPECTED_PNL_USDC=0.50` |
+| **Gas calibrado** | `realism.GAS_PER_TX` subido de $0.02 → $0.05 (más realista para Polymarket en Polygon) | `REALISM_GAS_USDC=0.05` |
+
 ---
 
 ## 14. Cómo bootstrapear una nueva sesión AI

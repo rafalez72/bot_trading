@@ -33,7 +33,17 @@ LONG_SHOT_BONUS = lambda: _envf("REALISM_LONGSHOT_SLIP_PCT", 0.04)
 LOW_LIQ_BONUS = lambda: _envf("REALISM_LOWLIQ_SLIP_PCT", 0.03)
 LOW_LIQ_THRESHOLD = lambda: _envf("REALISM_LOWLIQ_THRESHOLD_USDC", 10000)
 FEE_PCT = lambda: _envf("REALISM_FEE_PCT", 0.02)
-GAS_PER_TX = lambda: _envf("REALISM_GAS_USDC", 0.02)
+# Gas calibrado: Polymarket usa el CTF Exchange (mayor consumo que un transfer USDC).
+# A 30-50 gwei + MATIC ~$0.50, una orden típica está en $0.04-0.08. Default $0.05.
+GAS_PER_TX = lambda: _envf("REALISM_GAS_USDC", 0.05)
+# Win rate típico esperado por trade copiado (medido en paper, 1074 cerrados: 32.5%).
+EXPECTED_WIN_RATE = lambda: _envf("REALISM_EXPECTED_WIN_RATE", 0.325)
+# Multiplicador de ganancia bruta sobre size cuando el trade es win.
+# Medido en paper: avg_win $7.43 sobre size $5 → 1.524× (gross, antes de fee+gas).
+EXPECTED_WIN_GAIN_MULT = lambda: _envf("REALISM_EXPECTED_WIN_GAIN_MULT", 1.5)
+# Pérdida bruta promedio como % del size cuando el trade es loss.
+# Medido en paper: avg_loss $1.55 + gas $0.04 = $1.59 → 0.32 sobre size $5.
+EXPECTED_LOSS_PCT = lambda: _envf("REALISM_EXPECTED_LOSS_PCT", 0.32)
 
 LONG_SHOT_LOW = 0.15
 LONG_SHOT_HIGH = 0.85
@@ -97,3 +107,31 @@ def post_close_costs(gross_pnl: float) -> tuple[float, float, float]:
 
 def is_enabled() -> bool:
     return _enabled()
+
+
+def expected_net_pnl(size_usdc: float) -> float:
+    """Estimación del PnL esperado de un trade dado su size.
+
+    Modelo (calibrado contra paper trading: 1074 trades, +$1422):
+      gross_expected = size * (win_rate * win_mult - (1-win_rate) * loss_pct)
+      net = gross - gas_total - fee_on_wins
+
+    Calibración default (vía .env tunable):
+      win_rate=0.325, win_mult=1.5, loss_pct=0.32, gas=$0.05/tx, fee=2% wins.
+    Esto da expected_pnl/size ≈ 0.265 (concuerda con paper: $1.32/$5 = 0.264).
+
+    Para trades muy chicos, gas fijo come el upside.
+    Útil para filtrar trades en live donde sizing_mult << 1.
+    """
+    win_rate = EXPECTED_WIN_RATE()
+    win_mult = EXPECTED_WIN_GAIN_MULT()
+    loss_pct = EXPECTED_LOSS_PCT()
+
+    gross_win_value = size_usdc * win_rate * win_mult
+    gross_loss_value = size_usdc * (1 - win_rate) * loss_pct
+    expected_gross = gross_win_value - gross_loss_value
+
+    gas_total = GAS_PER_TX() * 2  # entry + exit
+    fee_on_wins = gross_win_value * FEE_PCT()
+
+    return expected_gross - gas_total - fee_on_wins

@@ -28,13 +28,15 @@ from src.config import (
     LIVE_BASE_USDC,
     LIVE_CAPITAL_USDC,
     LIVE_DRY_RUN,
+    LIVE_MAX_PER_WALLET_USDC,
+    LIVE_MIN_EXPECTED_PNL_USDC,
     MAX_PER_MARKET_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
     MIN_MARKET_VOLUME_USDC,
 )
 from src.copybot.learning import on_paper_trade_closed
 from src.copybot.paper import EPSILON, _check_kill_switch, _ensure_market_stub
-from src.copybot.realism import post_close_costs
+from src.copybot.realism import expected_net_pnl, post_close_costs
 from src.db.schema import db, tx
 
 log = logging.getLogger(__name__)
@@ -108,6 +110,24 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         return None, "extreme_price"
 
     size_usdc = LIVE_BASE_USDC * sizing
+
+    # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
+    # no vale la pena. Esto descarta trades donde sizing_mult dejó el size muy chico.
+    expected = expected_net_pnl(size_usdc)
+    if expected < LIVE_MIN_EXPECTED_PNL_USDC:
+        return None, "expected_pnl_too_low"
+
+    # Cap por wallet (forzosa diversificación): no más de X open por wallet.
+    wallet_open = conn.execute(
+        """
+        SELECT COALESCE(SUM(entry_size_usdc), 0) as v
+        FROM live_trades
+        WHERE source_wallet=? AND status='open'
+        """,
+        (source_wallet,),
+    ).fetchone()["v"]
+    if wallet_open + size_usdc > LIVE_MAX_PER_WALLET_USDC + EPSILON:
+        return None, "wallet_concentration"
 
     per_market_cap = LIVE_CAPITAL_USDC * MAX_PER_MARKET_PCT
     market_open = conn.execute(

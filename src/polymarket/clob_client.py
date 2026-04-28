@@ -19,6 +19,8 @@ from typing import Optional
 
 from src.config import (
     CLOB_API,
+    LIVE_MAX_SLIPPAGE_PCT,
+    LIVE_RETRY_PRICE_BUMP_PCT,
     POLYMARKET_API_KEY,
     POLYMARKET_API_PASSPHRASE,
     POLYMARKET_API_SECRET,
@@ -146,25 +148,126 @@ def get_balance() -> Optional[float]:
         return None
 
 
+def estimate_slippage(
+    *, token_id: str, side: str, target_size_shares: float, target_price: float
+) -> dict:
+    """Pre-check del orderbook: calcula la VWAP esperada y el slippage.
+
+    Devuelve {ok, vwap, slippage_pct, available_shares, error}.
+    - ok=False si no hay liquidez suficiente o el slippage > LIVE_MAX_SLIPPAGE_PCT.
+
+    Para BUY: walk de asks (precios bajos a altos) hasta acumular el size deseado.
+    Para SELL: walk de bids (precios altos a bajos).
+    """
+    client = get_client()
+    if client is None:
+        return {"ok": False, "error": "CLOB no configurado"}
+
+    try:
+        ob = client.get_order_book(token_id)
+        # ob.asks/bids son lists de OrderSummary {price, size}.
+        # Asks vienen ordenados ascendente; bids descendente.
+        # Si el SDK los trae al revés, normalizamos.
+        asks = sorted([(float(o.price), float(o.size)) for o in (ob.asks or [])])
+        bids = sorted(
+            [(float(o.price), float(o.size)) for o in (ob.bids or [])],
+            reverse=True,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"get_order_book: {e}"}
+
+    book = asks if side.upper() == "BUY" else bids
+    if not book:
+        return {"ok": False, "error": "orderbook vacio"}
+
+    accum_shares = 0.0
+    accum_value = 0.0
+    for price, size in book:
+        take = min(target_size_shares - accum_shares, size)
+        if take <= 0:
+            break
+        accum_value += take * price
+        accum_shares += take
+        if accum_shares >= target_size_shares - 1e-9:
+            break
+
+    if accum_shares < target_size_shares * 0.99:  # menos del 99% disponible
+        return {
+            "ok": False,
+            "error": f"liquidez insuficiente ({accum_shares:.1f}/{target_size_shares:.1f} shares)",
+            "available_shares": accum_shares,
+        }
+
+    vwap = accum_value / accum_shares
+    # Slippage: para BUY positivo si pagamos MÁS que target. Para SELL positivo si recibimos MENOS.
+    if side.upper() == "BUY":
+        slippage = (vwap - target_price) / target_price
+    else:
+        slippage = (target_price - vwap) / target_price
+
+    ok = slippage <= LIVE_MAX_SLIPPAGE_PCT
+    return {
+        "ok": ok,
+        "vwap": vwap,
+        "slippage_pct": slippage,
+        "available_shares": accum_shares,
+        "error": None if ok else f"slippage {slippage*100:.1f}% > {LIVE_MAX_SLIPPAGE_PCT*100:.1f}%",
+    }
+
+
+def _build_and_post(client, *, token_id, side, shares, price):
+    """Helper: arma una orden FAK (IOC, permite partial fill) y la postea.
+
+    Devuelve (success, response_dict). Atrapa excepciones y devuelve (False, {error}).
+    """
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=price,
+        size=shares,
+        side=BUY if side.upper() == "BUY" else SELL,
+    )
+    try:
+        signed = client.create_order(order_args)
+    except Exception as e:
+        return False, {"errorMsg": f"create_order: {e}"}
+
+    # Probamos FAK (Fill-And-Kill = IOC: lo que matchee, matchea; el resto se cancela).
+    # Si la versión del SDK no expone FAK, caemos a FOK.
+    try:
+        order_type = getattr(OrderType, "FAK", None) or OrderType.FOK
+        resp = client.post_order(signed, order_type)
+        return True, (resp or {})
+    except Exception as e:
+        return False, {"errorMsg": f"post_order: {e}"}
+
+
 def place_market_order(
     *,
     token_id: str,
     side: str,  # "BUY" | "SELL"
     size_usdc: float,
-    price: float,  # precio de referencia (para BUY se usa como límite)
+    price: float,  # precio de referencia
     dry_run: bool = False,
+    skip_slippage_check: bool = False,
 ) -> OrderResult:
-    """Manda una orden FOK (fill-or-kill) al CLOB.
+    """Manda una orden IOC al CLOB con pre-check de slippage y retry.
 
-    Para BUY: convierte USDC a shares = size_usdc / price.
-    Para SELL: size_usdc se interpreta como notional, shares = size_usdc / price.
+    Flujo:
+      1. (dry_run) → loguea y devuelve fake ok
+      2. Pre-check del orderbook → VWAP esperada vs target. Si slippage > umbral, abort.
+      3. Primera orden FAK al precio target.
+      4. Si no fillea (o fillea <50%), retry 1 vez con precio bumpeado
+         (BUY: target * (1 + retry_bump), SELL: target * (1 - retry_bump)).
 
-    Si dry_run=True, no manda nada y devuelve OrderResult ficticio "ok".
+    Devuelve OrderResult con filled_size = shares ejecutadas reales.
     """
     if dry_run:
         shares = size_usdc / price if price > 0 else 0
         log.info(
-            "[DRY-RUN] orden %s token=%s.. price=%.3f size=%.2f USDC (~%.2f shares)",
+            "[DRY-RUN] %s token=%s.. price=%.3f size=%.2f USDC (~%.2f shares)",
             side, token_id[:12], price, size_usdc, shares,
         )
         return OrderResult(
@@ -179,56 +282,84 @@ def place_market_order(
     if client is None:
         return OrderResult(ok=False, error="CLOB no configurado")
 
-    try:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY, SELL
+    if price <= 0:
+        return OrderResult(ok=False, error=f"precio invalido: {price}")
+    shares = round(size_usdc / price, 2)
+    if shares <= 0:
+        return OrderResult(ok=False, error="size_usdc demasiado chico")
 
-        if price <= 0:
-            return OrderResult(ok=False, error=f"precio invalido: {price}")
-        shares = round(size_usdc / price, 2)  # Polymarket usa 2 decimales en size
-        if shares <= 0:
-            return OrderResult(ok=False, error="size_usdc demasiado chico")
-
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side=BUY if side.upper() == "BUY" else SELL,
+    # --- Pre-check del orderbook ---
+    if not skip_slippage_check:
+        slip = estimate_slippage(
+            token_id=token_id, side=side, target_size_shares=shares, target_price=price,
         )
-        signed = client.create_order(order_args)
-        # FOK = fill-or-kill: o se ejecuta entera o se cancela. Evita partial fills.
-        resp = client.post_order(signed, OrderType.FOK)
+        if not slip["ok"]:
+            log.info("orden abortada por pre-check: %s", slip.get("error"))
+            return OrderResult(ok=False, error=f"pre-check: {slip.get('error')}", raw=slip)
 
-        if not resp:
-            return OrderResult(ok=False, error="respuesta vacia del CLOB")
+    # --- Intento 1: precio target ---
+    success, resp = _build_and_post(
+        client, token_id=token_id, side=side, shares=shares, price=price,
+    )
+    if not success:
+        return OrderResult(ok=False, error=resp.get("errorMsg", "post error"), raw=resp)
 
-        # resp típica: {"success": True, "orderID": "...", "status": "matched", ...}
-        ok = bool(resp.get("success", True))
-        status = resp.get("status", "unknown")
-        order_id = resp.get("orderID") or resp.get("orderId")
-        if not ok or status == "unmatched":
-            return OrderResult(
-                ok=False,
-                order_id=order_id,
-                status=status,
-                error=resp.get("errorMsg") or "orden no matcheada",
-                raw=resp,
-            )
+    status = resp.get("status", "unknown")
+    order_id = resp.get("orderID") or resp.get("orderId")
+    filled = float(resp.get("makingAmount", 0) or 0) or 0
+    fill_pct = filled / shares if shares > 0 else 0
 
-        # Si matchea, intentamos extraer el size real ejecutado
-        filled_size = float(resp.get("makingAmount", 0)) or shares
+    # Si fillea bien (>=50%) → ok
+    if fill_pct >= 0.5 and status not in ("unmatched",):
         return OrderResult(
-            ok=True,
-            order_id=order_id,
-            status=status,
-            filled_size=filled_size,
-            avg_price=price,
-            tx_hash=resp.get("transactionHash"),
-            raw=resp,
+            ok=True, order_id=order_id, status=status,
+            filled_size=filled or shares, avg_price=price,
+            tx_hash=resp.get("transactionHash"), raw=resp,
         )
-    except Exception as e:
-        log.exception("place_market_order error: %s", e)
-        return OrderResult(ok=False, error=str(e))
+
+    # --- Intento 2: precio bumpeado ---
+    # BUY: pagamos un poco más para asegurar fill. SELL: aceptamos un poco menos.
+    bump = 1 + LIVE_RETRY_PRICE_BUMP_PCT if side.upper() == "BUY" else 1 - LIVE_RETRY_PRICE_BUMP_PCT
+    retry_price = round(price * bump, 3)
+    remaining = round(shares - filled, 2)
+    if remaining <= 0:
+        return OrderResult(
+            ok=True, order_id=order_id, status=status,
+            filled_size=filled, avg_price=price, raw=resp,
+        )
+
+    log.info(
+        "retry %s con precio %.3f (vs %.3f, fill previo %.1f%%)",
+        side, retry_price, price, fill_pct * 100,
+    )
+    success2, resp2 = _build_and_post(
+        client, token_id=token_id, side=side, shares=remaining, price=retry_price,
+    )
+    if not success2:
+        return OrderResult(
+            ok=False, order_id=order_id, status="retry_failed",
+            error=resp2.get("errorMsg", "post error"), raw={"first": resp, "retry": resp2},
+        )
+
+    filled2 = float(resp2.get("makingAmount", 0) or 0) or 0
+    total_filled = filled + filled2
+    if total_filled <= 0:
+        return OrderResult(
+            ok=False, order_id=order_id, status="unmatched_after_retry",
+            error="ni la primera ni la retry matchearon", raw={"first": resp, "retry": resp2},
+        )
+
+    # Avg price ponderado entre los dos fills
+    weighted_price = (price * filled + retry_price * filled2) / total_filled if total_filled else price
+    return OrderResult(
+        ok=True,
+        order_id=resp2.get("orderID") or resp2.get("orderId") or order_id,
+        status="matched_after_retry",
+        filled_size=total_filled,
+        avg_price=weighted_price,
+        tx_hash=resp2.get("transactionHash") or resp.get("transactionHash"),
+        raw={"first": resp, "retry": resp2},
+    )
 
 
 def health_check() -> dict:
