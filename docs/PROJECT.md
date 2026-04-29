@@ -522,20 +522,107 @@ Si abrís un chat nuevo y el AI no sabe nada del proyecto:
 
 ---
 
-## 15. Estado actual operativo (al 2026-04-27)
+## 15. Estado actual operativo (al 2026-04-29)
 
+### Infra
 ```
-✓ Server FastAPI corriendo (PID variable)
-✓ Runner LIVE polleando cada 10s
-✓ Cloudflare Tunnel temporal: https://topics-respond-average-interracial.trycloudflare.com
-✓ Telegram bot @bonny21bot conectado (chat_id 1350329630)
-✓ Modo realista activo
-✓ 20 traders activos seleccionados con filtros estrictos
-✓ Auto-discovery cada 8h + on-demand
-✓ Kill switch armado (no activado)
+✓ Bot dockerizado, imagen en ghcr.io/rafalez72/bot_trading:latest
+✓ GitHub Actions buildea + pushea imagen en cada push a main
+✓ Lenovo (100.98.174.60) corre Docker Desktop
+✓ Task Scheduler "CopyBot-Update" corre cada 5 min: pull + restart si hay imagen nueva
+✓ Telegram bot @bonny21bot manda notif en cada deploy/error
+✓ Tab "Live" en el dashboard PWA (puerto 8000) — http://100.98.174.60:8000
+```
 
-Última métrica vista: PnL +$105.78, 7 abiertas, capital $100/100
+### Modo trading actual
 ```
+LIVE_MODE=true
+LIVE_DRY_RUN=true     ← validando antes de plata real
+LIVE_CAPITAL_USDC=30
+LIVE_BASE_USDC=2.5
+```
+
+### Polymarket account (con problemas — ver caveat #11)
+```
+Funder (proxy):   0x110345DeA0Ae8A7584D5e43244c1DCd6Ee170E2d
+Signer EOA:       (Magic-managed para email rafalezcano72@gmail.com)
+API creds:        configuradas en .env de Lenovo
+Balance USDC:     $0.00 (sin fundear, NO usar — wallet comprometida)
+```
+
+### Resultados acumulados
+
+**Paper (congelado al pasar a live_dry el 2026-04-28):**
+```
+1140 trades cerrados · 373 wins / 767 losses · win rate 32.7%
+PnL acumulado: +$1,470.66 sobre cap $100
+```
+
+**Live dry-run (en validación):**
+```
+2 trades cerrados (todos del wallet 0xa535fabc97)
+2 stop-losses al -54% y -60% · PnL: -$3.99
+```
+
+---
+
+## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-04-27 — Migración Mac → Lenovo
+- Decisión: Git + GitHub + GHCR en vez de rsync (más simple, audit trail)
+- Mac → GitHub privado `rafalez72/bot_trading`
+- Lenovo: Docker Desktop + clone repo + scp del .env + scp de la DB inicial
+- Task Scheduler con `update_and_restart.bat` cada 5 min
+
+### 2026-04-28 — Fase 5: live trading construido
+- `src/polymarket/clob_client.py`: wrapper py-clob-client con health_check, place_market_order (FOK/FAK), get_balance
+- `src/copybot/executor.py`: mirror de paper.py para órdenes reales en CLOB
+- `src/copybot/tradebook.py`: dispatcher que elige paper/executor según `LIVE_MODE`
+- Tabla `live_trades` con token_id, order_id, tx_hash, fees_usdc, dry_run
+- CLI nuevo: `run-live`, `check-live`, `live-status`
+- Notifs: `live_open`, `live_close`, `live_error` con tx hash
+
+### 2026-04-28 (tarde) — 4 mejoras Tier 1 anti-fricción
+- IOC + retry escalonado (FAK con precio +1% si <50% fill)
+- Pre-check orderbook con VWAP estimada (aborta si slippage > 3%)
+- Cap por wallet ($10/wallet sobre $30 cap → max 3 wallets concurrentes)
+- Filter expected_pnl > $0.50 (evita trades donde fees comen upside)
+- Gas calibrado: $0.02 → $0.05 (más realista para CTF Exchange)
+
+### 2026-04-28 (noche) — Tab "Live" en dashboard
+- 3 endpoints `/api/live/*` (summary, trades, pnl-timeline)
+- Tab "Live" en PWA con banner de modo, stats wins/losses, dry vs real, top wallets
+- Bottom nav reorganizado a 5 columnas (Paper / Copiando / Live / Top / Mercados)
+- Service worker bumpeado a v6 para invalidar cache vieja
+
+### 2026-04-29 (madrugada) — Switch a live_dry + correcciones
+- `.env` de Lenovo configurado con `LIVE_MODE=true LIVE_DRY_RUN=true` + creds
+- `check-live` OK: balance $0.00 (esperado, wallet sin fundear)
+- Primer trade dry-run: -$2.09 (stop-loss 60%)
+- Segundo dry-run: -$1.90 (stop-loss 54%)
+- **Bug encontrado**: kill switch contaba dry-run trades como reales → activación incorrecta
+- **Fix** (`ac48539`): kill switch ignora `dry_run=1` en live mode
+- Notif live REAL ahora con formato simple tipo paper: "📈 Ganancia REAL / Ganó: $X / Acumulado: $Y"
+
+---
+
+## 17. Pendientes inmediatos (post-validación dry-run)
+
+| # | Acción | Razón |
+|---|--------|-------|
+| 1 | Crear wallet **limpia** (NO `0x110345...`) | La actual tiene private key comprometida (compartida en chat) |
+| 2 | Generar API creds nuevas con esa wallet | El bot necesita firmar con clave que vos solo conozcas |
+| 3 | Fundear $30 USDC en la nueva wallet | Plata real para arrancar |
+| 4 | Cambiar `.env` de Lenovo con creds + funder nuevos | Switch a la wallet limpia |
+| 5 | Reset kill switch + dejar 1-2h en dry-run con wallet limpia | Confirmar cero issues |
+| 6 | `LIVE_DRY_RUN=false` → live real | Arranque |
+
+### Caveat #11: wallet 0x110345... comprometida (NO usar para real)
+La private key de esa wallet circuló en el chat de configuración y debe considerarse pública. Cualquier USDC depositado ahí puede ser robado. **Solo usar para dry-run sin fondos** mientras se valida el código.
+
+### Tunings sugeridos antes de plata real
+- Considerar `LIVE_MAX_PER_WALLET_USDC=2.5` (= 1 trade concurrente por wallet en lugar de hasta 4) — el primer dry-run mostró 2 losses del mismo wallet
+- O subir el threshold de stop-loss (actualmente 30%) — los stop-losses tempranos al -54%/-60% comieron mucho de cap
 
 ---
 
