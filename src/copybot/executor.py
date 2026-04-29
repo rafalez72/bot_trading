@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from src.config import (
     LIVE_BASE_USDC,
     LIVE_CAPITAL_USDC,
     LIVE_DRY_RUN,
+    LIVE_DRY_SLIPPAGE_PCT,
     LIVE_MAX_PER_WALLET_USDC,
     LIVE_MIN_EXPECTED_PNL_USDC,
     MAX_PER_MARKET_PCT,
@@ -42,6 +44,39 @@ from src.db.schema import db, tx
 log = logging.getLogger(__name__)
 
 
+def _log_reject(source_wallet, condition_id, outcome_index, side, price, reason, detail=None):
+    """Registra un reject en live_rejects para observabilidad.
+
+    Best-effort: nunca debe romper el flujo principal. Si la INSERT falla
+    (DB locked, schema viejo, etc.) loguea warning y sigue.
+    """
+    try:
+        with tx() as conn:
+            conn.execute(
+                "INSERT INTO live_rejects (at, source_wallet, condition_id, outcome_index, side, price, reason, detail) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (int(time.time()), source_wallet, condition_id, outcome_index, side, price, reason, detail),
+            )
+    except Exception as e:
+        log.warning("failed to log reject: %s", e)
+
+
+def _apply_dry_slippage(side: str, price: float) -> float:
+    """Aplica slippage pesimista al precio simulado de un dry-run.
+
+    BUY paga más (price * (1 + slippage)).
+    SELL recibe menos (price * (1 - slippage)).
+    Clamp a [0.01, 0.99] para evitar precios degenerados en bordes.
+    """
+    if price is None or price <= 0:
+        return price
+    if side.upper() == "BUY":
+        adj = price * (1 + LIVE_DRY_SLIPPAGE_PCT)
+    else:
+        adj = price * (1 - LIVE_DRY_SLIPPAGE_PCT)
+    return max(0.01, min(0.99, adj))
+
+
 def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_id,
                             outcome_index, price, timestamp, raw):
     """Reusa toda la validación de paper.open_position.
@@ -51,6 +86,7 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
     mantener simetría — cualquier mejora a los filtros se aplica a ambos.
     """
     if _check_kill_switch(conn):
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "kill_switch")
         return None, "kill_switch"
 
     sub = conn.execute(
@@ -58,11 +94,16 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         (source_wallet,),
     ).fetchone()
     if not sub:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "no_subscription")
         return None, "no_subscription"
     if sub["status"] != "active":
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
+                    detail=json.dumps({"sub_status": sub["status"]}))
         return None, "inactive"
     sizing = sub["sizing_mult"] or 1.0
     if sizing <= EPSILON:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
+                    detail=json.dumps({"sizing_mult": sizing}))
         return None, "inactive"
 
     cs = conn.execute(
@@ -74,6 +115,7 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         (source_wallet,),
     ).fetchone()
     if cs and cs["status"] == "blocked":
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "cluster_blocked")
         return None, "cluster_blocked"
     if cs and cs["status"] == "penalized":
         sizing = sizing * 0.5
@@ -83,6 +125,7 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         (source_trade_id,),
     ).fetchone()
     if dup:
+        # duplicate: no se loguea (ruido alto, valor bajo)
         return None, "duplicate"
 
     m = _ensure_market_stub(conn, condition_id, raw)
@@ -91,8 +134,12 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         liq = m["liquidity"]
         vol = m["volume"]
         if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
+            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "low_liquidity",
+                        detail=json.dumps({"liquidity": liq, "min": MIN_MARKET_LIQUIDITY_USDC}))
             return None, "low_liquidity"
         if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
+            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "low_volume",
+                        detail=json.dumps({"volume": vol, "min": MIN_MARKET_VOLUME_USDC}))
             return None, "low_volume"
         cat = m["category"]
         if cat:
@@ -100,13 +147,18 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
                 "SELECT status FROM category_perf WHERE category=?", (cat,)
             ).fetchone()
             if cat_row and cat_row["status"] == "blocked":
+                _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "category_blocked",
+                            detail=json.dumps({"category": cat}))
                 return None, "category_blocked"
 
     from src.copybot.policy import is_blocked as policy_blocked
     if policy_blocked(category=cat, entry_at=timestamp, entry_price=price):
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "policy_blocked",
+                    detail=json.dumps({"category": cat}))
         return None, "policy_blocked"
 
     if price < 0.05 or price > 0.95:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "extreme_price")
         return None, "extreme_price"
 
     size_usdc = LIVE_BASE_USDC * sizing
@@ -115,6 +167,9 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
     # no vale la pena. Esto descarta trades donde sizing_mult dejó el size muy chico.
     expected = expected_net_pnl(size_usdc)
     if expected < LIVE_MIN_EXPECTED_PNL_USDC:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "expected_pnl_too_low",
+                    detail=json.dumps({"size_usdc": size_usdc, "expected": expected,
+                                        "min": LIVE_MIN_EXPECTED_PNL_USDC}))
         return None, "expected_pnl_too_low"
 
     # Cap por wallet (forzosa diversificación): no más de X open por wallet.
@@ -127,6 +182,9 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         (source_wallet,),
     ).fetchone()["v"]
     if wallet_open + size_usdc > LIVE_MAX_PER_WALLET_USDC + EPSILON:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "wallet_concentration",
+                    detail=json.dumps({"open_usdc": wallet_open, "size_usdc": size_usdc,
+                                        "cap": LIVE_MAX_PER_WALLET_USDC}))
         return None, "wallet_concentration"
 
     per_market_cap = LIVE_CAPITAL_USDC * MAX_PER_MARKET_PCT
@@ -139,12 +197,18 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         (condition_id,),
     ).fetchone()["v"]
     if market_open + size_usdc > per_market_cap + EPSILON:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "market_concentration",
+                    detail=json.dumps({"open_usdc": market_open, "size_usdc": size_usdc,
+                                        "cap": per_market_cap}))
         return None, "market_concentration"
 
     global_open = conn.execute(
         "SELECT COALESCE(SUM(entry_size_usdc), 0) as v FROM live_trades WHERE status='open'"
     ).fetchone()["v"]
     if global_open + size_usdc > LIVE_CAPITAL_USDC + EPSILON:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "capital_full",
+                    detail=json.dumps({"open_usdc": global_open, "size_usdc": size_usdc,
+                                        "cap": LIVE_CAPITAL_USDC}))
         return None, "capital_full"
 
     return (size_usdc, m, cat), None
@@ -186,6 +250,7 @@ def open_position(
         token_id = get_token_id(condition_id, outcome_index)
     if not token_id:
         log.warning("no se pudo resolver token_id para cid=%s oi=%s", condition_id[:10], outcome_index)
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "no_token_id")
         return None, "no_token_id"
 
     # Ejecutar la orden
@@ -199,10 +264,21 @@ def open_position(
     if not order.ok:
         log.warning("BUY no matcheada: %s (cid=%s.. price=%.3f)",
                     order.error, condition_id[:10], price)
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "order_unmatched",
+                    detail=json.dumps({"error": str(order.error)[:200]}) if order.error else None)
         return None, "order_unmatched"
 
     actual_price = order.avg_price or price
+    # Slippage pesimista para dry-run: el CLOB simulado nos devuelve el mid,
+    # pero un fill real en BUY pagaría más. Ajustamos para que el PnL
+    # proyectado sea realista. Solo aplica si el trade fue realmente dry.
+    if LIVE_DRY_RUN:
+        actual_price = _apply_dry_slippage("BUY", actual_price)
     actual_shares = order.filled_size or (size_usdc / actual_price if actual_price > 0 else 0)
+    # Si ajustamos el precio post-fill, recalculamos shares para mantener
+    # consistencia size_usdc = shares * price (size_usdc es lo que "gastamos").
+    if LIVE_DRY_RUN and actual_price > 0:
+        actual_shares = size_usdc / actual_price
 
     market_slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
     with tx() as conn:
@@ -289,6 +365,9 @@ def close_position(
         return None
 
     actual_exit_price = order.avg_price or price
+    # Slippage pesimista en dry-run: SELL recibe menos que el mid.
+    if is_dry or LIVE_DRY_RUN:
+        actual_exit_price = _apply_dry_slippage("SELL", actual_exit_price)
     actual_exit_shares = order.filled_size or shares
     gross_pnl = _settle_pnl_shares(entry_price, actual_exit_shares, actual_exit_price)
     fee_usdc, _gas, net_pnl = post_close_costs(gross_pnl)
@@ -359,6 +438,9 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
         return
 
     actual_price = order.avg_price or exit_price
+    # Slippage pesimista en dry-run: SELL recibe menos que el mid.
+    if is_dry or LIVE_DRY_RUN:
+        actual_price = _apply_dry_slippage("SELL", actual_price)
     actual_shares = order.filled_size or shares
     gross = _settle_pnl_shares(entry_price, actual_shares, actual_price)
     fee, _gas, net = post_close_costs(gross)

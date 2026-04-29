@@ -240,6 +240,23 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_live_source ON live_trades(source_wallet)",
     "CREATE INDEX IF NOT EXISTS idx_live_entry ON live_trades(entry_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_live_token ON live_trades(token_id)",
+    # Live rejects: cada vez que un trade es descartado por el pipeline de
+    # validación live, dejamos un registro con la razón y contexto. Sirve
+    # para entender POR QUÉ no se abrieron posiciones (filtros muy duros,
+    # concentración, kill_switch, etc.) sin tener que reproducir el trade.
+    """CREATE TABLE IF NOT EXISTS live_rejects (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        at              INTEGER NOT NULL,
+        source_wallet   TEXT NOT NULL,
+        condition_id    TEXT,
+        outcome_index   INTEGER,
+        side            TEXT,
+        price           REAL,
+        reason          TEXT NOT NULL,
+        detail          TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_live_rejects_at ON live_rejects(at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_live_rejects_reason ON live_rejects(reason, at DESC)",
 ]
 
 

@@ -77,5 +77,17 @@ LIVE_MAX_SLIPPAGE_PCT = float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03"))  # 3%
 # re-intentamos con price * (1 + X) en BUY (peor para nosotros, mejor chance).
 LIVE_RETRY_PRICE_BUMP_PCT = float(os.getenv("LIVE_RETRY_PRICE_BUMP_PCT", "0.01"))  # 1%
 
+# Slippage pesimista para simulaciones dry-run en modo live. El CLOB devuelve
+# avg_price = price (mid optimista) cuando dry_run=True, lo que infla el PnL.
+# Aplicamos este % en executor.py para que la simulación se parezca más a un
+# fill real (BUY paga más, SELL recibe menos).
+LIVE_DRY_SLIPPAGE_PCT = float(os.getenv("LIVE_DRY_SLIPPAGE_PCT", "0.015"))  # 1.5% pesimista
+
+# ---------- WebSocket trades listener (Polymarket RTDS) ----------
+# Feature flag para activar el listener de la RTDS WebSocket
+# (`activity:trades`) en lugar del polling HTTP cada 5s.
+# Default: false — el módulo existe pero no se enchufa al runner todavía.
+WEBSOCKET_TRADES_ENABLED = os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)
