@@ -301,10 +301,19 @@ async def run_loop(*, once: bool = False) -> None:
                 continue
 
             t0 = time.time()
+            # Polling paralelo: todos los wallets a la vez (httpx maneja concurrencia,
+            # SQLite con WAL + asyncio single-thread tolera escrituras intercaladas).
+            results = await asyncio.gather(
+                *(_process_wallet(client, w) for w in wallets),
+                return_exceptions=True,
+            )
             total_examined = 0
             total_actions = 0
-            for w in wallets:
-                ex, ac = await _process_wallet(client, w)
+            for w, r in zip(wallets, results):
+                if isinstance(r, Exception):
+                    log.warning("wallet %s falló en gather: %s", w[:10], r)
+                    continue
+                ex, ac = r
                 total_examined += ex
                 total_actions += ac
 
