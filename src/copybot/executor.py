@@ -333,7 +333,8 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
     with tx() as conn:
         row = conn.execute(
             """
-            SELECT entry_price, entry_shares, token_id, dry_run, status
+            SELECT entry_price, entry_shares, token_id, dry_run, status,
+                   source_wallet, condition_id
             FROM live_trades WHERE id=?
             """,
             (live_trade_id,),
@@ -344,6 +345,8 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
         shares = row["entry_shares"]
         token_id = row["token_id"]
         is_dry = bool(row["dry_run"])
+        source_wallet = row["source_wallet"]
+        condition_id = row["condition_id"]
 
     sell_size_usdc = shares * exit_price
     order = place_market_order(
@@ -373,6 +376,24 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
             (actual_price, order.order_id, order.tx_hash, actual_shares,
              fee, net, status, reason, live_trade_id),
         )
+        accum = conn.execute(
+            "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+        ).fetchone()["a"]
+        slug_row = conn.execute(
+            "SELECT slug FROM markets WHERE condition_id=?", (condition_id,)
+        ).fetchone()
+        market_slug = slug_row["slug"] if slug_row else None
+
+    try:
+        from src.copybot.notifier import live_close
+        live_close(
+            source_wallet=source_wallet, market_slug=market_slug,
+            pnl_usdc=net, accumulated=accum,
+            exit_reason=reason, tx_hash=order.tx_hash, dry_run=is_dry,
+        )
+    except Exception:
+        pass
 
 
 def settle_resolved() -> int:
@@ -389,7 +410,8 @@ def settle_resolved() -> int:
         rows = conn.execute(
             """
             SELECT lt.id, lt.entry_price, lt.entry_shares, lt.outcome_index,
-                   m.outcome_prices
+                   lt.source_wallet, lt.condition_id, lt.dry_run,
+                   m.outcome_prices, m.slug
             FROM live_trades lt
             JOIN markets m ON m.condition_id = lt.condition_id
             WHERE lt.status='open' AND m.closed=1
@@ -397,6 +419,7 @@ def settle_resolved() -> int:
         ).fetchall()
 
     to_settle = []
+    notif_payload = []  # (source_wallet, slug, net, dry_run) por trade settleado
     for r in rows:
         try:
             prices = json.loads(r["outcome_prices"] or "[]")
@@ -407,6 +430,9 @@ def settle_resolved() -> int:
         fee, _gas, net = post_close_costs(gross)
         status = "settled_win" if net > 0 else "settled_loss"
         to_settle.append((payout, fee, net, status, r["id"]))
+        notif_payload.append((
+            r["source_wallet"], r["slug"], net, bool(r["dry_run"]),
+        ))
 
     if not to_settle:
         return 0
@@ -421,6 +447,22 @@ def settle_resolved() -> int:
             """,
             to_settle,
         )
+        accum = conn.execute(
+            "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+        ).fetchone()["a"]
     settled = len(to_settle)
+
+    try:
+        from src.copybot.notifier import live_close
+        for src_wallet, slug, net, is_dry in notif_payload:
+            live_close(
+                source_wallet=src_wallet, market_slug=slug,
+                pnl_usdc=net, accumulated=accum,
+                exit_reason="market_resolved", tx_hash=None, dry_run=is_dry,
+            )
+    except Exception:
+        pass
+
     log.info("settled %d live_trades (recordá hacer Redeem en polymarket.com)", settled)
     return settled

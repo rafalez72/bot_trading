@@ -694,6 +694,27 @@ PnL acumulado: +$1,470.66 sobre cap $100
   `LIVE_BASE_USDC`. Si en algún momento bajamos cap o base, hay que
   ajustar el threshold proporcionalmente para no quedar en zombie mode.
 
+### 2026-04-29 (tarde) — Bug: notif Telegram silenciosa en SL/TP/settle live
+- Síntoma: usuario reporta 4 trades cerrados (3 closed_loss, 1 closed_win
+  +$8.44 take_profit_112pct) pero CERO notificaciones de Telegram al
+  cerrarse.
+- Causa: `executor.close_position` SÍ llamaba `notifier.live_close()`,
+  pero `executor.force_close()` (que dispara los SL/TP del sweep) y
+  `executor.settle_resolved()` (cierre por mercado resuelto) NO lo
+  hacían. Como casi todos los cierres reales en dry-run son por SL/TP
+  (los wallets copiados rara vez hacen SELL exacto que matchee el flow
+  de `close_position`), el usuario nunca recibía notif.
+- Fix: agregar la llamada a `live_close()` en ambas funciones, con el
+  mismo cálculo de `accumulated` y lookup del `slug` que ya hacía
+  `close_position`. `settle_resolved` ahora itera y manda una notif
+  por cada trade settleado.
+- Bug equivalente en paper: `paper.force_close` y `paper.settle_resolved`
+  llaman a `on_paper_trade_closed()` que SÍ manda `gain`/`loss` desde
+  `learning.py`. Por eso el paper nunca tuvo este bug — solo el live.
+- Detalle: en live también se podría centralizar via un hook similar
+  (ej. `on_live_trade_closed`) pero lo mantengo simple — son 6 líneas
+  duplicadas en 3 sitios.
+
 ### 2026-04-29 (tarde) — Yak shave del Docker credential helper
 - El cron `update_and_restart.bat` falló al hacer `docker compose pull`
   con `error getting credentials - "A specified logon session does not
