@@ -549,9 +549,18 @@ Si abrís un chat nuevo y el AI no sabe nada del proyecto:
 ```
 LIVE_MODE=true
 LIVE_DRY_RUN=true     ← validando antes de plata real
-LIVE_CAPITAL_USDC=30
-LIVE_BASE_USDC=2.5
+LIVE_CAPITAL_USDC=100
+LIVE_BASE_USDC=5.0
+LIVE_MAX_PER_WALLET_USDC=10  (default config.py)
+LIVE_MIN_EXPECTED_PNL_USDC=0.50  (default config.py)
+LOG_LEVEL=INFO
 ```
+
+> Cap subido de $30 → $100 el 2026-04-29 mediodía: con base=$2.5 y los
+> `sizing_mult` < 1.0 del bandit, el filtro `expected_pnl_too_low`
+> rechazaba todos los BUYs (expected net ~$0.41 < $0.50 mínimo). Al
+> volver al setting del paper (cap=$100, base=$5) el filtro queda
+> calibrado y el bot opera normalmente.
 
 ### Polymarket account (con problemas — ver caveat #11)
 ```
@@ -571,8 +580,10 @@ PnL acumulado: +$1,470.66 sobre cap $100
 
 **Live dry-run (en validación):**
 ```
-2 trades cerrados (todos del wallet 0xa535fabc97)
+2 trades cerrados (todos del wallet 0xa535fabc97, cap=$30 inicial)
 2 stop-losses al -54% y -60% · PnL: -$3.99
++ trade #3 abierto el 29/04 12:18 ARG (después del cambio a cap=$100)
+  wallet 0x6f84f94cef · BUY @ 0.500 · size $7.83 · open
 ```
 
 ---
@@ -657,6 +668,49 @@ PnL acumulado: +$1,470.66 sobre cap $100
 - Cubre tanto reset por CLI (`reset-killswitch`) como por Telegram
   (`/killswitch`) — ambos pasan por la misma función.
 
+### 2026-04-29 (tarde) — Diagnóstico "examined>0 pero 0 OPEN" + cap $30→$100
+- Síntoma: post deploy del listener + reset thresholds, el bot tenía
+  20 wallets activas, los cursores avanzaban, pero `live_trades`
+  seguía con solo los 2 trades viejos. Cero aperturas nuevas durante
+  ~30 min.
+- Verificación contra Data API: 8 de los 20 wallets activos hicieron
+  47 BUYs en los últimos 30 min. El bot SÍ los veía (cursores
+  actualizados) pero los rechazaba todos.
+- Diagnóstico con `LOG_LEVEL=DEBUG`: causa principal era
+  `expected_pnl_too_low`. Con `LIVE_BASE_USDC=2.5` y los `sizing_mult`
+  del bandit (mayoría < 1.0), el `realism.expected_net_pnl(size_eff)`
+  devolvía ~$0.41, debajo del threshold $0.50 → todos los BUYs
+  rechazados silenciosamente. Causa secundaria: `cluster_blocked`
+  (algunos clusters siguen bloqueados por mala perf histórica).
+- **Solución (sin código nuevo, solo .env)**: subir cap a $100 y base
+  a $5 — los valores que validamos en paper. Math:
+  ```
+  size_eff = 5 * 0.78 = 3.9
+  net = 1.06 - 0.05 - 0.10 = ~0.92  ✓ pasa $0.50
+  ```
+- Resultado: trade #3 abierto a las 15:21 UTC, wallet `0x6f84f94c…`,
+  BUY @ 0.500, size $7.83 (= 5 × 1.57 sizing_mult).
+- Lección: el threshold `LIVE_MIN_EXPECTED_PNL_USDC` no escala con
+  `LIVE_BASE_USDC`. Si en algún momento bajamos cap o base, hay que
+  ajustar el threshold proporcionalmente para no quedar en zombie mode.
+
+### 2026-04-29 (tarde) — Yak shave del Docker credential helper
+- El cron `update_and_restart.bat` falló al hacer `docker compose pull`
+  con `error getting credentials - "A specified logon session does not
+  exist"`. Causa: helper de Docker Desktop (wincred) acumula sesiones
+  expiradas tras varios días sin reiniciar Docker Desktop. Esto bloquea
+  CUALQUIER pull, incluso de imágenes públicas como `python:3.11-slim`.
+- Workaround aplicado: editar `~/.docker/config.json` para inyectar
+  `auths.ghcr.io.auth` directamente como base64 (skip helper). Funcionó
+  para destrabar el deploy.
+- Pendiente recomendado:
+  1. Hacer público el package GHCR
+     (https://github.com/users/rafalez72/packages/container/bot_trading/settings
+     → "Change visibility" → Public). Así el cron funciona sin login.
+  2. Limpiar el `auths` del config para no dejar el PAT en plaintext.
+- El PAT usado para el destrabe (`ghp_zHs7…`) debe revocarse en
+  github.com/settings/tokens.
+
 ---
 
 ## 17. Pendientes inmediatos (post-validación dry-run)
@@ -665,10 +719,13 @@ PnL acumulado: +$1,470.66 sobre cap $100
 |---|--------|-------|
 | 1 | Crear wallet **limpia** (NO `0x110345...`) | La actual tiene private key comprometida (compartida en chat) |
 | 2 | Generar API creds nuevas con esa wallet | El bot necesita firmar con clave que vos solo conozcas |
-| 3 | Fundear $30 USDC en la nueva wallet | Plata real para arrancar |
+| 3 | Fundear ~$100 USDC en la nueva wallet | Cap actualizado a $100 (espejo del paper) |
 | 4 | Cambiar `.env` de Lenovo con creds + funder nuevos | Switch a la wallet limpia |
-| 5 | Reset kill switch + dejar 1-2h en dry-run con wallet limpia | Confirmar cero issues |
+| 5 | Dejar acumular ≥30 trades en dry-run con wallet limpia | Tener muestra estadísticamente válida antes de real (auto_filter mínimo es 30) |
 | 6 | `LIVE_DRY_RUN=false` → live real | Arranque |
+| 7 | Hacer **público** el package GHCR (1 click) | Para que el cron auto-update no se rompa con el credential helper de Docker Desktop. URL: github.com/users/rafalez72/packages/container/bot_trading/settings → Change visibility → Public |
+| 8 | Revocar PAT `ghp_zHs7…` | Quedó en el chat para destrabar el deploy del 29/04 |
+| 9 | Limpiar `auths` del `~/.docker/config.json` de Lenovo | Después del paso 7, ya no necesita login para pullear |
 
 ### Caveat #11: wallet 0x110345... comprometida (NO usar para real)
 La private key de esa wallet circuló en el chat de configuración y debe considerarse pública. Cualquier USDC depositado ahí puede ser robado. **Solo usar para dry-run sin fondos** mientras se valida el código.
