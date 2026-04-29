@@ -342,15 +342,213 @@
             </template>
         </section>
 
+        <!-- TAB: LIVE (Producción / dry-run) ---------- -->
+        <section x-show="tab==='live'" class="px-4 py-4 space-y-4">
+
+            <!-- Banner modo -->
+            <div class="rounded-2xl p-4 border"
+                 :class="liveSummary?.mode === 'live_real' ? 'bg-rose-900/30 border-rose-700' :
+                         liveSummary?.mode === 'live_dry'  ? 'bg-amber-900/30 border-amber-700' :
+                                                             'bg-slate-900 border-slate-800'">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-xs uppercase tracking-wide"
+                           :class="liveSummary?.mode === 'live_real' ? 'text-rose-300' :
+                                   liveSummary?.mode === 'live_dry'  ? 'text-amber-300' :
+                                                                       'text-slate-400'">
+                            Modo
+                        </p>
+                        <p class="text-xl font-bold mt-0.5">
+                            <span x-show="liveSummary?.mode === 'live_real'" class="text-rose-300">⚠️ LIVE REAL</span>
+                            <span x-show="liveSummary?.mode === 'live_dry'" class="text-amber-300">🧪 LIVE DRY-RUN</span>
+                            <span x-show="liveSummary?.mode === 'off'" class="text-slate-400">— OFF (paper only)</span>
+                        </p>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-xs text-slate-400">Balance USDC</p>
+                        <p class="text-xl font-bold"
+                           x-text="liveSummary?.wallet?.balance_usdc !== null && liveSummary?.wallet?.balance_usdc !== undefined ? fmtUsd(liveSummary.wallet.balance_usdc) : '—'"></p>
+                    </div>
+                </div>
+                <p class="text-[11px] text-slate-400 mt-2 font-mono truncate"
+                   x-show="liveSummary?.wallet?.funder"
+                   x-text="liveSummary?.wallet?.funder"></p>
+            </div>
+
+            <!-- Stats grid -->
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-gradient-to-br from-emerald-900/40 to-emerald-950 border border-emerald-800/50 rounded-2xl p-4">
+                    <p class="text-xs text-emerald-300 uppercase">Wins</p>
+                    <p class="text-3xl font-bold text-emerald-400 mt-1" x-text="liveSummary?.totals?.wins ?? 0"></p>
+                </div>
+                <div class="bg-gradient-to-br from-rose-900/40 to-rose-950 border border-rose-800/50 rounded-2xl p-4">
+                    <p class="text-xs text-rose-300 uppercase">Losses</p>
+                    <p class="text-3xl font-bold text-rose-400 mt-1" x-text="liveSummary?.totals?.losses ?? 0"></p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 col-span-2">
+                    <p class="text-xs text-slate-400 uppercase">PnL Live</p>
+                    <div class="flex items-baseline gap-2 mt-1">
+                        <p class="text-3xl font-bold"
+                           :class="(liveSummary?.totals?.pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                           x-text="fmtUsdSigned(liveSummary?.totals?.pnl_usdc ?? 0)"></p>
+                        <span class="text-sm text-slate-400"
+                              x-text="'(' + fmtPctSigned(liveSummary?.totals?.roi_pct ?? 0) + ')'"></span>
+                    </div>
+                    <p class="text-xs text-slate-400 mt-1">
+                        win rate <strong class="text-slate-200" x-text="fmtPct(liveSummary?.totals?.win_rate ?? 0)"></strong> ·
+                        invertidos <strong class="text-slate-200" x-text="fmtUsd(liveSummary?.totals?.invested_usdc ?? 0)"></strong>
+                    </p>
+                </div>
+            </div>
+
+            <!-- Hoy + Open -->
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <p class="text-xs text-slate-400 uppercase">Hoy (24h)</p>
+                    <p class="text-2xl font-bold mt-1"
+                       :class="(liveSummary?.today?.pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                       x-text="fmtUsdSigned(liveSummary?.today?.pnl_usdc ?? 0)"></p>
+                    <p class="text-xs text-slate-500 mt-1">
+                        <span class="text-emerald-400" x-text="(liveSummary?.today?.wins ?? 0) + 'W'"></span> /
+                        <span class="text-rose-400" x-text="(liveSummary?.today?.losses ?? 0) + 'L'"></span>
+                    </p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <p class="text-xs text-slate-400 uppercase">Abiertas ahora</p>
+                    <p class="text-2xl font-bold text-slate-100 mt-1" x-text="liveSummary?.open?.n ?? 0"></p>
+                    <p class="text-xs text-slate-500 mt-1"
+                       x-text="fmtUsd(liveSummary?.open?.invested_usdc ?? 0) + ' USDC'"></p>
+                </div>
+            </div>
+
+            <!-- Dry-run vs Real -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4"
+                 x-show="liveSummary?.by_dry_run">
+                <h2 class="text-sm font-semibold uppercase text-slate-300 mb-3">Dry-run vs Real</h2>
+                <div class="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                        <p class="text-xs text-amber-300">🧪 Dry-run (simuladas)</p>
+                        <p class="text-lg font-bold" x-text="(liveSummary?.by_dry_run?.['1']?.n ?? 0) + ' trades'"></p>
+                        <p class="text-xs"
+                           :class="(liveSummary?.by_dry_run?.['1']?.pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                           x-text="fmtUsdSigned(liveSummary?.by_dry_run?.['1']?.pnl ?? 0)"></p>
+                    </div>
+                    <div>
+                        <p class="text-xs text-rose-300">💵 Real (con USDC)</p>
+                        <p class="text-lg font-bold" x-text="(liveSummary?.by_dry_run?.['0']?.n ?? 0) + ' trades'"></p>
+                        <p class="text-xs"
+                           :class="(liveSummary?.by_dry_run?.['0']?.pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                           x-text="fmtUsdSigned(liveSummary?.by_dry_run?.['0']?.pnl ?? 0)"></p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Configuración activa -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <h2 class="text-sm font-semibold uppercase text-slate-300 mb-3">Configuración</h2>
+                <div class="grid grid-cols-2 gap-2 text-xs">
+                    <div class="flex justify-between"><span class="text-slate-500">Capital cap</span>
+                        <strong x-text="fmtUsd(liveSummary?.config?.capital_usdc ?? 0)"></strong></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Base size</span>
+                        <strong x-text="fmtUsd(liveSummary?.config?.base_usdc ?? 0)"></strong></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Max/wallet</span>
+                        <strong x-text="fmtUsd(liveSummary?.config?.max_per_wallet_usdc ?? 0)"></strong></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Min PnL</span>
+                        <strong x-text="fmtUsd(liveSummary?.config?.min_expected_pnl_usdc ?? 0)"></strong></div>
+                    <div class="flex justify-between col-span-2"><span class="text-slate-500">Max slippage</span>
+                        <strong x-text="((liveSummary?.config?.max_slippage_pct ?? 0)*100).toFixed(1) + '%'"></strong></div>
+                </div>
+            </div>
+
+            <!-- Top wallets en live -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden"
+                 x-show="liveSummary?.top_wallets?.length > 0">
+                <div class="px-4 py-3 border-b border-slate-800">
+                    <h2 class="text-sm font-semibold uppercase text-slate-300">Top wallets en live</h2>
+                </div>
+                <div class="divide-y divide-slate-800">
+                    <template x-for="w in liveSummary?.top_wallets ?? []" :key="w.wallet">
+                        <div class="px-4 py-3 flex items-center justify-between">
+                            <div>
+                                <p class="font-mono text-xs text-slate-400" x-text="w.wallet"></p>
+                                <p class="text-xs text-slate-500 mt-0.5">
+                                    <span class="text-emerald-400" x-text="w.wins + 'W'"></span> /
+                                    <span class="text-rose-400" x-text="w.losses + 'L'"></span> ·
+                                    <span x-text="w.n + ' trades'"></span>
+                                </p>
+                            </div>
+                            <p class="text-base font-bold"
+                               :class="w.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+                               x-text="fmtUsdSigned(w.pnl)"></p>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Trades recientes en live -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-sm font-semibold uppercase text-slate-300">Últimos trades live</h2>
+                    <span class="text-xs text-slate-500" x-text="liveTrades.length + ''"></span>
+                </div>
+                <div class="divide-y divide-slate-800 max-h-96 overflow-y-auto">
+                    <template x-for="t in liveTrades.slice(0, 30)" :key="t.id">
+                        <div class="px-4 py-3 flex items-center justify-between gap-3">
+                            <div class="min-w-0 flex-1">
+                                <p class="text-xs">
+                                    <span class="font-mono text-slate-400" x-text="shortWallet(t.source_wallet)"></span>
+                                    <span class="ml-1 text-[10px] px-1.5 py-0.5 rounded"
+                                          :class="t.dry_run ? 'bg-amber-900/40 text-amber-300' : 'bg-rose-900/40 text-rose-300'"
+                                          x-text="t.dry_run ? 'DRY' : 'REAL'"></span>
+                                    <span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300"
+                                          x-text="t.status"></span>
+                                </p>
+                                <p class="text-xs text-slate-400 mt-0.5">
+                                    <span x-text="t.side"></span>
+                                    <span x-text="' · entry ' + (t.entry_price ?? 0).toFixed(3)"></span>
+                                    <span x-show="t.exit_price" x-text="' → exit ' + (t.exit_price ?? 0).toFixed(3)"></span>
+                                </p>
+                                <p class="text-[10px] text-slate-500 mt-0.5" x-show="t.exit_reason" x-text="t.exit_reason"></p>
+                            </div>
+                            <div class="text-right shrink-0">
+                                <p class="text-sm font-bold"
+                                   :class="(t.pnl_usdc ?? 0) > 0 ? 'text-emerald-400' : (t.pnl_usdc ?? 0) < 0 ? 'text-rose-400' : 'text-slate-400'"
+                                   x-text="t.pnl_usdc != null ? fmtUsdSigned(t.pnl_usdc) : fmtUsd(t.entry_size_usdc)"></p>
+                                <p class="text-[10px] text-slate-500" x-text="t.pnl_usdc != null ? 'pnl' : 'size'"></p>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="liveTrades.length === 0">
+                        <div class="px-4 py-8 text-center text-sm text-slate-500">
+                            Sin trades live aún. Aparecerán cuando los wallets copiados operen.
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Aviso si esta en off -->
+            <div x-show="liveSummary?.mode === 'off'"
+                 class="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-center text-xs text-slate-400">
+                Live trading desactivado. Activá <code class="bg-slate-800 px-1.5 py-0.5 rounded">LIVE_MODE=true</code>
+                en el .env para empezar a usar esta tab.
+            </div>
+        </section>
+
         <!-- Bottom nav (mobile) -->
-        <nav class="fixed bottom-0 inset-x-0 bg-slate-950/95 backdrop-blur border-t border-slate-800 grid grid-cols-4 z-30 pb-[env(safe-area-inset-bottom)]">
+        <nav class="fixed bottom-0 inset-x-0 bg-slate-950/95 backdrop-blur border-t border-slate-800 grid grid-cols-5 z-30 pb-[env(safe-area-inset-bottom)]">
             <button @click="tab='home'" :class="tab==='home' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
                 <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
-                Resumen
+                Paper
             </button>
             <button @click="tab='copying'" :class="tab==='copying' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
                 <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                 Copiando
+            </button>
+            <button @click="tab='live'" :class="tab==='live' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px] relative">
+                <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                Live
+                <span x-show="liveSummary?.mode === 'live_real'" class="absolute top-2 right-1/4 w-2 h-2 bg-rose-500 rounded-full animate-pulse"></span>
+                <span x-show="liveSummary?.mode === 'live_dry'" class="absolute top-2 right-1/4 w-2 h-2 bg-amber-500 rounded-full"></span>
             </button>
             <button @click="tab='top'" :class="tab==='top' ? 'text-indigo-400' : 'text-slate-400'" class="py-3 flex flex-col items-center text-[11px]">
                 <svg class="w-5 h-5 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>

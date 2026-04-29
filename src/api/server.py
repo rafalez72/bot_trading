@@ -172,6 +172,176 @@ def api_health() -> dict:
     return {"ok": True, "markets": n}
 
 
+# ---------- LIVE (Fase 5) ----------
+
+@app.get("/api/live/summary")
+def api_live_summary() -> dict:
+    """Resumen del modo live (real o dry-run). Lee de live_trades."""
+    import time as _t
+    from src.config import (
+        LIVE_BASE_USDC, LIVE_CAPITAL_USDC, LIVE_DRY_RUN, LIVE_MODE,
+        LIVE_MAX_PER_WALLET_USDC, LIVE_MIN_EXPECTED_PNL_USDC,
+        LIVE_MAX_SLIPPAGE_PCT, POLYMARKET_FUNDER_ADDRESS,
+    )
+
+    if LIVE_MODE:
+        mode = "live_dry" if LIVE_DRY_RUN else "live_real"
+    else:
+        mode = "off"
+
+    today_ts = int(_t.time()) - 86400
+    with db() as conn:
+        # Counts por estado
+        rows = conn.execute(
+            "SELECT status, dry_run, COUNT(*) as n, SUM(pnl_usdc) as pnl "
+            "FROM live_trades GROUP BY status, dry_run"
+        ).fetchall()
+
+        opens = conn.execute(
+            "SELECT COUNT(*) as n, COALESCE(SUM(entry_size_usdc), 0) as inv "
+            "FROM live_trades WHERE status='open'"
+        ).fetchone()
+
+        # Wins/losses totales
+        wl = conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN status IN ('closed_win','settled_win') THEN 1 ELSE 0 END) as wins, "
+            "  SUM(CASE WHEN status IN ('closed_loss','settled_loss') THEN 1 ELSE 0 END) as losses, "
+            "  COALESCE(SUM(pnl_usdc), 0) as pnl, "
+            "  SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss') THEN entry_size_usdc ELSE 0 END) as invested "
+            "FROM live_trades"
+        ).fetchone()
+
+        # Hoy (ultimas 24h)
+        today = conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN status IN ('closed_win','settled_win') THEN 1 ELSE 0 END) as wins, "
+            "  SUM(CASE WHEN status IN ('closed_loss','settled_loss') THEN 1 ELSE 0 END) as losses, "
+            "  COALESCE(SUM(pnl_usdc), 0) as pnl "
+            "FROM live_trades "
+            "WHERE exit_at >= ? "
+            "AND status IN ('closed_win','closed_loss','settled_win','settled_loss')",
+            (today_ts,),
+        ).fetchone()
+
+        # Cuántos son dry vs real
+        by_dry = conn.execute(
+            "SELECT dry_run, COUNT(*) as n, COALESCE(SUM(pnl_usdc),0) as pnl "
+            "FROM live_trades WHERE status IN "
+            "('closed_win','closed_loss','settled_win','settled_loss') GROUP BY dry_run"
+        ).fetchall()
+
+        # Top wallets en live
+        top_wallets = conn.execute(
+            "SELECT substr(source_wallet,1,12) as wallet, COUNT(*) as n, "
+            "  SUM(CASE WHEN status IN ('closed_win','settled_win') THEN 1 ELSE 0 END) as wins, "
+            "  SUM(CASE WHEN status IN ('closed_loss','settled_loss') THEN 1 ELSE 0 END) as losses, "
+            "  COALESCE(SUM(pnl_usdc),0) as pnl "
+            "FROM live_trades "
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss') "
+            "GROUP BY source_wallet ORDER BY pnl DESC LIMIT 5"
+        ).fetchall()
+
+    wins = (wl["wins"] or 0) if wl else 0
+    losses = (wl["losses"] or 0) if wl else 0
+    pnl = float((wl["pnl"] or 0) if wl else 0)
+    invested = float((wl["invested"] or 0) if wl else 0)
+    win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else 0
+    roi = (pnl / invested * 100) if invested > 0 else 0
+
+    counts_by_dry = {int(r["dry_run"]): {"n": r["n"], "pnl": float(r["pnl"] or 0)} for r in by_dry}
+
+    # Balance del CLOB (lazy import para no cargar py-clob-client si no es live)
+    balance_usdc = None
+    if LIVE_MODE:
+        try:
+            from src.polymarket.clob_client import get_balance
+            balance_usdc = get_balance()
+        except Exception:
+            pass
+
+    return {
+        "mode": mode,
+        "dry_run": LIVE_DRY_RUN,
+        "config": {
+            "capital_usdc": LIVE_CAPITAL_USDC,
+            "base_usdc": LIVE_BASE_USDC,
+            "max_per_wallet_usdc": LIVE_MAX_PER_WALLET_USDC,
+            "min_expected_pnl_usdc": LIVE_MIN_EXPECTED_PNL_USDC,
+            "max_slippage_pct": LIVE_MAX_SLIPPAGE_PCT,
+        },
+        "wallet": {
+            "funder": POLYMARKET_FUNDER_ADDRESS,
+            "balance_usdc": balance_usdc,
+        },
+        "open": {
+            "n": opens["n"] if opens else 0,
+            "invested_usdc": float(opens["inv"] if opens else 0),
+        },
+        "totals": {
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "pnl_usdc": pnl,
+            "roi_pct": roi,
+            "invested_usdc": invested,
+        },
+        "today": {
+            "wins": (today["wins"] or 0) if today else 0,
+            "losses": (today["losses"] or 0) if today else 0,
+            "pnl_usdc": float((today["pnl"] or 0) if today else 0),
+        },
+        "by_dry_run": counts_by_dry,
+        "top_wallets": [dict(r) for r in top_wallets],
+    }
+
+
+@app.get("/api/live/trades")
+def api_live_trades(
+    status: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """Lista live_trades. Filtrable por status."""
+    q = "SELECT * FROM live_trades"
+    params: list = []
+    if status:
+        q += " WHERE status=?"
+        params.append(status)
+    q += " ORDER BY entry_at DESC LIMIT ?"
+    params.append(limit)
+    with db() as conn:
+        rows = conn.execute(q, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/live/pnl-timeline")
+def api_live_pnl_timeline(bucket: str = Query("hour", regex="^(hour|day)$")) -> dict:
+    """Serie temporal de PnL acumulado en live_trades."""
+    seconds = 3600 if bucket == "hour" else 86400
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                (exit_at / {seconds}) * {seconds} as t,
+                SUM(COALESCE(pnl_usdc, 0)) as bucket_pnl,
+                COUNT(*) as n
+            FROM live_trades
+            WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')
+              AND exit_at IS NOT NULL
+            GROUP BY t
+            ORDER BY t ASC
+            """,
+        ).fetchall()
+    points: list[dict] = []
+    cum = 0.0
+    for r in rows:
+        cum += r["bucket_pnl"] or 0
+        points.append(
+            {"t": int(r["t"]), "cum_pnl": cum, "delta": r["bucket_pnl"], "count": r["n"]}
+        )
+    return {"bucket": bucket, "points": points}
+
+
 # ---------- Estáticos / PWA ----------
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

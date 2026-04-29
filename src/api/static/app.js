@@ -12,6 +12,8 @@ function dashboard() {
         topTraders: [],
         markets: [],
         learning: [],
+        liveSummary: null,
+        liveTrades: [],
         chartBucket: 'hour',
         chart: null,
         hasChartData: false,
@@ -85,18 +87,22 @@ function dashboard() {
         async refresh() {
             this.loading = true;
             try {
-                const [s, c, t, m, l] = await Promise.all([
+                const [s, c, t, m, l, ls, lt] = await Promise.all([
                     fetch('/api/summary').then(r => r.json()),
                     fetch('/api/copying').then(r => r.json()),
                     fetch('/api/traders/top?limit=50').then(r => r.json()),
                     fetch('/api/markets/active?limit=20').then(r => r.json()),
                     fetch('/api/learning/events?limit=50').then(r => r.json()),
+                    fetch('/api/live/summary').then(r => r.json()).catch(() => null),
+                    fetch('/api/live/trades?limit=50').then(r => r.json()).catch(() => []),
                 ]);
                 this.summary = s;
                 this.copying = c;
                 this.topTraders = t;
                 this.markets = m;
                 this.learning = l;
+                this.liveSummary = ls;
+                this.liveTrades = lt;
                 this.lastUpdate = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 this.countdown = REFRESH_SEC;
             } catch (e) {
