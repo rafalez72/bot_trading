@@ -173,18 +173,42 @@ def live_open(*, source_wallet: str, market_slug: str | None,
 def live_close(*, source_wallet: str, market_slug: str | None,
                pnl_usdc: float, accumulated: float, exit_reason: str,
                tx_hash: str | None = None, dry_run: bool = False) -> None:
-    """Notif al cerrar una posición real."""
+    """Notif al cerrar una posición real (o simulada en dry-run).
+
+    Real: formato simple tipo paper notif, con "REAL" para distinguirlo.
+    Dry-run: formato detallado con emoji 🧪 (info para validar el flow).
+    """
     if "live_close" not in ENABLED_NOTIFICATIONS:
         return
-    prefix = "🧪 *DRY-RUN* " if dry_run else ("💵" if pnl_usdc > 0 else "🩸")
-    sign = "+" if pnl_usdc > 0 else ""
-    txt = (
-        f"{prefix} *LIVE CLOSE*\n"
-        f"Trader: `{source_wallet[:12]}...`\n"
-        f"Mercado: {market_slug or '(sin slug)'}\n"
-        f"PnL: *{sign}${pnl_usdc:.2f}*  (motivo: {exit_reason})\n"
-        f"Acumulado live: ${accumulated:+.2f}"
-    )
+
+    if dry_run:
+        # Dry-run: detallado para debugging del flow
+        sign = "+" if pnl_usdc > 0 else ""
+        txt = (
+            f"🧪 *DRY-RUN CLOSE*\n"
+            f"Trader: `{source_wallet[:12]}...`\n"
+            f"Mercado: {market_slug or '(sin slug)'}\n"
+            f"PnL: *{sign}${pnl_usdc:.2f}*  (motivo: {exit_reason})\n"
+            f"Acumulado live: ${accumulated:+.2f}"
+        )
+        if tx_hash:
+            txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
+        send(txt)
+        return
+
+    # Real: simple, tipo gain/loss de paper
+    if pnl_usdc > 0:
+        txt = (
+            f"📈 *Ganancia REAL*\n"
+            f"Ganó: ${pnl_usdc:.2f}\n"
+            f"Acumulado: ${accumulated:+.2f}"
+        )
+    else:
+        txt = (
+            f"📉 *Pérdida REAL*\n"
+            f"Perdió: ${abs(pnl_usdc):.2f}\n"
+            f"Acumulado: ${accumulated:+.2f}"
+        )
     if tx_hash:
         txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
     send(txt)
