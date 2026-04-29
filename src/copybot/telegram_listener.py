@@ -132,20 +132,54 @@ def _handle_command(cmd: str) -> str | None:
     return None  # comando no reconocido — no respondemos para evitar ruido
 
 
-async def _process_update(u: dict[str, Any], allowed_chat: int) -> None:
+async def _process_update(
+    u: dict[str, Any], allowed_chat: int, token: str
+) -> None:
     msg = u.get("message") or u.get("edited_message")
     if not msg:
         return
     chat = msg.get("chat") or {}
-    if chat.get("id") != allowed_chat:
-        log.debug("ignored telegram msg from chat_id=%s", chat.get("id"))
-        return
+    chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
+    log.info(
+        "telegram update: chat_id=%s text=%r authorized=%s",
+        chat_id, text[:60], chat_id == allowed_chat,
+    )
+    if chat_id != allowed_chat:
+        # Responder directamente a ese chat con su id, para que el usuario
+        # pueda copiarlo a TELEGRAM_CHAT_ID en el .env si quiere autorizar.
+        # Usamos requests directo (no notifier.send) porque _send_reply
+        # responde solo al chat autorizado.
+        try:
+            await _send_to_chat(
+                token, chat_id,
+                "🔒 Este chat no está autorizado para controlar el bot.\n\n"
+                f"Tu chat_id es: `{chat_id}`\n\n"
+                "Si querés autorizarlo, pedile al admin que lo agregue como "
+                "TELEGRAM_CHAT_ID en el .env.",
+            )
+        except Exception as e:
+            log.warning("reply to unauthorized chat failed: %s", e)
+        return
     if not text.startswith("/"):
         return
     reply = _handle_command(text)
     if reply:
         _send_reply(reply)
+
+
+async def _send_to_chat(token: str, chat_id: int, text: str) -> None:
+    """Envía un mensaje a un chat específico (usado para diagnóstico)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"{API_BASE}/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_notification": "true",
+            },
+        )
 
 
 async def _drain_initial(client: httpx.AsyncClient, token: str) -> int:
@@ -215,7 +249,7 @@ async def run() -> None:
                 updates = r.json().get("result") or []
                 for u in updates:
                     try:
-                        await _process_update(u, allowed)
+                        await _process_update(u, allowed, token)
                     except Exception as e:
                         log.exception("telegram update handler failed: %s", e)
                     offset = max(offset, int(u["update_id"]) + 1)

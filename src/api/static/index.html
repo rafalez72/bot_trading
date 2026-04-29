@@ -104,6 +104,19 @@
                 </p>
             </div>
 
+            <!-- Traders monitoreados -->
+            <div class="bg-slate-900 border border-indigo-800/40 rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                    <p class="text-xs text-indigo-300 uppercase tracking-wide">Traders monitoreados</p>
+                    <p class="text-3xl font-bold text-indigo-400 mt-1" x-text="summary?.copying?.active ?? 0"></p>
+                    <p class="text-xs text-slate-400 mt-1">wallets que el bot copia ahora</p>
+                </div>
+                <div class="text-right text-[11px] text-slate-500 leading-tight">
+                    <p>en pausa: <span class="text-slate-300 font-medium" x-text="summary?.copying?.paused ?? 0"></span></p>
+                    <p class="mt-0.5">droppeados: <span class="text-slate-300 font-medium" x-text="summary?.copying?.dropped ?? 0"></span></p>
+                </div>
+            </div>
+
             <!-- Big stats grid -->
             <div class="grid grid-cols-2 gap-3">
                 <div class="bg-gradient-to-br from-emerald-900/40 to-emerald-950 border border-emerald-800/50 rounded-2xl p-4">
