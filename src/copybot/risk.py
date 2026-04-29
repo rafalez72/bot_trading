@@ -56,6 +56,38 @@ def _set_kill(active: bool, reason: str = "") -> None:
             """,
             (reason,),
         )
+        # Reset manual: persistir el timestamp como "high-water mark" para
+        # que check_kill_switch ignore los trades viejos que motivaron el
+        # disparo. El bot retoma la operación con baseline limpia y solo
+        # vuelve a activarse si NUEVAS pérdidas (post-reset) superan el cap.
+        if not active:
+            conn.execute(
+                """
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES ('kill_switch_reset_at', ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = datetime('now')
+                """,
+                (str(int(time.time())),),
+            )
+
+
+def _reset_at() -> int:
+    """Lee el timestamp del último reset manual del kill switch.
+
+    Devuelve 0 si nunca se reseteó manualmente (fresh install).
+    """
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM bot_state WHERE key='kill_switch_reset_at'"
+        ).fetchone()
+    if not r:
+        return 0
+    try:
+        return int(r["value"])
+    except (TypeError, ValueError):
+        return 0
 
 
 def kill_switch_status() -> dict:
@@ -79,21 +111,32 @@ def check_kill_switch() -> bool:
     El dry-run del live debe comportarse igual que real (es la última
     validación previa a plata real), así que cuenta TODOS los trades
     cerrados de la tabla activa, incluyendo dry_run=1.
+
+    Ventana de evaluación: `max(now-24h, kill_switch_reset_at)`. El reset
+    manual actúa como high-water mark — los trades viejos que motivaron
+    el último disparo NO vuelven a contar. Si después del reset el PnL
+    de los trades nuevos cae por debajo del threshold, se reactiva.
     """
-    today_start = int(time.time()) - 86400  # rolling 24h
+    rolling_24h = int(time.time()) - 86400
+    since = max(rolling_24h, _reset_at())
     sql = f"""
-        SELECT COALESCE(SUM(pnl_usdc), 0) as pnl
+        SELECT COALESCE(SUM(pnl_usdc), 0) as pnl,
+               COUNT(*) as n
         FROM {TRADES_TABLE}
         WHERE exit_at >= ?
           AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
     """
     with db() as conn:
-        r = conn.execute(sql, (today_start,)).fetchone()
+        r = conn.execute(sql, (since,)).fetchone()
     pnl = r["pnl"] or 0
     threshold = -EFFECTIVE_CAPITAL_USDC * DAILY_KILL_SWITCH_PCT
     if pnl <= threshold:
         prev = kill_switch_status()["active"]
-        reason = f"PnL 24h ${pnl:.2f} <= -{DAILY_KILL_SWITCH_PCT*100:.0f}% del capital"
+        window = "desde reset" if since > rolling_24h else "24h"
+        reason = (
+            f"PnL {window} ${pnl:.2f} <= "
+            f"-{DAILY_KILL_SWITCH_PCT*100:.0f}% del capital"
+        )
         _set_kill(True, reason)
         if not prev:
             try:

@@ -231,6 +231,7 @@ python copybot.py telegram-test              # mensaje de prueba
 | Capa | Frecuencia | Acción |
 |------|-----------|--------|
 | **Stop-loss / Take-profit** | cada 60s | cierra posición individual al -30% / +80% |
+| **Kill switch (con reset high-water)** | cada ciclo | pausa todo si PnL < -10% del cap en `max(24h, último reset manual)`. El reset manual NO borra trades pero sí marca un "high-water mark" — los trades viejos quedan en la DB para histórico pero no vuelven a disparar. Solo nuevas pérdidas (post-reset) pueden reactivar. |
 | **Bandit UCB1** | cada cierre | recalcula `sizing_mult` de TODOS los activos |
 | **Auto-drop** | cada cierre | drop si 5 losses consecutivos |
 | **Auto-replace** | inmediato post-drop | re-corre `select_traders`, llena vacante |
@@ -240,7 +241,6 @@ python copybot.py telegram-test              # mensaje de prueba
 | **Policy bucket** | post-backtest, ≥8 trades | bloquea hora/categoría/rango_precio perdedor |
 | **Auto-tune filtros** | cada 6h | endurece/afloja MIN_WIN_RATE, MIN_VOLUME, etc. |
 | **Discovery automática** | cada 8h | discover + backfill nuevos + recluster + select |
-| **Kill switch** | cada ciclo | pausa todo si PnL 24h < -10% del cap |
 | **Daily summary** | cada 24h | (DESACTIVADO por pedido) |
 
 ---
@@ -415,6 +415,7 @@ ssh melina@100.98.174.60 "cat ~/polymarket_copybot/logs/deploy.log"
 | Dry-run del live debe igualar a real | 2026-04-29 | Es la última validación antes de plata real, no puede tener "atajos". Implica: kill_switch y auto_filter cuentan dry-run. |
 | Auto-filter lee tabla activa, no paper hard-coded | 2026-04-29 | Para que el módulo aprenda del modo actual; si no, decisiones se basan en evidencia desconectada |
 | Min 30 cierres antes de mover thresholds | 2026-04-29 | Evita endurecimiento espurio por ruido estadístico (caso del 29/04 05:22 con 2 dry-run losses) |
+| Kill switch con high-water reset (no borra trades) | 2026-04-29 | El reset manual del usuario significa "ya sé del drawdown, déjame seguir"; los trades quedan para histórico pero no vuelven a disparar. Solo nuevas pérdidas reactivan. Permite operar después de un drawdown sin perder evidencia. |
 
 ---
 
@@ -638,6 +639,23 @@ PnL acumulado: +$1,470.66 sobre cap $100
 - Reset puntual del 29/04: thresholds volvieron a `0.55/0.55/$25k/150` y
   `select --top 20` reabrió ~20 suscripciones. Esto es un one-time fix
   porque la muestra (2 trades) era estadísticamente ruido, no evidencia.
+
+### 2026-04-29 (mediodía) — Kill switch con high-water mark al reset
+- Validación del listener: usuario probó `/killswitch` desde Telegram,
+  el bot respondió OK pero al toque se reactivó porque el rolling 24h
+  seguía mostrando -$3.99 (los 2 trades viejos del setup inicial).
+- Comportamiento técnicamente correcto bajo "dry = real" pero impráctico
+  para validación: el bot quedaba pausado hasta que el rolling 24h se
+  vaciara solo (~12-15h).
+- **Cambio**: `risk._set_kill(False, …)` ahora persiste un timestamp
+  `bot_state.kill_switch_reset_at`. `check_kill_switch` evalúa la
+  ventana `[max(now-24h, reset_at), now]`. Los trades viejos no se
+  borran (siguen en `live_trades`/`paper_trades` para histórico) pero
+  no vuelven a disparar el kill switch.
+- Si después del reset hay nuevas pérdidas que superan -10% del cap,
+  se reactiva con razón `"PnL desde reset $-X.XX <= -10%..."`.
+- Cubre tanto reset por CLI (`reset-killswitch`) como por Telegram
+  (`/killswitch`) — ambos pasan por la misma función.
 
 ---
 
