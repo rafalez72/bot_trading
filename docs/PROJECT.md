@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-04-27 (migración Lenovo en curso, paso rsync)
+> **Última actualización**: 2026-04-29 (revert kill_switch dry-run filter, telegram listener, reset thresholds)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -214,6 +214,7 @@ python copybot.py backtest [--hours 168]     # replay histórico
 
 # Risk
 python copybot.py reset-killswitch           # desactivar kill switch manual
+python copybot.py reset-thresholds           # volver thresholds del selector a defaults
 
 # Dashboard
 python copybot.py serve [--port 8000]        # FastAPI + PWA
@@ -250,6 +251,12 @@ python copybot.py telegram-test              # mensaje de prueba
 - 📈 `gain` — cada trade cerrado con ganancia: "Ganancia / Ganó: $X / Acumulado: $Y"
 - 📉 `loss` — cada trade cerrado con pérdida: "Pérdida / Perdió: $X / Acumulado: $Y"
 - ⛔ `kill_switch` — cuando el bot se autopausa por safety
+
+**Comandos entrantes (telegram_listener, long polling)**:
+- `/status` — modo, kill_switch, PnL 24h, wallets activos, posiciones abiertas
+- `/killswitch` o `/resetkill` — desactiva el kill switch
+- `/help` — lista de comandos
+- Solo responde al `TELEGRAM_CHAT_ID` configurado en `.env` (otros chat_ids se ignoran).
 
 **Desactivadas (stubs en el código):**
 - `trader_dropped` (eliminada por pedido del usuario)
@@ -405,6 +412,9 @@ ssh melina@100.98.174.60 "cat ~/polymarket_copybot/logs/deploy.log"
 | Realismo es heurístico | 2026-04-27 | Calibrar con un trade real cuando lleguemos a Fase 5 |
 | Notif solo gain/loss/kill_switch | 2026-04-27 | Pedido del usuario; resto silenciado |
 | Auto-discovery en drop sin cooldown | 2026-04-27 | Procesamiento extra es trivial vs beneficio |
+| Dry-run del live debe igualar a real | 2026-04-29 | Es la última validación antes de plata real, no puede tener "atajos". Implica: kill_switch y auto_filter cuentan dry-run. |
+| Auto-filter lee tabla activa, no paper hard-coded | 2026-04-29 | Para que el módulo aprenda del modo actual; si no, decisiones se basan en evidencia desconectada |
+| Min 30 cierres antes de mover thresholds | 2026-04-29 | Evita endurecimiento espurio por ruido estadístico (caso del 29/04 05:22 con 2 dry-run losses) |
 
 ---
 
@@ -603,6 +613,31 @@ PnL acumulado: +$1,470.66 sobre cap $100
 - **Bug encontrado**: kill switch contaba dry-run trades como reales → activación incorrecta
 - **Fix** (`ac48539`): kill switch ignora `dry_run=1` en live mode
 - Notif live REAL ahora con formato simple tipo paper: "📈 Ganancia REAL / Ganó: $X / Acumulado: $Y"
+
+### 2026-04-29 (mañana) — Principio "dry-run = real" + telegram listener + min-sample auto-tune
+- **Decisión nueva**: el dry-run del live es la última prueba antes de plata real,
+  por lo tanto debe comportarse IDÉNTICO. Esto invalida el fix de `ac48539`.
+- **Revert lógico de `ac48539`**: `risk.check_kill_switch` vuelve a contar
+  trades dry-run en el rolling 24h. Si los dry-run pierden mucho, el bot
+  se autopausa exactamente como pasaría en real (validación legítima).
+- **`auto_filter` ahora lee de la TABLA ACTIVA** (`live_trades` en live,
+  `paper_trades` en paper) en vez de paper hard-coded — si no, el módulo
+  no aprendía de los trades del live y los thresholds se movían por
+  evidencia desconectada del modo actual.
+- **Nuevo umbral mínimo de muestra**: `MIN_SAMPLE_FOR_TUNE = 30` cierres
+  antes de mover thresholds (era 20). Evita que 2-3 trades disparen un
+  endurecimiento desproporcionado, problema observado el 29/04 05:22 UTC
+  cuando un auto-tune basado en una muestra contaminada subió MIN_SCORE
+  de 0.55 a 0.85 y dejó solo 3 wallets activas.
+- **Comando CLI nuevo `reset-thresholds`** para volver al baseline
+  (DEFAULTS) cuando un auto-tune fue espurio. Aplica DELETE del cooldown
+  y agrega un evento de `learning_events` para auditoría.
+- **Telegram listener** (`src/copybot/telegram_listener.py`): long polling
+  como tarea async dentro del runner. Comandos `/status`, `/killswitch`,
+  `/resetkill`, `/help`. Solo responde al `TELEGRAM_CHAT_ID` configurado.
+- Reset puntual del 29/04: thresholds volvieron a `0.55/0.55/$25k/150` y
+  `select --top 20` reabrió ~20 suscripciones. Esto es un one-time fix
+  porque la muestra (2 trades) era estadísticamente ruido, no evidencia.
 
 ---
 

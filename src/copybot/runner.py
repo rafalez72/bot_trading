@@ -273,6 +273,16 @@ async def run_loop(*, once: bool = False) -> None:
     except Exception as e:
         log.warning("no se pudo instalar telegram error handler: %s", e)
 
+    # Listener de comandos de Telegram (long polling, comandos /status, /killswitch).
+    # Corre en background — no bloquea el loop principal.
+    telegram_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.copybot import telegram_listener
+            telegram_task = asyncio.create_task(telegram_listener.run())
+        except Exception as e:
+            log.warning("no se pudo arrancar telegram listener: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

@@ -76,19 +76,16 @@ def kill_switch_status() -> dict:
 def check_kill_switch() -> bool:
     """Recalcula. Devuelve True si quedó (o sigue) activo.
 
-    En modo live, IGNORA los trades dry_run=1 (son simulados, no
-    perdemos plata real). Solo cuenta trades reales para decidir si pausar.
+    El dry-run del live debe comportarse igual que real (es la última
+    validación previa a plata real), así que cuenta TODOS los trades
+    cerrados de la tabla activa, incluyendo dry_run=1.
     """
     today_start = int(time.time()) - 86400  # rolling 24h
-    # Lee de la tabla activa (paper_trades en paper, live_trades en live).
-    # Para live_trades, filtramos dry_run=0 (solo reales cuentan).
-    extra_filter = " AND dry_run = 0" if TRADES_TABLE == "live_trades" else ""
     sql = f"""
         SELECT COALESCE(SUM(pnl_usdc), 0) as pnl
         FROM {TRADES_TABLE}
         WHERE exit_at >= ?
           AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-          {extra_filter}
     """
     with db() as conn:
         r = conn.execute(sql, (today_start,)).fetchone()

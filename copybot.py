@@ -376,6 +376,23 @@ def cmd_tune(args: argparse.Namespace) -> None:
     console.print(f"\nThresholds actuales:\n{get_all()}")
 
 
+def cmd_reset_thresholds(_args: argparse.Namespace) -> None:
+    from src.copybot.auto_filter import get_all, reset_to_defaults
+
+    changes = reset_to_defaults()
+    if not changes:
+        console.print("[yellow]Sin cambios — ya estaban en defaults.[/yellow]")
+        return
+    t = Table(title="Thresholds reseteados a defaults")
+    t.add_column("Key", style="cyan")
+    t.add_column("Antes", justify="right")
+    t.add_column("Default", justify="right", style="bold")
+    for key, (before, after) in changes.items():
+        t.add_row(key, f"{before:.2f}", f"{after:.2f}")
+    console.print(t)
+    console.print(f"\n[dim]Snapshot final: {get_all()}[/dim]")
+
+
 def cmd_categories(_args: argparse.Namespace) -> None:
     from src.copybot.categories import stats
 
@@ -584,6 +601,11 @@ def main() -> None:
     p_tn = sub.add_parser("tune", help="Ejecuta auto-tune de thresholds")
     p_tn.add_argument("--force", action="store_true")
     p_tn.set_defaults(func=cmd_tune)
+
+    sub.add_parser(
+        "reset-thresholds",
+        help="Vuelve los thresholds del selector a sus defaults iniciales",
+    ).set_defaults(func=cmd_reset_thresholds)
 
     sub.add_parser("categories", help="Performance por categoría").set_defaults(func=cmd_categories)
 

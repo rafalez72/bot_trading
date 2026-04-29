@@ -1,10 +1,14 @@
 """Auto-tuneo de los thresholds del selector basado en performance rolling.
 
 Política simple y conservadora:
-- Mira los últimos N closes del paper trading.
+- Mira los últimos N closes de la tabla ACTIVA (paper en paper mode,
+  live en live mode — incluye dry-run para que la validación previa
+  a plata real refleje el mismo comportamiento que tendría real).
 - Si win_rate < 0.40 → endurece filtros (sube MIN_WIN_RATE, MIN_VOLUME, MIN_TRADES)
 - Si win_rate > 0.65 Y hay menos de 5 traders activos → afloja un poco
   (pero nunca por debajo del piso inicial)
+- Mínimo MIN_SAMPLE_FOR_TUNE trades antes de mover thresholds (evita
+  reaccionar a ruido estadístico de pocos trades).
 - No corre más de una vez cada N horas.
 
 Persistencia: filter_thresholds (key, value).
@@ -15,6 +19,7 @@ import logging
 import time
 from typing import Any
 
+from src.copybot.tradebook import TABLE as TRADES_TABLE
 from src.db.schema import db, tx
 
 log = logging.getLogger(__name__)
@@ -43,6 +48,7 @@ DEFAULTS: dict[str, float] = {
 
 CHECK_EVERY_HOURS = 6
 WINDOW_TRADES = 100
+MIN_SAMPLE_FOR_TUNE = 30  # mínimo de cierres antes de mover thresholds
 
 
 def _get_threshold(key: str) -> float:
@@ -69,6 +75,35 @@ def _set_threshold(key: str, value: float) -> None:
 
 def get_all() -> dict[str, float]:
     return {k: _get_threshold(k) for k in DEFAULTS}
+
+
+def reset_to_defaults() -> dict[str, tuple[float, float]]:
+    """Vuelve los thresholds a los valores DEFAULTS y resetea el cooldown.
+
+    Útil cuando el auto-tune endureció con una muestra insuficiente y
+    querés volver al baseline manualmente. Devuelve un dict
+    `{key: (before, after)}` para auditar el cambio.
+    """
+    changes: dict[str, tuple[float, float]] = {}
+    for key, default in DEFAULTS.items():
+        before = _get_threshold(key)
+        if abs(before - default) > 1e-9:
+            changes[key] = (before, default)
+            _set_threshold(key, default)
+    # Resetear cooldown para que el próximo tune corra fresco
+    with tx() as conn:
+        conn.execute(
+            "DELETE FROM bot_state WHERE key='auto_filter_last_run'"
+        )
+        conn.execute(
+            """
+            INSERT INTO learning_events
+                (wallet, event_type, before_value, after_value, delta, trigger, metric_snapshot)
+            VALUES ('(system)', 'auto_tune', NULL, NULL, NULL, ?, ?)
+            """,
+            ("Manual reset a defaults", str(changes)),
+        )
+    return changes
 
 
 def _clamp(key: str, value: float, *, floor_only: bool = False) -> float:
@@ -113,17 +148,22 @@ def maybe_tune(*, force: bool = False) -> dict[str, Any] | None:
 
     with db() as conn:
         rows = conn.execute(
-            """
-            SELECT status, pnl_usdc FROM paper_trades
+            f"""
+            SELECT status, pnl_usdc FROM {TRADES_TABLE}
             WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')
             ORDER BY exit_at DESC LIMIT ?
             """,
             (WINDOW_TRADES,),
         ).fetchall()
 
-    if len(rows) < 20:
+    if len(rows) < MIN_SAMPLE_FOR_TUNE:
         _set_last_run()
-        return {"changes": {}, "reason": "muy poca data", "n": len(rows)}
+        return {
+            "changes": {},
+            "reason": f"muestra insuficiente ({len(rows)} < {MIN_SAMPLE_FOR_TUNE})",
+            "n": len(rows),
+            "table": TRADES_TABLE,
+        }
 
     wins = sum(1 for r in rows if r["status"].endswith("_win"))
     n = len(rows)
