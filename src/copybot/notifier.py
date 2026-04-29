@@ -41,7 +41,7 @@ MAX_LEN = 4000  # límite real es 4096, dejamos margen
 # startup: aviso cuando el runner arranca (post-restart).
 ENABLED_NOTIFICATIONS = {
     "gain", "loss", "kill_switch",
-    "live_open", "live_close", "live_error",
+    "live_close", "live_error",
     "log_error", "startup",
 }
 
@@ -175,40 +175,23 @@ def live_close(*, source_wallet: str, market_slug: str | None,
                tx_hash: str | None = None, dry_run: bool = False) -> None:
     """Notif al cerrar una posición real (o simulada en dry-run).
 
-    Real: formato simple tipo paper notif, con "REAL" para distinguirlo.
-    Dry-run: formato detallado con emoji 🧪 (info para validar el flow).
+    Formato simple: GANADO/PERDIDO + monto + acumulado.
+    En dry-run agrega `🧪 dry-run` al final para distinguir.
     """
     if "live_close" not in ENABLED_NOTIFICATIONS:
         return
-
-    if dry_run:
-        # Dry-run: detallado para debugging del flow
-        sign = "+" if pnl_usdc > 0 else ""
+    if pnl_usdc >= 0:
         txt = (
-            f"🧪 *DRY-RUN CLOSE*\n"
-            f"Trader: `{source_wallet[:12]}...`\n"
-            f"Mercado: {market_slug or '(sin slug)'}\n"
-            f"PnL: *{sign}${pnl_usdc:.2f}*  (motivo: {exit_reason})\n"
-            f"Acumulado live: ${accumulated:+.2f}"
-        )
-        if tx_hash:
-            txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
-        send(txt)
-        return
-
-    # Real: simple, tipo gain/loss de paper
-    if pnl_usdc > 0:
-        txt = (
-            f"📈 *Ganancia REAL*\n"
-            f"Ganó: ${pnl_usdc:.2f}\n"
-            f"Acumulado: ${accumulated:+.2f}"
+            f"🟢 *GANADO* ${pnl_usdc:.2f}\n"
+            f"PnL acumulado: ${accumulated:+.2f}"
         )
     else:
         txt = (
-            f"📉 *Pérdida REAL*\n"
-            f"Perdió: ${abs(pnl_usdc):.2f}\n"
-            f"Acumulado: ${accumulated:+.2f}"
+            f"🔴 *PERDIDO* ${abs(pnl_usdc):.2f}\n"
+            f"PnL acumulado: ${accumulated:+.2f}"
         )
+    if dry_run:
+        txt += "\n🧪 _dry-run_"
     if tx_hash:
         txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
     send(txt)
