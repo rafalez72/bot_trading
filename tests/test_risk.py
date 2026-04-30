@@ -91,8 +91,11 @@ def test_kill_switch_inactive_after_reset(isolated_db, now_ts):
     assert risk.kill_switch_status()["active"] is False
 
 
-def test_kill_switch_reactivates_on_new_losses_after_reset(isolated_db, now_ts):
+def test_kill_switch_reactivates_on_new_losses_after_reset(isolated_db, now_ts, monkeypatch):
     """After reset, NEW losses past the threshold reactivate the switch."""
+    # Disable the race-protection grace window for this test (production = 5s).
+    monkeypatch.setattr(risk, "RESET_GRACE_SECONDS", 0)
+
     # Step 1: trigger and reset.
     _insert_closed_trade(pnl=-6.0, exit_at=now_ts - 500)
     _insert_closed_trade(pnl=-6.0, exit_at=now_ts - 600)

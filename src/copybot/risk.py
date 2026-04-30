@@ -105,6 +105,9 @@ def kill_switch_status() -> dict:
     }
 
 
+RESET_GRACE_SECONDS = 5  # ventana post-reset donde no reactivamos (race protection)
+
+
 def check_kill_switch() -> bool:
     """Recalcula. Devuelve True si quedó (o sigue) activo.
 
@@ -116,9 +119,15 @@ def check_kill_switch() -> bool:
     manual actúa como high-water mark — los trades viejos que motivaron
     el último disparo NO vuelven a contar. Si después del reset el PnL
     de los trades nuevos cae por debajo del threshold, se reactiva.
+
+    Auto-recovery: si las pérdidas se recuperan por encima del threshold
+    (ej. wins compensan), desactiva automáticamente. Antes era manual-only,
+    pero combinado con un race del reset_at quedaba atascado.
     """
-    rolling_24h = int(time.time()) - 86400
-    since = max(rolling_24h, _reset_at())
+    now_ts = int(time.time())
+    rolling_24h = now_ts - 86400
+    reset_at = _reset_at()
+    since = max(rolling_24h, reset_at)
     sql = f"""
         SELECT COALESCE(SUM(pnl_usdc), 0) as pnl,
                COUNT(*) as n
@@ -130,23 +139,41 @@ def check_kill_switch() -> bool:
         r = conn.execute(sql, (since,)).fetchone()
     pnl = r["pnl"] or 0
     threshold = -EFFECTIVE_CAPITAL_USDC * DAILY_KILL_SWITCH_PCT
+    prev_active = kill_switch_status()["active"]
+
     if pnl <= threshold:
-        prev = kill_switch_status()["active"]
+        # Race protection: si recién hubo un reset (<10s), saltear la activación.
+        # Esto protege contra el caso donde reset_kill_switch corre en paralelo
+        # y otro proceso ya leyó el reset_at viejo antes del commit.
+        if now_ts - reset_at <= RESET_GRACE_SECONDS:
+            log.info(
+                "kill switch trigger suppressed: reset hace %ds (grace %ds)",
+                now_ts - reset_at, RESET_GRACE_SECONDS,
+            )
+            return prev_active  # mantener estado actual, no tocar
         window = "desde reset" if since > rolling_24h else "24h"
         reason = (
             f"PnL {window} ${pnl:.2f} <= "
             f"-{DAILY_KILL_SWITCH_PCT*100:.0f}% del capital"
         )
         _set_kill(True, reason)
-        if not prev:
+        if not prev_active:
             try:
                 from src.copybot.notifier import kill_switch_activated
                 kill_switch_activated(reason, pnl)
             except Exception as e:
                 log.warning("notifier failed: %s", e)
         return True
-    # Si está activo pero ya no se cumple la condición, lo dejamos manual
-    # (un humano debe inspeccionar antes de re-activar)
+
+    # Auto-recovery: pnl recuperado. Si estaba activo, desactivar.
+    # _set_kill(False, ...) actualiza también el reset_at para que la
+    # ventana arranque limpia.
+    if prev_active:
+        log.info(
+            "kill switch auto-recovery: PnL $%.2f > threshold $%.2f",
+            pnl, threshold,
+        )
+        _set_kill(False, f"auto-recovery: PnL ${pnl:+.2f} > threshold")
     return False
 
 
