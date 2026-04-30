@@ -358,6 +358,16 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("auto_drop_by_rejects error: %s", e)
 
+            # Recompute bandit sizings periódicamente (cada ~10 min).
+            # Antes solo se llamaba on_close — wallets dormidos nunca veían el
+            # inactivity decay aplicado. Ahora se rebalancea aunque no haya cierres.
+            if cycle % max(1, 600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.bandit import recompute_sizings
+                    recompute_sizings()
+                except Exception as e:
+                    log.exception("recompute_sizings error: %s", e)
+
             # Auto-discovery (chequea internamente si pasaron 12h)
             if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
