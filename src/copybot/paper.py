@@ -139,7 +139,10 @@ def open_position(
             return None, "no_subscription"
         if sub["status"] != "active":
             return None, "inactive"
-        sizing = sub["sizing_mult"] or 1.0
+        # Usar `is None` y NO `or` — un sizing_mult=0 (drop residual) con `or`
+        # se convertía a 1.0, dejando wallets dropped operando como zombies.
+        sm = sub["sizing_mult"]
+        sizing = 1.0 if sm is None else float(sm)
         if sizing <= EPSILON:
             return None, "inactive"
 

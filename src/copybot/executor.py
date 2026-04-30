@@ -102,7 +102,11 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
                     detail=json.dumps({"sub_status": sub["status"]}))
         return None, "inactive"
-    sizing = sub["sizing_mult"] or 1.0
+    # IMPORTANTE: usar `is None` y NO `or` — un sizing_mult=0 (drop residual)
+    # con `or` se convertía a 1.0, dejando wallets dropped operando como
+    # zombies. Ahora 0 es 0 y cae al check de EPSILON debajo.
+    sm = sub["sizing_mult"]
+    sizing = 1.0 if sm is None else float(sm)
     if sizing <= EPSILON:
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
                     detail=json.dumps({"sizing_mult": sizing}))
