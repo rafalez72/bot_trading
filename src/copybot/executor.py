@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from src.config import (
@@ -129,6 +130,16 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         return None, "duplicate"
 
     m = _ensure_market_stub(conn, condition_id, raw)
+    # Block short-duration markets (1m/5m/10m/15m). Son binarios que expiran
+    # rápido — la posición perdedora va a $0 antes que pueda dispararse el SL.
+    # Datos: 10/10 trades con SL>=70% fueron en mercados *-5m-* (-$38 pnl).
+    slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
+    if not slug and m:
+        slug = m["slug"] if "slug" in m.keys() else None
+    if slug and re.search(r"-(?:1|5|10|15)m-", slug):
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
+                    "short_duration_market", detail=json.dumps({"slug": slug}))
+        return None, "short_duration_market"
     cat = None
     if m:
         liq = m["liquidity"]

@@ -39,12 +39,13 @@ EXPLORATION_BONUS = 2.0   # constante c en UCB1
 
 def _refresh_arm(conn, wallet: str) -> None:
     """Recalcula n_pulls y sum_reward para un wallet."""
+    from src.copybot.tradebook import TABLE as TRADES_TABLE
     r = conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) as n,
             COALESCE(SUM(pnl_usdc), 0) as pnl
-        FROM paper_trades
+        FROM {TRADES_TABLE}
         WHERE source_wallet=?
           AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
         """,

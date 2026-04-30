@@ -31,7 +31,11 @@ WIN_MULT = 1.05
 LOSS_MULT = 0.85
 SIZING_MIN = 0.1
 SIZING_MAX = 2.0
-DROP_AFTER_LOSSES = 5
+DROP_AFTER_LOSSES = 3
+# PnL acumulado catastrófico → drop (independiente de racha consecutiva).
+# Default: 10% del capital. En live activamos cuando hay datos significativos.
+DROP_PNL_THRESHOLD_USDC = -10.0
+DROP_PNL_MIN_TRADES = 5
 
 
 def _log_event(
@@ -63,20 +67,24 @@ def _log_event(
 
 
 def on_paper_trade_closed(paper_trade_id: int) -> None:
-    """Llamar cada vez que un paper_trade pasa a estado terminal (win/loss).
+    """Llamar cada vez que un trade (paper o live) pasa a estado terminal.
 
     Pipeline:
       1. Trackear performance por categoría (puede bloquearla).
       2. Detectar racha de pérdidas → drop del trader.
-      3. Recalcular sizings de TODOS los activos vía UCB1.
+      3. Drop por PnL acumulado catastrófico (independiente de racha).
+      4. Recalcular sizings de TODOS los activos vía UCB1.
+
+    Funciona en paper y live: queryea la tabla activa via tradebook.TABLE.
     """
     # Dependencias dentro de la función para evitar import circular
     from src.copybot.bandit import recompute_sizings
     from src.copybot.categories import update_for_paper_trade
+    from src.copybot.tradebook import TABLE as TRADES_TABLE
 
     with tx() as conn:
         pt = conn.execute(
-            "SELECT * FROM paper_trades WHERE id=?", (paper_trade_id,)
+            f"SELECT * FROM {TRADES_TABLE} WHERE id=?", (paper_trade_id,)
         ).fetchone()
         if not pt:
             return
@@ -91,10 +99,10 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
         if not sub:
             return
 
-        # 2) Drop por racha
+        # 2) Drop por racha consecutiva
         recent = conn.execute(
-            """
-            SELECT status FROM paper_trades
+            f"""
+            SELECT status FROM {TRADES_TABLE}
             WHERE source_wallet=?
               AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
             ORDER BY exit_at DESC LIMIT ?
@@ -116,15 +124,39 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
                 (wallet,),
             )
             _log_event(
-                conn,
-                wallet,
-                "drop",
-                before,
-                0.0,
+                conn, wallet, "drop", before, 0.0,
                 f"{DROP_AFTER_LOSSES} pérdidas consecutivas",
                 {"reason": "loss_streak"},
             )
             was_dropped = True
+
+        # 3) Drop por PnL acumulado catastrófico (independiente de racha)
+        if not was_dropped:
+            agg = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(pnl_usdc), 0) p, COUNT(*) n
+                FROM {TRADES_TABLE}
+                WHERE source_wallet=?
+                  AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                """,
+                (wallet,),
+            ).fetchone()
+            if agg["n"] >= DROP_PNL_MIN_TRADES and agg["p"] <= DROP_PNL_THRESHOLD_USDC:
+                before = sub["sizing_mult"] or 1.0
+                conn.execute(
+                    """
+                    UPDATE copy_subscriptions
+                    SET status='dropped', stopped_at=datetime('now'), sizing_mult=0
+                    WHERE wallet=?
+                    """,
+                    (wallet,),
+                )
+                _log_event(
+                    conn, wallet, "drop", before, 0.0,
+                    f"PnL acumulado ${agg['p']:+.2f} en {agg['n']} trades",
+                    {"reason": "cumulative_pnl", "pnl": agg["p"], "n": agg["n"]},
+                )
+                was_dropped = True
 
     # Auto-reemplazo silencioso post-tx (sin notif por pedido del usuario)
     if was_dropped:
