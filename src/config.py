@@ -25,6 +25,18 @@ MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "10000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
+# Trailing stop: cuando la posición está +TRAIL_ACTIVATION_PCT en ganancia,
+# se activa el trailing. Si el precio cae TRAIL_DROP_PCT desde el peak,
+# se fuerza el cierre. Esto deja correr los wins grandes en vez de cortarlos
+# en TP=50%.
+TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "0.30"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "0.25"))
+
+# Diversification cap: si un solo wallet hizo > MAX_WALLET_24H_PCT de los
+# trades del bot en 24h, rechazamos nuevos copies de ese wallet hasta que
+# se diversifique. Guard: solo aplica si total >= 10 (sample chico = ruido).
+MAX_WALLET_24H_PCT = float(os.getenv("MAX_WALLET_24H_PCT", "0.50"))
+
 # ---------- Live trading (Fase 5 - plata real) ----------
 # LIVE_MODE=false → paper trading (default).
 # LIVE_MODE=true  → ejecuta órdenes reales en Polymarket CLOB.

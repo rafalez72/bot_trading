@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-04-29 (revert kill_switch dry-run filter, telegram listener, reset thresholds)
+> **Última actualización**: 2026-04-30 (paralelización polling, observabilidad, auto-pause, trailing stop, diversification cap)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -111,8 +111,9 @@ polymarket_copybot/
 | `trades` | Cada trade individual indexado (idempotente por id sintético) |
 | `trader_metrics` | Métricas calculadas: PnL, ROI, Sharpe, win_rate, drawdown, score |
 | `copy_subscriptions` | Traders que el bot está copiando (active / paused / dropped) + sizing_mult |
-| `paper_trades` | Trades simulados del bot (entry/exit/pnl/status/exit_reason/asset) |
-| `live_trades` | Trades **reales** en Polymarket CLOB (Fase 5). Mirror de paper_trades + token_id, order_id, tx_hash, fees, dry_run flag |
+| `paper_trades` | Trades simulados del bot (entry/exit/pnl/status/exit_reason/asset/peak_price) |
+| `live_trades` | Trades **reales** en Polymarket CLOB (Fase 5). Mirror de paper_trades + token_id, order_id, tx_hash, fees, dry_run flag, peak_price |
+| `live_rejects` | Cada trade rechazado por el validador (at, source_wallet, condition_id, reason, detail JSON). Observabilidad post-2026-04-30 |
 | `learning_events` | Log de cada decisión de aprendizaje (size_up, size_down, drop, etc.) |
 | `category_perf` | Performance acumulada por categoría de mercado + status (allowed/blocked) |
 | `cluster_perf` | Performance por cluster (K-means de wallets) |
@@ -136,17 +137,33 @@ LOG_LEVEL=INFO
 
 # Capital y trading
 BOT_CAPITAL_USDC=100.0           # cap fijo (no compounding)
-COPY_BASE_USDC=5.0               # apuesta base por copia
-COPY_POLL_SECONDS=10             # polling de wallets
+COPY_BASE_USDC=5.0               # apuesta base por copia (paper)
+COPY_POLL_SECONDS=5              # polling paralelo (gather), bajado de 10
+
+# Live trading (Fase 5)
+LIVE_MODE=true                   # activa executor.py
+LIVE_DRY_RUN=true                # simula órdenes (dry-run)
+LIVE_CAPITAL_USDC=100.0
+LIVE_BASE_USDC=10.0              # subido de 5 → 10 para justificar fees
+LIVE_MAX_PER_WALLET_USDC=10.0
+LIVE_MIN_EXPECTED_PNL_USDC=0.50
+LIVE_DRY_SLIPPAGE_PCT=0.015      # 1.5% pesimista en dry-run
 
 # Risk management
-STOP_LOSS_PCT=0.30               # cierre si cae 30%
-TAKE_PROFIT_PCT=0.80             # cierre si sube 80%
+STOP_LOSS_PCT=0.20               # cierre si cae 20% (bajado de 30)
+TAKE_PROFIT_PCT=0.50             # cierre si sube 50% (bajado de 80)
 MAX_PER_MARKET_PCT=0.20          # max 20% del cap en un solo mercado
 MIN_MARKET_LIQUIDITY_USDC=5000   # filtro de liquidez
 MIN_MARKET_VOLUME_USDC=10000     # filtro de volumen
 DAILY_KILL_SWITCH_PCT=0.10       # pausa si PnL 24h < -10% del cap
-STOPLOSS_SWEEP_SECONDS=60        # frecuencia del check de SL/TP
+STOPLOSS_SWEEP_SECONDS=15        # frecuencia SL/TP (bajado de 60)
+
+# Trailing stop (activa cuando posición en ganancia)
+TRAIL_ACTIVATION_PCT=0.30        # +30% gain activa el trailing
+TRAIL_DROP_PCT=0.25              # cierra si cae 25% desde el peak
+
+# Diversificación
+MAX_WALLET_24H_PCT=0.50          # max 50% de trades de un wallet en 24h
 
 # Realismo (simula plata real)
 REALISTIC_MODE=true
@@ -230,10 +247,16 @@ python copybot.py telegram-test              # mensaje de prueba
 
 | Capa | Frecuencia | Acción |
 |------|-----------|--------|
-| **Stop-loss / Take-profit** | cada 60s | cierra posición individual al -30% / +80% |
-| **Kill switch (con reset high-water)** | cada ciclo | pausa todo si PnL < -10% del cap en `max(24h, último reset manual)`. El reset manual NO borra trades pero sí marca un "high-water mark" — los trades viejos quedan en la DB para histórico pero no vuelven a disparar. Solo nuevas pérdidas (post-reset) pueden reactivar. |
+| **Stop-loss / Take-profit** | cada 15s | cierra posición individual al -20% / +50% |
+| **Trailing stop** | cada 15s | cuando peak ≥ entry × 1.30 → SL pasa a peak × 0.75 (captura más del upside en wins grandes) |
+| **Kill switch (con reset high-water + auto-recovery)** | cada ciclo | pausa todo si PnL < -10% del cap en `max(24h, último reset manual)`. **Auto-recovery**: si PnL recupera > threshold, se desactiva solo. **Race protection**: ignora trigger si reset hace <5s. |
 | **Bandit UCB1** | cada cierre | recalcula `sizing_mult` de TODOS los activos |
-| **Auto-drop** | cada cierre | drop si 5 losses consecutivos |
+| **Inactivity decay** | cada cierre (post-UCB) | sizing × 0.7 si wallet no operó en >=24h (libera capital de arms dormidas) |
+| **Auto-drop por racha** | cada cierre | drop si 3 losses consecutivos |
+| **Auto-drop por PnL** | cada cierre | drop si total cerrado <= -$10 con ≥5 trades (independiente de racha) |
+| **Auto-drop por reject-clog** | cada ~10 min | drop si ≥50 rejects en 24h con 0 fills (wallet ruidoso sin valor) |
+| **Diversification cap** | en open | reject `diversification_cap` si un wallet ya hizo > 50% de los trades en 24h |
+| **Short-duration market filter** | en open | reject `short_duration_market` para slugs `*-(1\|5\|10\|15)m-*` (binarios que expiran rápido) |
 | **Auto-replace** | inmediato post-drop | re-corre `select_traders`, llena vacante |
 | **Discovery on-demand** | si active < 20 | flag `discovery_pending=true` → runner dispara cycle |
 | **Cluster perf refresh** | cada 5 min | actualiza `cluster_perf`; bloquea/penaliza clusters |
@@ -714,6 +737,80 @@ PnL acumulado: +$1,470.66 sobre cap $100
 - Detalle: en live también se podría centralizar via un hook similar
   (ej. `on_live_trade_closed`) pero lo mantengo simple — son 6 líneas
   duplicadas en 3 sitios.
+
+### 2026-04-30 (madrugada) — Latencia, observabilidad y tests
+- **Polling paralelo (`fd3710f`)**: `runner.run_loop` polea los 20 wallets con
+  `asyncio.gather` en vez de secuencial. Ciclo cae de ~10s → ~1s. Habilita
+  bajar `COPY_POLL_SECONDS=10→5` con efecto real.
+- **`live_rejects` table + `_log_reject` helper**: cada path de rechazo en
+  `_open_position_validate` registra reason + detail JSON. Antes el bot
+  rechazaba trades en silencio, ahora hay traza para diagnóstico.
+- **Slippage pesimista en dry-run** (`LIVE_DRY_SLIPPAGE_PCT=0.015`):
+  BUY ↑1.5%, SELL ↓1.5%, clamp [0.01, 0.99]. Los números del dry-run
+  ahora proyectan lo que realmente sale en real.
+- **Suite pytest inicial** en `tests/`: 16 tests para risk + executor con
+  fixture `isolated_db` (monkeypatch DB_PATH a tmpfile). Cubre kill switch
+  lifecycle, rejects, force_close.
+- **WebSocket client RTDS standalone** (`src/polymarket/websocket.py`):
+  foundation para latencia <1s vs 5-7s polling. Filter client-side por
+  `proxyWallet`. Flag `WEBSOCKET_TRADES_ENABLED=false` — no integrado aún.
+- **Investigación webhooks Polymarket**: `wss://ws-live-data.polymarket.com`,
+  topic `activity:trades` es global (sin filtro por wallet server-side).
+
+### 2026-04-30 (mañana) — Análisis post-deploy y bugs críticos
+**Hallazgo brutal del análisis**: tras 8h en `live_dry`, PnL real = **-$26.42**
+(no el +$17 que parecía con posiciones abiertas mark-to-market). WR=21%,
+9 wins / 34 losses. **2 wallets concentraban 56% de las pérdidas**.
+- **Mercados `*-5m-*` matando todo**: 10/10 trades con SL ≥70% fueron
+  binarios crypto de 5min (`btc-updown-5m-...`, `eth-updown-5m-...`). Estos
+  expiran rápido y la posición perdedora va a $0 antes que dispare el SL.
+  - **Fix**: nuevo reject `short_duration_market` en `_open_position_validate`
+    que bloquea slugs matching `-(?:1|5|10|15)m-`.
+- **Auto-drop NO funcionaba en live (bug crítico)**: `learning.py` y
+  `bandit.py` querían literalmente `paper_trades`. En `live_dry` los trades
+  van a `live_trades` → la lógica de drop NUNCA disparaba en live. Por eso
+  `0x54542e00..` con 19 closes -$40 seguía activo.
+  - **Fix**: ambos archivos usan ahora `tradebook.TABLE` (la tabla activa
+    según `LIVE_MODE`). `DROP_AFTER_LOSSES` bajado 5→3. Nuevo trigger
+    `cumulative_pnl`: si total cerrado <= -$10 con ≥5 trades → drop.
+- **Tightening de risk params**:
+  - `STOPLOSS_SWEEP_SECONDS=60→15` (4× más rápido)
+  - `STOP_LOSS_PCT=0.30→0.20` (cap pérdidas más temprano)
+  - `TAKE_PROFIT_PCT=0.80→0.50` (más wins, más chicos)
+  - `LIVE_BASE_USDC=5→10` (justifica fees, ROI absoluto mayor)
+- **Drops manuales** de `0x54542e00..` y `0xd28d57ae..` (ya estaban dropped
+  por el auto-drop fix, pero se forzaron para limpiar).
+- **Bug del kill switch race**: tras reset, había un race entre el commit
+  del reset y el siguiente `check_kill_switch` del runner que reactivaba
+  con datos viejos. **Fix** (`1ee0327`):
+  - `RESET_GRACE_SECONDS=5`: si reset hace <5s, no reactivar.
+  - **Auto-recovery**: si `pnl > threshold` y kill switch activo, lo
+    desactiva automáticamente (antes era manual-only y atascaba).
+
+### 2026-04-30 (mediodía) — Mejoras de diversificación y trailing
+**Análisis 8h post-deploy**: PnL flipped **-$26.75 → +$7.26** (+$34 swing),
+WR 21%→45%, 0 mercados 5m colándose. Pero 22/22 trades vinieron de UN
+solo wallet (concentración 100%). 5 mejoras aplicadas en paralelo:
+1. **Auto-drop por reject-clog** (`learning.auto_drop_by_rejects`):
+   wallets con ≥50 rejects en 24h y 0 fills → status='dropped'. Hookeado
+   en runner cada ~10min. Resuelve el caso `0x2e3c40fa47..` (90 rejects
+   en 8h, 0 fills, clogeando la pipeline).
+2. **Inactivity decay** en `bandit.recompute_sizings`:
+   `INACTIVITY_HOURS=24, INACTIVITY_DECAY=0.7`. Si un wallet no operó
+   en >=24h, su sizing se multiplica por 0.7. Libera capital de "arms
+   dormidas" con score histórico alto pero sin trade reciente.
+3. **Trailing stop** en `risk.sweep_stops`: nueva columna `peak_price`
+   en live_trades + paper_trades (default NULL, set a entry_price al
+   abrir). Cuando peak >= entry × (1 + `TRAIL_ACTIVATION_PCT`=0.30),
+   se activa el trailing: SL pasa a peak × (1 - `TRAIL_DROP_PCT`=0.25).
+   Captura más del upside en wins grandes (algunos fueron +100-343%).
+4. **Diversification cap** en `_open_position_validate`: si un wallet
+   ya hizo > `MAX_WALLET_24H_PCT`=0.50 de los trades en 24h, reject
+   con reason `diversification_cap`. Guard `total>=10` para evitar
+   rechazos en sample chico.
+5. **#5 — Esperar 24-48h** más datos antes de tocar más params.
+
+Tests: 20 passing (12 executor + 4 risk + 4 nuevos en test_learning).
 
 ### 2026-04-29 (tarde) — Yak shave del Docker credential helper
 - El cron `update_and_restart.bat` falló al hacer `docker compose pull`

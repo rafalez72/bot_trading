@@ -222,6 +222,91 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
         log.exception("bandit recompute failed: %s", e)
 
 
+def auto_drop_by_rejects(min_rejects: int = 50, window_hours: int = 24) -> int:
+    """Drop active wallets que generaron >= min_rejects rejects con 0 fills
+    en la ventana window_hours. Devuelve la cantidad de wallets dropped.
+
+    Estos wallets están "tapando el pipeline": sus señales de trade no pasan
+    nuestros filtros pero igual ocupan el slot polling. Mejor sacarlos para
+    dejar lugar a wallets cuyas señales sí abren posiciones.
+
+    Persiste un learning_event con trigger='reject_clog' y notifica via
+    Telegram (`notifier.trader_dropped`) si está disponible.
+
+    Safe en DB fresh: si no hay rows en `live_rejects`, devuelve 0.
+    """
+    from src.copybot.tradebook import TABLE as TRADES_TABLE
+
+    window_secs = window_hours * 3600
+    candidates: list[tuple[str, int, float]] = []  # (wallet, n_rejects, sizing_before)
+
+    with tx() as conn:
+        # Buscamos wallets activos con >=min_rejects en la ventana y 0 fills.
+        # Usamos un solo query con subqueries correlacionadas — barato porque
+        # los índices idx_live_rejects_at y idx_live_source filtran rápido.
+        rows = conn.execute(
+            f"""
+            SELECT cs.wallet AS wallet,
+                   cs.sizing_mult AS sizing_mult,
+                   (
+                     SELECT COUNT(*) FROM live_rejects lr
+                     WHERE lr.source_wallet = cs.wallet
+                       AND lr.at >= strftime('%s','now') - ?
+                   ) AS n_rejects,
+                   (
+                     SELECT COUNT(*) FROM {TRADES_TABLE} t
+                     WHERE t.source_wallet = cs.wallet
+                       AND t.entry_at >= strftime('%s','now') - ?
+                   ) AS n_fills
+            FROM copy_subscriptions cs
+            WHERE cs.status = 'active'
+            """,
+            (window_secs, window_secs),
+        ).fetchall()
+
+        for r in rows:
+            n_rejects = r["n_rejects"] or 0
+            n_fills = r["n_fills"] or 0
+            if n_rejects >= min_rejects and n_fills == 0:
+                candidates.append((
+                    r["wallet"],
+                    int(n_rejects),
+                    float(r["sizing_mult"] or 1.0),
+                ))
+
+        for wallet, n_rejects, sizing_before in candidates:
+            conn.execute(
+                """
+                UPDATE copy_subscriptions
+                SET status='dropped', stopped_at=datetime('now'), sizing_mult=0
+                WHERE wallet=?
+                """,
+                (wallet,),
+            )
+            trigger = f"reject_clog ({n_rejects} rejects, 0 fills in {window_hours}h)"
+            _log_event(
+                conn, wallet, "drop", sizing_before, 0.0,
+                trigger,
+                {"reason": "reject_clog", "n_rejects": n_rejects, "window_hours": window_hours},
+            )
+
+    # Notif fuera de la tx (best-effort). El notifier acepta argumentos
+    # libres pero la API tradicional pasa (wallet, reason).
+    if candidates:
+        try:
+            from src.copybot import notifier
+            for wallet, n_rejects, _ in candidates:
+                reason = f"reject_clog: {n_rejects} rejects / 0 fills en {window_hours}h"
+                try:
+                    notifier.trader_dropped(wallet, reason)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("trader_dropped notif failed: %s", e)
+
+    return len(candidates)
+
+
 def recent_events(limit: int = 100) -> list[dict]:
     with db() as conn:
         rows = conn.execute(

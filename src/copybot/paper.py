@@ -231,14 +231,16 @@ def open_position(
             """
             INSERT INTO paper_trades
                 (source_wallet, source_trade_id, condition_id, outcome, outcome_index,
-                 side, entry_price, entry_size_usdc, entry_at, status, raw, asset)
-            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, 'open', ?, ?)
+                 side, entry_price, entry_size_usdc, entry_at, status, raw, asset,
+                 peak_price)
+            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, 'open', ?, ?, ?)
             """,
             (
                 source_wallet, source_trade_id, condition_id, outcome, outcome_index,
                 price, size_usdc, timestamp,
                 json.dumps(raw, separators=(",", ":")) if raw else None,
                 asset,
+                price,  # peak_price arranca == entry_price
             ),
         )
         return cur.lastrowid, None

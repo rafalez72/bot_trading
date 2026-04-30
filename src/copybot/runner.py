@@ -346,6 +346,18 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("update_cluster_perf error: %s", e)
 
+            # Auto-drop wallets con reject_clog (cada ~10 min)
+            if cycle % max(1, 600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.learning import auto_drop_by_rejects
+                    n = auto_drop_by_rejects()
+                    if n:
+                        console.print(
+                            f"[red]auto-drop:[/red] {n} wallets droppeados por reject_clog"
+                        )
+                except Exception as e:
+                    log.exception("auto_drop_by_rejects error: %s", e)
+
             # Auto-discovery (chequea internamente si pasaron 12h)
             if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:

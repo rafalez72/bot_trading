@@ -22,6 +22,8 @@ from src.config import (
     LIVE_MODE,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    TRAIL_ACTIVATION_PCT,
+    TRAIL_DROP_PCT,
 )
 from src.copybot.tradebook import TABLE as TRADES_TABLE, force_close
 from src.db.schema import db, tx
@@ -205,9 +207,17 @@ async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
 
 
 async def sweep_stops() -> dict:
-    """Recorre todas las posiciones open (paper o live) y cierra las que disparen stop/tp."""
+    """Recorre todas las posiciones open (paper o live) y cierra las que disparen stop/tp.
+
+    Order de evaluación:
+      1. Update peak_price si cur > peak actual.
+      2. Trailing stop (si peak_gain >= TRAIL_ACTIVATION_PCT y cur cae
+         TRAIL_DROP_PCT desde el peak) — toma prioridad sobre SL/TP.
+      3. Stop-loss tradicional.
+      4. Take-profit tradicional.
+    """
     sql = f"""
-        SELECT id, asset, entry_price, entry_size_usdc, source_wallet
+        SELECT id, asset, entry_price, entry_size_usdc, source_wallet, peak_price
         FROM {TRADES_TABLE}
         WHERE status='open' AND asset IS NOT NULL
     """
@@ -215,7 +225,7 @@ async def sweep_stops() -> dict:
         rows = conn.execute(sql).fetchall()
 
     if not rows:
-        return {"checked": 0, "stop_loss": 0, "take_profit": 0}
+        return {"checked": 0, "stop_loss": 0, "take_profit": 0, "trailing": 0}
 
     # Agrupar por asset para evitar requests duplicados
     by_asset: dict[str, list] = defaultdict(list)
@@ -224,6 +234,7 @@ async def sweep_stops() -> dict:
 
     sl_count = 0
     tp_count = 0
+    trail_count = 0
     async with httpx.AsyncClient(timeout=10.0) as client:
         for asset, positions in by_asset.items():
             cur = await _last_price(client, asset)
@@ -233,8 +244,44 @@ async def sweep_stops() -> dict:
                 entry = p["entry_price"] or 0
                 if entry <= 0:
                     continue
+
+                # 1) Update peak_price si corresponde. Persistimos solo si cambia.
+                old_peak = p.get("peak_price")
+                old_peak_val = old_peak if old_peak is not None else entry
+                new_peak = max(old_peak_val, cur)
+                if new_peak > old_peak_val:
+                    try:
+                        with tx() as conn:
+                            conn.execute(
+                                f"UPDATE {TRADES_TABLE} SET peak_price=? WHERE id=?",
+                                (new_peak, p["id"]),
+                            )
+                    except Exception as e:
+                        log.debug("peak_price update failed id=%s: %s", p["id"], e)
+
                 drop = (entry - cur) / entry
                 rise = (cur - entry) / entry
+                peak_gain = (new_peak - entry) / entry
+
+                # 2) Trailing stop — corre PRIMERO, toma prioridad sobre SL/TP.
+                # Activa solo si el peak alcanzó la activación y el precio
+                # actual cayó >=TRAIL_DROP_PCT desde el peak.
+                trail_sl = new_peak * (1 - TRAIL_DROP_PCT)
+                if peak_gain >= TRAIL_ACTIVATION_PCT and cur < trail_sl:
+                    peak_pct = int(peak_gain * 100)
+                    force_close(
+                        p["id"], cur,
+                        reason=f"trailing_stop_from_peak_{peak_pct}",
+                    )
+                    trail_count += 1
+                    log.info(
+                        "TRAIL-STOP %s #%d  entry=%.3f peak=%.3f cur=%.3f  peak+%d%% drop -%d%%",
+                        TRADES_TABLE, p["id"], entry, new_peak, cur,
+                        peak_pct, int((new_peak - cur) / new_peak * 100),
+                    )
+                    continue
+
+                # 3) Stop-loss tradicional
                 if drop >= STOP_LOSS_PCT:
                     force_close(p["id"], cur, reason=f"stop_loss_{int(drop*100)}pct")
                     sl_count += 1
@@ -251,6 +298,7 @@ async def sweep_stops() -> dict:
                             big_stop_loss(p["id"], wallet, loss_usdc, entry, cur)
                         except Exception:
                             pass
+                # 4) Take-profit tradicional
                 elif TAKE_PROFIT_PCT > 0 and rise >= TAKE_PROFIT_PCT:
                     force_close(p["id"], cur, reason=f"take_profit_{int(rise*100)}pct")
                     tp_count += 1
@@ -267,7 +315,12 @@ async def sweep_stops() -> dict:
                         except Exception:
                             pass
 
-    return {"checked": len(rows), "stop_loss": sl_count, "take_profit": tp_count}
+    return {
+        "checked": len(rows),
+        "stop_loss": sl_count,
+        "take_profit": tp_count,
+        "trailing": trail_count,
+    }
 
 
 if __name__ == "__main__":

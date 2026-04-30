@@ -257,6 +257,11 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_live_rejects_at ON live_rejects(at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_live_rejects_reason ON live_rejects(reason, at DESC)",
+    # Trailing stop: peak_price es el máximo observado durante la vida de la
+    # posición. Lo usamos para activar trailing-stop cuando el trade ya está
+    # +30% en ganancia, y cerrar si después cae 25% del peak.
+    "ALTER TABLE live_trades ADD COLUMN peak_price REAL",
+    "ALTER TABLE paper_trades ADD COLUMN peak_price REAL",
 ]
 
 

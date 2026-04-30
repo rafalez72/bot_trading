@@ -36,6 +36,12 @@ SIZING_MIN = 0.1
 SIZING_MAX = 2.0
 EXPLORATION_BONUS = 2.0   # constante c en UCB1
 
+# Inactivity decay: si un wallet no tradeó en >=INACTIVITY_HOURS, multiplicamos
+# su sizing por INACTIVITY_DECAY. Libera capital de "arms dormidas" con score
+# histórico alto pero sin actividad reciente. Aplica DESPUÉS de UCB1.
+INACTIVITY_HOURS = 24
+INACTIVITY_DECAY = 0.7
+
 
 def _refresh_arm(conn, wallet: str) -> None:
     """Recalcula n_pulls y sum_reward para un wallet."""
@@ -121,6 +127,34 @@ def recompute_sizings() -> dict:
             mult = (s / total_score) * target_sum
             mult = max(SIZING_MIN, min(SIZING_MAX, mult))
             new_sizings[w] = mult
+
+        # Inactivity decay: si el wallet no tradeó en >=INACTIVITY_HOURS, achicamos.
+        # Buscamos MAX(entry_at) por wallet en la tabla activa (paper o live).
+        from src.copybot.tradebook import TABLE as TRADES_TABLE
+        cutoff_ts = None
+        # Una sola query agrupada — más barato que un SELECT por wallet.
+        last_trade_rows = conn.execute(
+            f"""
+            SELECT source_wallet, MAX(entry_at) AS last_at
+            FROM {TRADES_TABLE}
+            WHERE source_wallet IN ({','.join('?' for _ in new_sizings)})
+            GROUP BY source_wallet
+            """,
+            tuple(new_sizings.keys()),
+        ).fetchall() if new_sizings else []
+        last_at_by_wallet: dict[str, int] = {
+            r["source_wallet"]: int(r["last_at"] or 0) for r in last_trade_rows
+        }
+        import time as _t
+        cutoff = int(_t.time()) - INACTIVITY_HOURS * 3600
+        for w in list(new_sizings.keys()):
+            last_at = last_at_by_wallet.get(w, 0)
+            # last_at == 0 → nunca tradeó; tratamos como "inactivo" salvo que
+            # sea un arm nuevo sin trades cerrados. Para no castigar arms
+            # genuinamente nuevos (que ya tienen UCB inflado por exploración),
+            # solo aplicamos decay si HAY un last_at registrado y es viejo.
+            if last_at > 0 and last_at < cutoff:
+                new_sizings[w] = max(SIZING_MIN, new_sizings[w] * INACTIVITY_DECAY)
 
         # Persistir y registrar cambios significativos
         for r in rows:

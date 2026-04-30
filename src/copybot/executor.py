@@ -34,6 +34,7 @@ from src.config import (
     LIVE_MAX_PER_WALLET_USDC,
     LIVE_MIN_EXPECTED_PNL_USDC,
     MAX_PER_MARKET_PCT,
+    MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
     MIN_MARKET_VOLUME_USDC,
 )
@@ -172,6 +173,36 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "extreme_price")
         return None, "extreme_price"
 
+    # Diversification cap: si un solo wallet ya hizo > MAX_WALLET_24H_PCT
+    # de TODOS los trades en 24h, rechazamos para forzar diversificación.
+    # Guard total>=10 para evitar rechazos cuando recién arrancamos
+    # (1 trade de un wallet sería 100% de un sample chico).
+    from src.copybot.tradebook import TABLE as _TABLE_DIV
+    div_row = conn.execute(
+        f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
+        FROM {_TABLE_DIV}
+        WHERE entry_at >= strftime('%s','now') - 86400
+        """,
+        (source_wallet,),
+    ).fetchone()
+    total_24h = (div_row["total"] or 0) if div_row else 0
+    this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
+    if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
+        _log_reject(
+            source_wallet, condition_id, outcome_index, "BUY", price,
+            "diversification_cap",
+            detail=json.dumps({
+                "total_24h": total_24h,
+                "this_wallet_24h": this_wallet_24h,
+                "pct": this_wallet_24h / total_24h,
+                "cap": MAX_WALLET_24H_PCT,
+            }),
+        )
+        return None, "diversification_cap"
+
     size_usdc = LIVE_BASE_USDC * sizing
 
     # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
@@ -298,8 +329,9 @@ def open_position(
             INSERT INTO live_trades
                 (source_wallet, source_trade_id, condition_id, token_id, outcome,
                  outcome_index, side, entry_price, entry_size_usdc, entry_shares,
-                 entry_at, entry_order_id, entry_tx_hash, status, raw, asset, dry_run)
-            VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                 entry_at, entry_order_id, entry_tx_hash, status, raw, asset, dry_run,
+                 peak_price)
+            VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
             """,
             (
                 source_wallet, source_trade_id, condition_id, token_id, outcome,
@@ -308,6 +340,7 @@ def open_position(
                 json.dumps(raw, separators=(",", ":")) if raw else None,
                 token_id,
                 1 if LIVE_DRY_RUN else 0,
+                actual_price,  # peak_price arranca == entry_price
             ),
         )
         live_id = cur.lastrowid
