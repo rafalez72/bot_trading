@@ -145,7 +145,7 @@ LIVE_MODE=true                   # activa executor.py
 LIVE_DRY_RUN=true                # simula órdenes (dry-run)
 LIVE_CAPITAL_USDC=100.0
 LIVE_BASE_USDC=10.0              # subido de 5 → 10 para justificar fees
-LIVE_MAX_PER_WALLET_USDC=10.0
+LIVE_MAX_PER_WALLET_USDC=20.0    # 2 trades concurrentes por wallet (subido de 10)
 LIVE_MIN_EXPECTED_PNL_USDC=0.50
 LIVE_DRY_SLIPPAGE_PCT=0.015      # 1.5% pesimista en dry-run
 
@@ -786,6 +786,27 @@ PnL acumulado: +$1,470.66 sobre cap $100
   - `RESET_GRACE_SECONDS=5`: si reset hace <5s, no reactivar.
   - **Auto-recovery**: si `pnl > threshold` y kill switch activo, lo
     desactiva automáticamente (antes era manual-only y atascaba).
+
+### 2026-04-30 (tarde) — Bug del auto-drop deshecho por selector + compound decay
+**Análisis 3.1h post-deploy del mediodía**: WR 75%, PnL +$130 (con caveat:
+3 outliers explican $113). Trailing stop capturó +245% y +476% peaks (#89, #92).
+Pero: hallazgo crítico — `0x2e3c40fa..` que había sido auto-droppeado a las
+10:43 por reject_clog, **abrió 3 trades nuevos** (los 3 winners de $113).
+
+- **Bug en `selector.py`**: cuando `auto_replace` corre `select_traders(top_n=20)`
+  tras un drop, el código en líneas 110-118 hacía `UPDATE status='active'` sin
+  filtrar el estado previo, **deshaciendo silenciosamente los auto-drops**
+  (loss_streak, cumulative_pnl, reject_clog). Un wallet con buen score pero
+  recientemente dropped por mala perfor era reactivado al instante.
+  - **Fix**: `select_traders` ahora **respeta `status='dropped'` como permanente**.
+    Solo reactiva `paused`. Drops aparecen en `summary.skipped_dropped`.
+- **Compound inactivity decay**: la decay anterior aplicaba ×0.7 una vez,
+  arms muertas se quedaban en mult≈0.7 indefinidamente. Ahora el decay se
+  aplica una vez por cada bloque `INACTIVITY_HOURS` sin actividad (cap 6
+  períodos para no overflow). Ej. 48h → ×0.49, 96h → ×0.24, 168h → ×0.083.
+- **`LIVE_MAX_PER_WALLET_USDC`**: 10 → **20**. Antes con base=$10 + cap=$10,
+  cualquier 2do trade del mismo wallet rechazaba con `wallet_concentration`
+  (37 rejects en 3h). Ahora wallets buenos pueden apilar 2 posiciones.
 
 ### 2026-04-30 (mediodía) — Mejoras de diversificación y trailing
 **Análisis 8h post-deploy**: PnL flipped **-$26.75 → +$7.26** (+$34 swing),

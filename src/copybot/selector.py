@@ -107,7 +107,17 @@ def select_traders(top_n: int = DEFAULT_TOP_N) -> dict:
                 summary["added"].append({"wallet": w, "reason": reason, "score": score})
             else:
                 row = existing[w]
-                if row["status"] != "active":
+                # IMPORTANTE: NO reactivar wallets `dropped`. Drop es permanente.
+                # Antes este bloque hacía UPDATE status='active' sin filtro, lo que
+                # deshacía silenciosamente los auto-drops (loss_streak, cumulative_pnl,
+                # reject_clog). Si un wallet con score alto fue dropeado por mala
+                # performance reciente, debe quedarse fuera. Solo reactivamos `paused`.
+                if row["status"] == "dropped":
+                    summary.setdefault("skipped_dropped", []).append(
+                        {"wallet": w, "reason": "permanently dropped"}
+                    )
+                    continue
+                if row["status"] != "active":  # i.e. 'paused'
                     conn.execute(
                         """
                         UPDATE copy_subscriptions

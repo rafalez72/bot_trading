@@ -153,8 +153,17 @@ def recompute_sizings() -> dict:
             # sea un arm nuevo sin trades cerrados. Para no castigar arms
             # genuinamente nuevos (que ya tienen UCB inflado por exploración),
             # solo aplicamos decay si HAY un last_at registrado y es viejo.
+            #
+            # Compound decay: aplicamos INACTIVITY_DECAY una vez por cada
+            # bloque de INACTIVITY_HOURS sin actividad. Ej. 48h inactivo → ×0.49.
+            # 96h → ×0.24. Sin esto, una arm muerta queda con mult ≈ 0.7 para
+            # siempre, desperdiciando capital frente a wallets activos.
             if last_at > 0 and last_at < cutoff:
-                new_sizings[w] = max(SIZING_MIN, new_sizings[w] * INACTIVITY_DECAY)
+                inactive_hours = (int(_t.time()) - last_at) / 3600.0
+                periods = int(inactive_hours / INACTIVITY_HOURS)
+                periods = max(1, min(periods, 6))  # cap a 6 períodos para no overflow
+                decay_factor = INACTIVITY_DECAY ** periods
+                new_sizings[w] = max(SIZING_MIN, new_sizings[w] * decay_factor)
 
         # Persistir y registrar cambios significativos
         for r in rows:
