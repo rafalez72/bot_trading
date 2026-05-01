@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/clob/:path*", "destination": "/api/clob?p=:path*" }
+  ]
+}
