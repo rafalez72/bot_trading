@@ -1,21 +1,20 @@
-// Vercel Edge Function — proxy para Polymarket /auth/api-key
+// Vercel Edge proxy — generic forwarder a clob.polymarket.com
 //
-// Por qué Vercel: pool de IPs distinto a Cloudflare Workers / Azure /
-// ProtonVPN free. Polymarket bloquea CF Workers pero (aún) no Vercel Edge.
+// Reescribe la URL: /api/proxy/<path>?<query> → https://clob.polymarket.com/<path>?<query>
+// Forwardea TODOS los headers POLY_* que vengan en la request.
 //
-// Mismo flujo que el CF Worker:
-//   1. Cliente computa los headers POLY_* localmente con su PK
-//   2. POST a este endpoint
-//   3. Edge Function forwardea a clob.polymarket.com
-//   4. Devuelve respuesta tal cual
-//
-// La PK NUNCA toca este servidor — solo la firma ya construida.
+// Útil para: /auth/api-key (POST/GET), /balance-allowance (GET), etc.
 
 export const config = { runtime: 'edge' };
 
-const TARGET = 'https://clob.polymarket.com/auth/api-key';
+const TARGET_HOST = 'https://clob.polymarket.com';
 
 export default async function handler(req) {
+    const url = new URL(req.url);
+    // Strip /api/proxy prefix → keep path + query
+    const path = url.pathname.replace(/^\/api\/proxy/, '') || '/';
+    const targetUrl = TARGET_HOST + path + url.search;
+
     const headers = new Headers();
     for (const [k, v] of req.headers) {
         if (k.toUpperCase().startsWith('POLY_')) {
@@ -25,11 +24,16 @@ export default async function handler(req) {
     headers.set('Accept', 'application/json');
     headers.set('User-Agent', 'Mozilla/5.0 (compatible; PMProxy/1.0)');
 
+    const init = {
+        method: req.method,
+        headers,
+    };
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        init.body = await req.text();
+    }
+
     try {
-        const response = await fetch(TARGET, {
-            method: req.method,
-            headers,
-        });
+        const response = await fetch(targetUrl, init);
         const body = await response.text();
         return new Response(body, {
             status: response.status,
@@ -39,7 +43,7 @@ export default async function handler(req) {
             },
         });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), {
+        return new Response(JSON.stringify({ error: String(e), target: targetUrl }), {
             status: 500,
             headers: { 'Content-Type': 'application/json' },
         });
