@@ -52,32 +52,44 @@ def _enabled() -> bool:
 
 
 def send(text: str, *, parse_mode: str = "Markdown", silent: bool = False) -> bool:
-    """Manda un mensaje. Devuelve True si OK, False si falla o desactivado."""
+    """Manda un mensaje a TODOS los chat_ids configurados.
+
+    `TELEGRAM_CHAT_ID` puede ser un ID solo o comma-separated para multi-cast
+    (ej. amigos suscriptos). Cada chat_id en la lista recibe el mismo mensaje;
+    si uno falla (chat bloqueado, etc.) los otros siguen.
+
+    Devuelve True si AL MENOS UN chat recibió el mensaje.
+    """
     if not _enabled():
         return False
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    chat_ids_raw = os.environ.get("TELEGRAM_CHAT_ID", "")
+    chat_ids = [c.strip() for c in chat_ids_raw.split(",") if c.strip()]
+    if not chat_ids:
+        return False
     if len(text) > MAX_LEN:
         text = text[: MAX_LEN - 20] + "\n…(truncado)"
-    try:
-        r = httpx.post(
-            f"{API_BASE}/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_notification": "true" if silent else "false",
-                "disable_web_page_preview": "true",
-            },
-            timeout=TIMEOUT,
-        )
-        if r.status_code != 200:
-            log.warning("telegram send %d: %s", r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as e:
-        log.warning("telegram send error: %s", e)
-        return False
+    any_ok = False
+    for cid in chat_ids:
+        try:
+            r = httpx.post(
+                f"{API_BASE}/bot{token}/sendMessage",
+                data={
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                    "disable_notification": "true" if silent else "false",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=TIMEOUT,
+            )
+            if r.status_code != 200:
+                log.warning("telegram send to %s: %d %s", cid, r.status_code, r.text[:120])
+            else:
+                any_ok = True
+        except Exception as e:
+            log.warning("telegram send error to %s: %s", cid, e)
+    return any_ok
 
 
 # ---------- Helpers de eventos específicos ----------

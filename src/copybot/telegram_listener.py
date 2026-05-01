@@ -40,11 +40,18 @@ def _enabled() -> bool:
 
 
 def _authorized_chat_id() -> int | None:
+    """Solo el PRIMER chat_id de la lista puede ejecutar comandos.
+
+    `TELEGRAM_CHAT_ID` puede ser comma-separated para multicast de notifs,
+    pero solo el primero (el owner) ejecuta /status, /killswitch, etc.
+    Los otros (amigos suscriptos) reciben info solo, no controlan el bot.
+    """
     raw = os.getenv("TELEGRAM_CHAT_ID")
     if not raw:
         return None
+    first = raw.split(",")[0].strip()
     try:
-        return int(raw)
+        return int(first)
     except ValueError:
         return None
 
