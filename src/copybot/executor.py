@@ -132,7 +132,12 @@ def _parse_slug_expiry(slug: str | None) -> int | None:
         except Exception:
             pass
 
-    # 3. -YYYY-MM-DD$ al final → fecha cruda. Conservador: 00:00 UTC del día.
+    # 3. -YYYY-MM-DD$ al final → fecha cruda. Usamos END of day (23:59:59 UTC)
+    # como expiry asumido. Razón: markets deportivos típicamente se juegan a la
+    # noche/tarde y resuelven por la noche. Si usamos 00:00 UTC del día, todo
+    # partido de "hoy" queda con time_left negativo y se rechaza. Con 23:59:59
+    # permitimos entrar durante el día y el filtro de 10min bloquea solo el
+    # tail end. Si la fecha es ayer o anterior → expiry pasado → block (correcto).
     m = re.search(r"-(\d{4})-(\d{1,2})-(\d{1,2})$", s)
     if m:
         try:
@@ -140,7 +145,7 @@ def _parse_slug_expiry(slug: str | None) -> int | None:
             year = int(m.group(1))
             month = int(m.group(2))
             day = int(m.group(3))
-            event_utc = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
+            event_utc = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
             return int(event_utc.timestamp())
         except Exception:
             pass
