@@ -1,0 +1,6 @@
+{
+  "name": "polymarket-auth-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Edge proxy para regenerar API creds de Polymarket bypass WAF"
+}
