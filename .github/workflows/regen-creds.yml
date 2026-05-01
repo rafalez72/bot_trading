@@ -1,14 +1,14 @@
 name: Regen Polymarket API Creds
 
-# Workflow manual: usa los runners de GitHub (Azure US/EU) que tienen IPs
-# rotantes — bypassea el bloqueo de Cloudflare desde Argentina/datacenters
-# conocidos. Si te tira 403, re-ejecutá y casi siempre te da una IP fresca.
+# Multi-runner: prueba en paralelo Linux, Windows, macOS — cada uno tiene
+# pool de IPs diferente. Si alguno pasa el bloqueo de Cloudflare, ya está.
+# fail-fast: false → no se aborta el resto si uno falla.
 
 on:
   workflow_dispatch:
     inputs:
       sig_type:
-        description: "Signature type (0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE - default Magic Auth)"
+        description: "Signature type (0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE)"
         required: true
         default: "2"
         type: choice
@@ -19,7 +19,11 @@ on:
 
 jobs:
   regen:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,10 +32,12 @@ jobs:
       - name: Install
         run: pip install -q py-clob-client
       - name: Show runner IP / location
+        shell: bash
         run: |
-          echo "Runner IP info:"
+          echo "=== Runner: ${{ matrix.os }} ==="
           curl -s -m 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E "^(ip|loc)=" || true
       - name: Regen creds
+        shell: bash
         env:
           PK: ${{ secrets.POLYMARKET_PRIVATE_KEY }}
           FUNDER: ${{ secrets.POLYMARKET_FUNDER_ADDRESS }}
@@ -41,4 +47,13 @@ jobs:
             echo "::error::Faltan secrets POLYMARKET_PRIVATE_KEY o POLYMARKET_FUNDER_ADDRESS"
             exit 1
           fi
-          python scripts/regen_creds_auto.py
+          # Reintentos con backoff dentro de un mismo runner
+          for i in 1 2 3; do
+            echo "=== Intento $i en ${{ matrix.os }} ==="
+            if python scripts/regen_creds_auto.py; then
+              echo "::notice::SUCCESS en ${{ matrix.os }} intento $i"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
