@@ -37,6 +37,7 @@ from src.config import (
     MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
     MIN_MARKET_VOLUME_USDC,
+    MIN_TIME_TO_EXPIRY_SECONDS,
 )
 from src.copybot.learning import on_paper_trade_closed
 from src.copybot.paper import EPSILON, _check_kill_switch, _ensure_market_stub
@@ -61,6 +62,34 @@ def _log_reject(source_wallet, condition_id, outcome_index, side, price, reason,
             )
     except Exception as e:
         log.warning("failed to log reject: %s", e)
+
+
+def _parse_slug_expiry(slug: str | None) -> int | None:
+    """Extrae el timestamp epoch de expiry del final del slug.
+
+    Formato típico: 'btc-updown-5m-1777505400' → devuelve 1777505400.
+    Devuelve None si no encuentra un timestamp válido.
+
+    Sanity: el ts debe estar en rango [2024, 2030] (1.7e9 a 1.9e9) para
+    descartar matches espurios (ej. slug que termina en un número que
+    no es timestamp).
+    """
+    if not slug:
+        return None
+    m = re.search(r'-(\d{10,13})$', slug)
+    if not m:
+        return None
+    try:
+        ts = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    # Si son milisegundos (13 dígitos), convertir a segundos
+    if ts > 10**12:
+        ts = ts // 1000
+    # Sanity check: rango razonable
+    if ts < 1700000000 or ts > 1900000000:
+        return None
+    return ts
 
 
 def _apply_dry_slippage(side: str, price: float) -> float:
@@ -135,16 +164,23 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         return None, "duplicate"
 
     m = _ensure_market_stub(conn, condition_id, raw)
-    # Block short-duration markets (1m/5m/10m/15m). Son binarios que expiran
-    # rápido — la posición perdedora va a $0 antes que pueda dispararse el SL.
-    # Datos: 10/10 trades con SL>=70% fueron en mercados *-5m-* (-$38 pnl).
+    # Filtro inteligente: bloquear markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS.
+    # Reemplaza el filtro lazy por slug pattern. Más preciso: un -15m- recién abierto
+    # (15 min restantes) ya pasa, pero un -1h- con 3 min restantes se rechaza.
+    # Si no hay timestamp parseable en el slug, fail-open (no bloquea — los slugs
+    # sin epoch suelen ser markets largos: deportes, política, etc).
     slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
     if not slug and m:
         slug = m["slug"] if "slug" in m.keys() else None
-    if slug and re.search(r"-(?:1|5|10|15)m-", slug):
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
-                    "short_duration_market", detail=json.dumps({"slug": slug}))
-        return None, "short_duration_market"
+    expiry_ts = _parse_slug_expiry(slug)
+    if expiry_ts is not None:
+        time_left = expiry_ts - int(time.time())
+        if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
+            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
+                        "expires_too_soon",
+                        detail=json.dumps({"slug": slug, "time_left_sec": time_left,
+                                            "min_required": MIN_TIME_TO_EXPIRY_SECONDS}))
+            return None, "expires_too_soon"
     cat = None
     if m:
         liq = m["liquidity"]

@@ -37,6 +37,13 @@ TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "0.25"))
 # se diversifique. Guard: solo aplica si total >= 10 (sample chico = ruido).
 MAX_WALLET_24H_PCT = float(os.getenv("MAX_WALLET_24H_PCT", "0.50"))
 
+# Filtro inteligente de markets cortos: bloqueamos si el mercado expira en
+# menos de N segundos. Reemplaza el filtro lazy por slug pattern (-5m-, -15m-).
+# El timestamp de expiry se extrae del slug (formato: 'btc-updown-5m-1777505400').
+# Si no se puede parsear, NO bloquea (fail-open) — los slugs sin epoch suelen
+# ser markets de eventos largos (deportes, política).
+MIN_TIME_TO_EXPIRY_SECONDS = int(os.getenv("MIN_TIME_TO_EXPIRY_SECONDS", "600"))  # 10 min
+
 # ---------- Live trading (Fase 5 - plata real) ----------
 # LIVE_MODE=false → paper trading (default).
 # LIVE_MODE=true  → ejecuta órdenes reales en Polymarket CLOB.

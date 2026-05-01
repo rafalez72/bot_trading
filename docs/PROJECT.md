@@ -165,6 +165,9 @@ TRAIL_DROP_PCT=0.25              # cierra si cae 25% desde el peak
 # Diversificación
 MAX_WALLET_24H_PCT=0.50          # max 50% de trades de un wallet en 24h
 
+# Filtro inteligente de mercados cortos (reemplaza filtro lazy por slug)
+MIN_TIME_TO_EXPIRY_SECONDS=600   # bloquea markets que expiran en <10min
+
 # Realismo (simula plata real)
 REALISTIC_MODE=true
 REALISM_ENTRY_SLIP_PCT=0.015     # +1.5% slippage en entries
@@ -256,7 +259,7 @@ python copybot.py telegram-test              # mensaje de prueba
 | **Auto-drop por PnL** | cada cierre | drop si total cerrado <= -$10 con ≥5 trades (independiente de racha) |
 | **Auto-drop por reject-clog** | cada ~10 min | drop si ≥50 rejects en 24h con 0 fills (wallet ruidoso sin valor) |
 | **Diversification cap** | en open | reject `diversification_cap` si un wallet ya hizo > 50% de los trades en 24h |
-| **Short-duration market filter** | en open | reject `short_duration_market` para slugs `*-(1\|5\|10\|15)m-*` (binarios que expiran rápido) |
+| **Smart expiry filter** | en open | parsea timestamp del slug (`-(\d{10,13})$`); reject `expires_too_soon` si `expiry - now < MIN_TIME_TO_EXPIRY_SECONDS` (default 600s = 10 min). Reemplaza al filtro lazy por slug pattern. Fail-open si el slug no tiene epoch (markets largos: deportes, política) |
 | **Auto-replace** | inmediato post-drop | re-corre `select_traders`, llena vacante |
 | **Discovery on-demand** | si active < 20 | flag `discovery_pending=true` → runner dispara cycle |
 | **Cluster perf refresh** | cada 5 min | actualiza `cluster_perf`; bloquea/penaliza clusters |
@@ -786,6 +789,23 @@ PnL acumulado: +$1,470.66 sobre cap $100
   - `RESET_GRACE_SECONDS=5`: si reset hace <5s, no reactivar.
   - **Auto-recovery**: si `pnl > threshold` y kill switch activo, lo
     desactiva automáticamente (antes era manual-only y atascaba).
+
+### 2026-05-01 (madrugada) — Smart expiry filter
+**Problema detectado**: con el filtro `short_duration_market` por slug pattern
+(bloqueaba `*-(1|5|10|15)m-*`), las últimas 6h pasaron de operar a estar
+quietas. Análisis: 66% de los rejects eran `short_duration_market`. Los
+top traders de Polymarket scalpean masivamente markets cortos.
+
+**Filtro inteligente nuevo** reemplaza al de slug:
+- Parsea el epoch del final del slug: `btc-updown-5m-1777505400` → 1777505400
+- Calcula `time_left = expiry - now`
+- Si `time_left < MIN_TIME_TO_EXPIRY_SECONDS` (default 600s = 10 min) → reject `expires_too_soon`
+- Si el slug NO tiene timestamp parseable (sports, política, eventos) →
+  fail-open (no bloquea — esos markets son típicamente largos)
+
+Beneficio: un `-15m-` recién abierto (15 min restantes) ahora pasa, antes
+se bloqueaba. Un `-1h-` con 3 min restantes ahora se rechaza, antes pasaba.
+Captura el riesgo real (tiempo) en vez del bucket nominal.
 
 ### 2026-04-30 (tarde) — Bug del auto-drop deshecho por selector + compound decay
 **Análisis 3.1h post-deploy del mediodía**: WR 75%, PnL +$130 (con caveat:
