@@ -368,6 +368,16 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("recompute_sizings error: %s", e)
 
+            # Health check de servicios upstream (CLOB/proxy + Data API).
+            # Cada ~3 min. Tras 3 fallas consecutivas (~9 min) → alerta Telegram.
+            if cycle % max(1, 180 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.health_monitor import check_outages
+                    from src.config import CLOB_API
+                    await check_outages(CLOB_API)
+                except Exception as e:
+                    log.exception("health_monitor error: %s", e)
+
             # Auto-discovery (chequea internamente si pasaron 12h)
             if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:

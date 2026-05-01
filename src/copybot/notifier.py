@@ -43,6 +43,7 @@ ENABLED_NOTIFICATIONS = {
     "gain", "loss", "kill_switch",
     "live_close", "live_error",
     "log_error", "startup",
+    "outage",  # alertas de servicio caído (Polymarket / Vercel proxy)
 }
 
 
@@ -205,6 +206,30 @@ def live_error(*, stage: str, error: str) -> None:
         f"⚠️ *LIVE ERROR*\n"
         f"Stage: `{stage}`\n"
         f"Error: {error[:300]}"
+    )
+
+
+def outage_alert(service: str, target: str, detail: str) -> None:
+    """Alerta cuando un servicio upstream cae (Polymarket, Vercel, etc.)."""
+    if "outage" not in ENABLED_NOTIFICATIONS:
+        return
+    send(
+        f"🚨 *SERVICIO CAÍDO*\n"
+        f"Servicio: `{service}`\n"
+        f"Target: `{target[:60]}`\n"
+        f"Detalle: {str(detail)[:200]}\n\n"
+        "Bot operando con limitaciones. Te aviso cuando recupere."
+    )
+
+
+def recovery_alert(service: str, target: str) -> None:
+    """Notif cuando un servicio se recupera tras una caída."""
+    if "outage" not in ENABLED_NOTIFICATIONS:
+        return
+    send(
+        f"✅ *Servicio recuperado*\n"
+        f"Servicio: `{service}`\n"
+        f"Target: `{target[:60]}`"
     )
 
 

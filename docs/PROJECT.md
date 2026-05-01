@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-04-30 (paralelización polling, observabilidad, auto-pause, trailing stop, diversification cap)
+> **Última actualización**: 2026-05-01 (LIVE REAL activado vía Vercel proxy + sig_type=1)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -168,6 +168,11 @@ MAX_WALLET_24H_PCT=0.50          # max 50% de trades de un wallet en 24h
 # Filtro inteligente de mercados cortos (reemplaza filtro lazy por slug)
 MIN_TIME_TO_EXPIRY_SECONDS=600   # bloquea markets que expiran en <10min
 
+# Proxy Vercel para bypass de geo-block AR (ver changelog 2026-05-01)
+CLOB_API=https://bot-trading-lemon.vercel.app/clob   # routea via Vercel edge → Polymarket
+                                                     # default: https://clob.polymarket.com (NO
+                                                     # accesible desde IPs argentinas)
+
 # Realismo (simula plata real)
 REALISTIC_MODE=true
 REALISM_ENTRY_SLIP_PCT=0.015     # +1.5% slippage en entries
@@ -268,6 +273,7 @@ python copybot.py telegram-test              # mensaje de prueba
 | **Auto-tune filtros** | cada 6h | endurece/afloja MIN_WIN_RATE, MIN_VOLUME, etc. |
 | **Discovery automática** | cada 8h | discover + backfill nuevos + recluster + select |
 | **Daily summary** | cada 24h | (DESACTIVADO por pedido) |
+| **Health monitor upstream** | cada ~3 min | ping a CLOB/proxy + Data API. Tras 3 fallas consecutivas (~9 min) → alerta Telegram (`outage_alert`). Recovery → notif. Ver `health_monitor.py` |
 
 ---
 
@@ -789,6 +795,108 @@ PnL acumulado: +$1,470.66 sobre cap $100
   - `RESET_GRACE_SECONDS=5`: si reset hace <5s, no reactivar.
   - **Auto-recovery**: si `pnl > threshold` y kill switch activo, lo
     desactiva automáticamente (antes era manual-only y atascaba).
+
+### 2026-05-01 (tarde) — 🚀 LIVE REAL ACTIVADO
+**Día épico** de descubrimientos y pivots para llegar a operar plata real.
+Resumen de lo aprendido y resuelto:
+
+#### Bloqueo geográfico de Polymarket
+Polymarket bloquea con Cloudflare WAF **agresivamente** cualquier IP
+de Argentina + datacenters conocidos para los endpoints autenticados
+del CLOB (`/auth/api-key`, `/balance-allowance`, `/order`, etc.).
+Probado y bloqueado:
+- IPs argentinas (Telecom, etc.)
+- Cloudflare WARP (sale por AR)
+- ProtonVPN free (M247 pool — tanto US como RO)
+- Cloudflare Workers (todo el pool de outbound IPs del usuario)
+- GitHub Actions (Linux/Win/Mac/ARM — todo Azure)
+- Codespaces (Azure)
+
+**Solución que funcionó**: **Vercel Edge Functions** (subdomain `bot-trading-lemon.vercel.app`)
+con `vercel.json` rewrite `/clob/:path*` → `/api/clob?p=:path*` para
+soportar multi-segment paths (workaround a la limitación del catch-all
+`[...path]` que no resuelve correctamente con segmentos múltiples).
+
+Bot configurado vía `CLOB_API` env var: `https://bot-trading-lemon.vercel.app/clob`.
+Cada request del bot va por proxy → Vercel edge (US) → Polymarket
+(intra-CF, sin geo-block).
+
+#### Descubrimiento del bug del funder
+La address que Polymarket muestra en **Profile → Settings → Dirección**
+(con el cartel "Esta dirección es solo para uso de API") **NO es la misma**
+que la del Deposit screen (que dice "Your deposit address"):
+- **Deposit address** (`0xC76730D81B...`): inbox que recibe USDC. NO usar
+  para API.
+- **API address** (`0xC44a79BCe3...`): la wallet de trading real que el
+  CLOB consulta para balance/orders. Esta es la que va en `POLYMARKET_FUNDER_ADDRESS`.
+
+Si pasamos la deposit address, el balance API devuelve siempre $0 (porque
+la deposit address NO es la wallet de trading, solo el receiving inbox).
+
+#### Descubrimiento del sig_type
+La cuenta del usuario está en **POLY_PROXY antiguo (sig_type=1)**, no en
+Gnosis Safe (sig_type=2). Esto explica por qué con sig_type=2 daba 401
+"Unauthorized/Invalid api key" aún con creds válidas — la firma EIP-712
+no matcheaba el binding del usuario en Polymarket.
+
+Test confirmatorio (probando los 3 sig_types contra la API address):
+- sig_type=2 + API addr: balance=$0 (bind incorrecto, devuelve 0 en vez de error)
+- sig_type=1 + API addr: **balance=$99.19 con allowances unlimited** ✅
+- sig_type=0 + API addr: balance=$0
+
+#### Configuración final que funcionó
+```env
+POLYMARKET_PRIVATE_KEY=0xbc380...   # PK de Polymarket oficial (no la vieja 0x0535ec...)
+POLYMARKET_FUNDER_ADDRESS=0xC44a79BCe3805A3af056522Ae9BD805F6Da8Db9C  # API addr del Profile
+POLYMARKET_SIG_TYPE=1               # POLY_PROXY (NO 2)
+POLYMARKET_API_KEY=e82b2454-...
+POLYMARKET_API_SECRET=Zo0xSdTl...
+POLYMARKET_API_PASSPHRASE=3c62f4ac...
+LIVE_MODE=true
+LIVE_DRY_RUN=false                  # ← REAL
+LIVE_CAPITAL_USDC=100.0
+LIVE_BASE_USDC=10.0
+CLOB_API=https://bot-trading-lemon.vercel.app/clob   # ← proxy Vercel
+```
+
+`check-live` confirma:
+```
+✓ CLOB conectado
+Funder wallet: 0xC44a79BCe3805A3af056522Ae9BD805F6Da8Db9C
+Balance USDC:  $99.19
+Sig type:      1
+Host:          https://bot-trading-lemon.vercel.app/clob
+```
+
+#### Wipe del PnL para monitoreo limpio
+Antes de switch a real, hicimos:
+- `live_trades` → backup tabla `live_trades_dryrun_<ts>`
+- `live_rejects` → backup tabla `live_trades_dryrun_<ts>_rejects`
+- `live_trades` y `live_rejects` truncadas (PnL=$0 fresh)
+- `kill_switch` reseteado a inactive
+- Las tablas de aprendizaje (`bandit_state`, `learning_events`,
+  `copy_subscriptions`, `category_perf`, etc.) **NO se tocaron** —
+  el bot conserva todo el aprendizaje del dry-run.
+
+Pre-real PnL acumulado (dry-run, ahora archivado): **+$136.04 sobre 119 cierres**
+con WR 47% en 24h. Meta para real: ≥+5% mensual sobre cap $100 con WR sostenido.
+
+#### Latencia agregada por el proxy
+Vercel edge (US) → Polymarket (intra-CF): ~50ms.
+Lenovo (AR) → Vercel edge: ~150-200ms RTT.
+**Total extra por call CLOB: ~250-300ms.**
+Bot hace ~10-30 calls CLOB/h → ~3-9s extra/h. Despreciable para no-HFT.
+
+#### Aprendizajes operativos clave
+1. **Polymarket bloquea por país + datacenter ranges**, no solo por IP
+   individual. Workers/Actions/Codespaces todos terminan flaggeados.
+2. **El "Deposit address" ≠ "API address"** en cuentas Polymarket. El
+   Profile → Dirección es la real.
+3. **Old POLY_PROXY (sig_type=1) sigue activo** para muchas cuentas, no
+   asumir Gnosis Safe (sig_type=2) por default.
+4. **Vercel free tier alcanza** para nuestro volumen (~22k invocations/mes
+   << 1M límite). Pero es frágil si Polymarket bloquea Vercel también.
+   Plan B: Mullvad VPN ($5/mes) en la lenovo Windows.
 
 ### 2026-05-01 (madrugada) — Smart expiry filter
 **Problema detectado**: con el filtro `short_duration_market` por slug pattern
