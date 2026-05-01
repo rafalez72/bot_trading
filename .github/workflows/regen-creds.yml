@@ -1,0 +1,44 @@
+name: Regen Polymarket API Creds
+
+# Workflow manual: usa los runners de GitHub (Azure US/EU) que tienen IPs
+# rotantes — bypassea el bloqueo de Cloudflare desde Argentina/datacenters
+# conocidos. Si te tira 403, re-ejecutá y casi siempre te da una IP fresca.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sig_type:
+        description: "Signature type (0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE - default Magic Auth)"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "0"
+          - "1"
+          - "2"
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -q py-clob-client
+      - name: Show runner IP / location
+        run: |
+          echo "Runner IP info:"
+          curl -s -m 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E "^(ip|loc)=" || true
+      - name: Regen creds
+        env:
+          PK: ${{ secrets.POLYMARKET_PRIVATE_KEY }}
+          FUNDER: ${{ secrets.POLYMARKET_FUNDER_ADDRESS }}
+          SIG: ${{ inputs.sig_type }}
+        run: |
+          if [ -z "$PK" ] || [ -z "$FUNDER" ]; then
+            echo "::error::Faltan secrets POLYMARKET_PRIVATE_KEY o POLYMARKET_FUNDER_ADDRESS"
+            exit 1
+          fi
+          python scripts/regen_creds_auto.py
