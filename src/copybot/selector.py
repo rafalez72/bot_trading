@@ -59,17 +59,24 @@ def select_traders(top_n: int = DEFAULT_TOP_N) -> dict:
     th = get_thresholds()
 
     with db() as conn:
+        # Excluir wallets ya dropeados — drop es permanente. Si no excluimos
+        # acá, el LIMIT puede quedarse corto: top_n=20 con 5 dropped en el
+        # top → solo 15 candidatos disponibles. Con el WHERE NOT IN garantizamos
+        # que siempre tomamos top_n DISPONIBLES.
         candidates = conn.execute(
             """
-            SELECT * FROM trader_metrics
-            WHERE score              >= ?
-              AND realized_pnl_usdc  >= ?
-              AND win_rate           >= ?
-              AND total_trades       >= ?
-              AND total_volume_usdc  >= ?
-              AND max_drawdown_pct   <= ?
-              AND sharpe_proxy       >= ?
-            ORDER BY score DESC
+            SELECT tm.* FROM trader_metrics tm
+            WHERE tm.score              >= ?
+              AND tm.realized_pnl_usdc  >= ?
+              AND tm.win_rate           >= ?
+              AND tm.total_trades       >= ?
+              AND tm.total_volume_usdc  >= ?
+              AND tm.max_drawdown_pct   <= ?
+              AND tm.sharpe_proxy       >= ?
+              AND tm.wallet NOT IN (
+                  SELECT wallet FROM copy_subscriptions WHERE status='dropped'
+              )
+            ORDER BY tm.score DESC
             LIMIT ?
             """,
             (
