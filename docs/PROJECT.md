@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-01 (LIVE REAL activado vía Vercel proxy + sig_type=1)
+> **Última actualización**: 2026-05-02 (bot HL paralelo + multicast TG + inactivity drop + shadow tracker)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -114,6 +114,10 @@ polymarket_copybot/
 | `paper_trades` | Trades simulados del bot (entry/exit/pnl/status/exit_reason/asset/peak_price) |
 | `live_trades` | Trades **reales** en Polymarket CLOB (Fase 5). Mirror de paper_trades + token_id, order_id, tx_hash, fees, dry_run flag, peak_price |
 | `live_rejects` | Cada trade rechazado por el validador (at, source_wallet, condition_id, reason, detail JSON). Observabilidad post-2026-04-30 |
+| `hl_trades` | Trades del bot Hyperliquid paralelo (dry-run). Mirror de live_trades adaptado a perps (coin, is_buy, leverage, liquidation_price, funding_paid). Post-2026-05-02 |
+| `hl_subscriptions` | Wallets HL que el bot copia. status=active/paused/dropped + sizing_mult |
+| `hl_rejects` | Rejects del HL bot (espejo de live_rejects para HL) |
+| `shadow_trades` | Trades observados de wallets DROPPED (no copiados, solo registrados). Para análisis a posteriori si el threshold de drop fue agresivo |
 | `learning_events` | Log de cada decisión de aprendizaje (size_up, size_down, drop, etc.) |
 | `category_perf` | Performance acumulada por categoría de mercado + status (allowed/blocked) |
 | `cluster_perf` | Performance por cluster (K-means de wallets) |
@@ -172,6 +176,28 @@ MIN_TIME_TO_EXPIRY_SECONDS=600   # bloquea markets que expiran en <10min
 CLOB_API=https://bot-trading-lemon.vercel.app/clob   # routea via Vercel edge → Polymarket
                                                      # default: https://clob.polymarket.com (NO
                                                      # accesible desde IPs argentinas)
+
+# Hyperliquid bot paralelo (dry-run — ver changelog 2026-05-02)
+HL_MODE=true                          # arranca el HL runner en paralelo
+HL_CAPITAL_USDC=50.0                  # cap ficticio
+HL_BASE_USDC=5.0                      # base por trade
+HL_MAX_PER_WALLET_USDC=10.0
+HL_MAX_LEVERAGE=5.0
+HL_STOP_LOSS_PCT=0.20
+HL_TAKE_PROFIT_PCT=0.50
+HL_TRAIL_ACTIVATION_PCT=0.30
+HL_TRAIL_DROP_PCT=0.25
+HL_DRY_SLIPPAGE_PCT=0.001             # 0.1% (perps tienen spreads apretados)
+HL_ALLOWED_COINS=                     # vacío = todas. Default config: BTC,ETH,SOL
+HL_SLEEP_SECONDS=5
+HL_SWEEP_SECONDS=30
+HL_LIQUIDATION_BUFFER=1.2
+HL_MIN_EXPECTED_PNL_USDC=0.20
+
+# Telegram multicast — comma-separated chat_ids para notifs broadcast
+TELEGRAM_BOT_TOKEN=...                # NUNCA commitear al git
+TELEGRAM_CHAT_ID=<owner_id>,<friend_id1>,<friend_id2>   # primer ID = owner
+                                       # solo el primero ejecuta comandos
 
 # Realismo (simula plata real)
 REALISTIC_MODE=true
@@ -274,6 +300,10 @@ python copybot.py telegram-test              # mensaje de prueba
 | **Discovery automática** | cada 8h | discover + backfill nuevos + recluster + select |
 | **Daily summary** | cada 24h | (DESACTIVADO por pedido) |
 | **Health monitor upstream** | cada ~3 min | ping a CLOB/proxy + Data API. Tras 3 fallas consecutivas (~9 min) → alerta Telegram (`outage_alert`). Recovery → notif. Ver `health_monitor.py` |
+| **Auto-drop por inactividad on-chain** | cada ~6h | drop wallets cuyo `paper_cursor` no avanzó en >48h (sin actividad). `learning.auto_drop_by_inactivity()` |
+| **Shadow tracker** | cada ~1h | pollea wallets dropped, registra sus trades en `shadow_trades` (sin copiar). Post-mortem analysis de drops. Ver `shadow_tracker.py` |
+| **Discovery on-idle** | cada ~6h | si 0 trades del bot en 6h, fuerza `discovery_pending=true` para refresh del top |
+| **HL bot paralelo (dry-run)** | mismo poll que PM | Polling Hyperliquid en task separado. Validación + simulación de fills + SL/TP/trailing/liquidation buffer. Ver `hl_runner.py`, `hl_executor.py` |
 
 ---
 
@@ -621,6 +651,73 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-02 — Bot Hyperliquid paralelo + mejoras PM
+
+**Hito**: bot Hyperliquid corriendo **en paralelo** al PM real, en dry-run
+para validar producción con plata ficticia.
+
+#### Hyperliquid bot (paralelo, dry-run)
+- Nuevo módulo `src/hyperliquid/client.py`: async wrapper de `/info` (meta,
+  allMids, userFills, clearinghouseState, candles). HL **NO geo-bloquea**
+  desde AR — operamos directo desde lenovo, sin proxy.
+- `src/copybot/hl_executor.py`: dry-run open/close/force_close con todas
+  las validaciones (kill_switch compartido con PM, sub status, coin
+  allowlist, leverage cap, expected_pnl, wallet/global capital, duplicate
+  source_fill_id). Slippage pesimista, liquidation buffer.
+- `src/copybot/hl_runner.py`: `hl_run_loop()` async — polling paralelo
+  (gather) + sweep periódico SL/TP/trailing/liquidation. Hookeado en
+  `runner.run_loop` cuando `HL_MODE=true`.
+- 3 tablas nuevas: `hl_trades`, `hl_subscriptions`, `hl_rejects`. Schema
+  migrado idempotente.
+- 16 env vars `HL_*` con defaults seguros. `HL_MODE=false` por default.
+- Notif `hl_close` con prefix `🔵 [HL]` para distinguir de PM. Threshold
+  `HL_NOTIF_MIN_PNL=0.30` para suprimir micro-trades de scalpers.
+
+**Lecciones operativas con HL**:
+- Slippage **0.5% es muy alto para perps** — Hyperliquid tiene spreads
+  apretadísimos. Bajado a 0.1% (`HL_DRY_SLIPPAGE_PCT=0.001`).
+- Allowlist hardcoded `BTC,ETH,SOL` rechazaba 99% del volumen (los wallets
+  operan mayormente memecoins). Vaciada (`HL_ALLOWED_COINS=`) para permitir
+  todas.
+- Seed wallets de internet random (sin verificar) eran inútiles: 9/10
+  inactivas. Discovery on-the-fly via `recentTrades` de BTC/ETH/SOL/HYPE
+  encontró 18 wallets reales con 2000+ fills/24h.
+- Wallets HFT scalpers (ej. `0x010461c14e..`) generan -$0.01 por trade
+  (puro slippage cost) y spammean Telegram. **Drop manual** de scalpers +
+  threshold de notif `>=$0.30` para silenciarlos en background.
+
+#### Multicast Telegram
+- `notifier.send`: parsea `TELEGRAM_CHAT_ID` por coma para multicast.
+  Owner + amigos pueden suscribirse. Si un chat falla, los demás siguen.
+- `telegram_listener._authorized_chat_id`: solo el PRIMER chat_id puede
+  ejecutar comandos (`/status`, `/killswitch`). Los amigos reciben
+  notifs read-only.
+
+#### Bot token comprometido y regenerado
+- Bot `bonny21bot` fue **hijackeado** por un atacante que le seteó un
+  webhook a `webhook.sherlock.st` (servicio ruso de búsqueda de personas).
+  Síntoma: `/start` y `/killswitch` no respondían (webhook robaba updates),
+  pero `sendMessage` funcionaba (notifs salían normal).
+- Detectado vía `getWebhookInfo` que devolvió URL del attacker.
+- **Fix**: `deleteWebhook` + revocar token vía BotFather + nuevo token al
+  `.env`. **No commitear nunca el token a git** — solo en `.env` lenovo.
+
+#### Mejoras Polymarket bot
+- **Auto-drop por inactividad**: `learning.auto_drop_by_inactivity()` —
+  drop wallets activos cuyo `paper_cursor` no se movió en >48h. El cursor
+  avanza on-poll cuando hay /trades nuevos; si está flat = wallet sin
+  actividad on-chain = drop. Hook cada ~6h en runner.
+- **Shadow tracker**: nueva tabla `shadow_trades` + módulo
+  `shadow_tracker.py`. Pollea wallets dropped cada ~1h y registra sus
+  trades observados (sin copiar). Para análisis a posteriori — si en 1
+  semana descubrimos que un wallet dropped reapareció y tradeó bien,
+  sabemos que el threshold de inactividad fue agresivo.
+- **Discovery on-idle**: si 0 trades del bot en últimas 6h, fuerza
+  `discovery_pending=true` para refrescar el top.
+- **Drops permanentes**: confirmado el comportamiento — una vez dropped
+  (por cualquier razón), el wallet no se reactiva. Fue clave para
+  estabilizar el sistema.
 
 ### 2026-04-27 — Migración Mac → Lenovo
 - Decisión: Git + GitHub + GHCR en vez de rsync (más simple, audit trail)

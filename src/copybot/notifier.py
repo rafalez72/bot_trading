@@ -248,10 +248,20 @@ def recovery_alert(service: str, target: str) -> None:
 
 # ---------- Hyperliquid (paralelo, dry-run) ----------
 
+HL_NOTIF_MIN_PNL = 0.30  # Threshold: solo notificar cierres con |PnL| >= $0.30
+
+
 def hl_close(*, source_wallet: str, coin: str, is_buy: int,
              pnl_usdc: float, accumulated: float, exit_reason: str) -> None:
-    """Notif al cerrar una posición HL dry-run. Prefix [HL] para distinguir."""
+    """Notif al cerrar una posición HL dry-run. Prefix [HL] para distinguir.
+
+    Solo notifica si |pnl| >= HL_NOTIF_MIN_PNL para evitar spam de
+    micro-pérdidas de scalpers (0.01 USD por slippage). Los trades chicos
+    quedan en hl_trades para análisis pero no inundan Telegram.
+    """
     if "hl_close" not in ENABLED_NOTIFICATIONS:
+        return
+    if abs(pnl_usdc) < HL_NOTIF_MIN_PNL:
         return
     direction = "LONG" if is_buy else "SHORT"
     if pnl_usdc >= 0:
