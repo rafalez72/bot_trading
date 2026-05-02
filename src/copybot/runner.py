@@ -370,6 +370,48 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("auto_drop_by_rejects error: %s", e)
 
+            # Auto-drop por inactividad on-chain (cada ~6h, threshold 48h)
+            if cycle % max(1, 21600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.learning import auto_drop_by_inactivity
+                    n = auto_drop_by_inactivity()
+                    if n:
+                        console.print(
+                            f"[red]auto-drop:[/red] {n} wallets droppeados por inactividad >48h"
+                        )
+                except Exception as e:
+                    log.exception("auto_drop_by_inactivity error: %s", e)
+
+            # Shadow tracker: pollea wallets dropped y registra su actividad
+            # post-drop para análisis a posteriori (cada ~1h)
+            if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.shadow_tracker import shadow_poll_dropped
+                    await shadow_poll_dropped()
+                except Exception as e:
+                    log.exception("shadow_tracker error: %s", e)
+
+            # Force discovery on idle: si 0 trades en últimas 6h, rascamos
+            # discovery on-demand para refrescar wallets candidatos
+            if cycle % max(1, 21600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    with db() as _conn:
+                        idle = _conn.execute(
+                            f"SELECT COUNT(*) c FROM {TRADEBOOK_MODE.startswith('live') and 'live_trades' or 'paper_trades'} "
+                            f"WHERE entry_at >= ?",
+                            (int(time.time()) - 6 * 3600,),
+                        ).fetchone()["c"]
+                    if idle == 0:
+                        log.info("0 trades en 6h — fuerzo discovery_pending")
+                        with tx() as _conn:
+                            _conn.execute(
+                                "INSERT INTO bot_state (key, value, updated_at) "
+                                "VALUES ('discovery_pending', 'true', datetime('now')) "
+                                "ON CONFLICT(key) DO UPDATE SET value='true', updated_at=datetime('now')"
+                            )
+                except Exception as e:
+                    log.exception("idle discovery trigger error: %s", e)
+
             # Recompute bandit sizings periódicamente (cada ~10 min).
             # Antes solo se llamaba on_close — wallets dormidos nunca veían el
             # inactivity decay aplicado. Ahora se rebalancea aunque no haya cierres.

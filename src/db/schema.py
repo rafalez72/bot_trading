@@ -306,6 +306,24 @@ _MIGRATIONS = [
         detail        TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_hl_rejects_at ON hl_rejects(at DESC)",
+    # ── Shadow tracking: registra trades de wallets dropped (post-drop) para
+    # analizar a posteriori si dropearlos costó plata. NO se copian, solo se observan.
+    """CREATE TABLE IF NOT EXISTS shadow_trades (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet        TEXT NOT NULL,
+        drop_reason   TEXT,
+        trade_id      TEXT UNIQUE,
+        timestamp     INTEGER NOT NULL,
+        condition_id  TEXT,
+        slug          TEXT,
+        side          TEXT,
+        outcome_index INTEGER,
+        price         REAL,
+        size_usdc     REAL,
+        observed_at   INTEGER DEFAULT (strftime('%s','now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_shadow_wallet ON shadow_trades(wallet, timestamp DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_shadow_observed ON shadow_trades(observed_at DESC)",
 ]
 
 

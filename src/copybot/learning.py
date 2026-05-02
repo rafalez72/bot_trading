@@ -36,6 +36,10 @@ DROP_AFTER_LOSSES = 3
 # Default: 10% del capital. En live activamos cuando hay datos significativos.
 DROP_PNL_THRESHOLD_USDC = -10.0
 DROP_PNL_MIN_TRADES = 5
+# Inactivity drop: wallet sin actividad on-chain en N horas → drop.
+# Detectado vía paper_cursor:<wallet> en index_state (avanza on-poll si
+# hay trade nuevo, sino queda flat).
+DROP_INACTIVITY_HOURS = 48
 
 
 def _log_event(
@@ -305,6 +309,72 @@ def auto_drop_by_rejects(min_rejects: int = 50, window_hours: int = 24) -> int:
             log.warning("trader_dropped notif failed: %s", e)
 
     return len(candidates)
+
+
+def auto_drop_by_inactivity(window_hours: int | None = None) -> int:
+    """Drop active wallets sin actividad on-chain en window_hours.
+
+    El runner advance `index_state.paper_cursor:<wallet>` cuando ve trades
+    nuevos en /trades?user=<wallet>. Si el cursor no se mueve en >72h,
+    el wallet está dormido on-chain → drop para liberar el slot.
+
+    NOTA: distinto de `auto_drop_by_rejects` (que detecta wallets activos
+    pero con todas sus señales rechazadas) — este detecta wallets sin
+    NINGUNA señal del lado del exchange.
+    """
+    import time as _t
+
+    if window_hours is None:
+        window_hours = DROP_INACTIVITY_HOURS
+    cutoff = int(_t.time()) - window_hours * 3600
+
+    dropped: list[tuple[str, int]] = []
+    with tx() as conn:
+        rows = conn.execute(
+            """
+            SELECT cs.wallet AS wallet,
+                   COALESCE(CAST(ist.value AS INTEGER), 0) AS cursor_ts
+            FROM copy_subscriptions cs
+            LEFT JOIN index_state ist ON ist.key = 'paper_cursor:' || cs.wallet
+            WHERE cs.status = 'active'
+              AND COALESCE(CAST(ist.value AS INTEGER), 0) > 0
+              AND CAST(ist.value AS INTEGER) < ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        for r in rows:
+            wallet = r["wallet"]
+            cursor = r["cursor_ts"]
+            inactive_h = (int(_t.time()) - cursor) / 3600.0
+            conn.execute(
+                """
+                UPDATE copy_subscriptions
+                SET status='dropped', stopped_at=datetime('now'), sizing_mult=0
+                WHERE wallet=?
+                """,
+                (wallet,),
+            )
+            _log_event(
+                conn, wallet, "drop", 1.0, 0.0,
+                f"inactividad on-chain {inactive_h:.0f}h sin trades",
+                {"reason": "inactivity_oncchain", "hours": round(inactive_h, 1)},
+            )
+            dropped.append((wallet, int(inactive_h)))
+
+    if dropped:
+        log.info("auto_drop_by_inactivity: %d wallets dropeados (>%dh sin actividad)",
+                 len(dropped), window_hours)
+        for w, h in dropped:
+            log.info("  drop inactivity: %s.. (%dh)", w[:10], h)
+        # Auto-replace tras drops
+        try:
+            from src.copybot.selector import select_traders
+            select_traders(top_n=20)
+        except Exception as e:
+            log.warning("auto-replace post-inactivity failed: %s", e)
+
+    return len(dropped)
 
 
 def recent_events(limit: int = 100) -> list[dict]:
