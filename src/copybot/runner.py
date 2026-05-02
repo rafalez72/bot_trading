@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from rich.console import Console
@@ -282,6 +283,17 @@ async def run_loop(*, once: bool = False) -> None:
             telegram_task = asyncio.create_task(telegram_listener.run())
         except Exception as e:
             log.warning("no se pudo arrancar telegram listener: %s", e)
+
+    # Hyperliquid paralelo (dry-run). Si HL_MODE=true, arrancamos el runner HL
+    # como task en paralelo. NO toca el loop principal del PM bot.
+    hl_task: asyncio.Task | None = None
+    if os.getenv("HL_MODE", "false").lower() == "true" and not once:
+        try:
+            from src.copybot.hl_runner import hl_run_loop
+            hl_task = asyncio.create_task(hl_run_loop())
+            log.info("HL runner: arrancado en paralelo (dry-run)")
+        except Exception as e:
+            log.warning("no se pudo arrancar HL runner: %s", e)
 
     cycle = 0
     last_sweep = 0.0

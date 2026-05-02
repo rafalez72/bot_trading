@@ -44,6 +44,7 @@ ENABLED_NOTIFICATIONS = {
     "live_close", "live_error",
     "log_error", "startup",
     "outage",  # alertas de servicio caído (Polymarket / Vercel proxy)
+    "hl_close",  # cierres del bot HL paralelo (dry-run)
 }
 
 
@@ -243,6 +244,28 @@ def recovery_alert(service: str, target: str) -> None:
         f"Servicio: `{service}`\n"
         f"Target: `{target[:60]}`"
     )
+
+
+# ---------- Hyperliquid (paralelo, dry-run) ----------
+
+def hl_close(*, source_wallet: str, coin: str, is_buy: int,
+             pnl_usdc: float, accumulated: float, exit_reason: str) -> None:
+    """Notif al cerrar una posición HL dry-run. Prefix [HL] para distinguir."""
+    if "hl_close" not in ENABLED_NOTIFICATIONS:
+        return
+    direction = "LONG" if is_buy else "SHORT"
+    if pnl_usdc >= 0:
+        txt = (
+            f"🟢 *[HL] GANADO* ${pnl_usdc:.2f} ({coin} {direction})\n"
+            f"PnL acumulado HL: ${accumulated:+.2f}"
+        )
+    else:
+        txt = (
+            f"🔴 *[HL] PERDIDO* ${abs(pnl_usdc):.2f} ({coin} {direction})\n"
+            f"PnL acumulado HL: ${accumulated:+.2f}"
+        )
+    txt += "\n🧪 _dry-run_"
+    send(txt)
 
 
 # ---------- Startup + error log forwarder ----------

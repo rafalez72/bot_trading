@@ -108,5 +108,23 @@ LIVE_DRY_SLIPPAGE_PCT = float(os.getenv("LIVE_DRY_SLIPPAGE_PCT", "0.015"))  # 1.
 # Default: false — el módulo existe pero no se enchufa al runner todavía.
 WEBSOCKET_TRADES_ENABLED = os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
 
+# ---------- Hyperliquid (copy-bot perps en paralelo, dry-run) ----------
+# Activación: HL_MODE=true. Si false, el HL runner no arranca y nada cambia.
+HL_MODE = os.getenv("HL_MODE", "false").lower() == "true"
+HL_CAPITAL_USDC = float(os.getenv("HL_CAPITAL_USDC", "50.0"))
+HL_BASE_USDC = float(os.getenv("HL_BASE_USDC", "5.0"))
+HL_MAX_PER_WALLET_USDC = float(os.getenv("HL_MAX_PER_WALLET_USDC", "10.0"))
+HL_MAX_LEVERAGE = float(os.getenv("HL_MAX_LEVERAGE", "5.0"))
+HL_MIN_EXPECTED_PNL_USDC = float(os.getenv("HL_MIN_EXPECTED_PNL_USDC", "0.20"))
+HL_STOP_LOSS_PCT = float(os.getenv("HL_STOP_LOSS_PCT", "0.20"))
+HL_TAKE_PROFIT_PCT = float(os.getenv("HL_TAKE_PROFIT_PCT", "0.50"))
+HL_TRAIL_ACTIVATION_PCT = float(os.getenv("HL_TRAIL_ACTIVATION_PCT", "0.30"))
+HL_TRAIL_DROP_PCT = float(os.getenv("HL_TRAIL_DROP_PCT", "0.25"))
+HL_DRY_SLIPPAGE_PCT = float(os.getenv("HL_DRY_SLIPPAGE_PCT", "0.005"))
+HL_ALLOWED_COINS = [c.strip().upper() for c in os.getenv("HL_ALLOWED_COINS", "BTC,ETH,SOL").split(",") if c.strip()]
+HL_SLEEP_SECONDS = int(os.getenv("HL_SLEEP_SECONDS", "5"))
+HL_SWEEP_SECONDS = int(os.getenv("HL_SWEEP_SECONDS", "30"))
+HL_LIQUIDATION_BUFFER = float(os.getenv("HL_LIQUIDATION_BUFFER", "1.2"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

@@ -262,6 +262,50 @@ _MIGRATIONS = [
     # +30% en ganancia, y cerrar si después cae 25% del peak.
     "ALTER TABLE live_trades ADD COLUMN peak_price REAL",
     "ALTER TABLE paper_trades ADD COLUMN peak_price REAL",
+    # ── Hyperliquid (perps copy-bot dry-run, paralelo al PM bot)
+    """CREATE TABLE IF NOT EXISTS hl_trades (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_wallet   TEXT NOT NULL,
+        source_fill_id  TEXT UNIQUE,
+        coin            TEXT NOT NULL,
+        is_buy          INTEGER NOT NULL,
+        leverage        REAL DEFAULT 1.0,
+        entry_at        INTEGER NOT NULL,
+        exit_at         INTEGER,
+        entry_price     REAL NOT NULL,
+        exit_price      REAL,
+        peak_price      REAL,
+        entry_size_usdc REAL NOT NULL,
+        exit_size_usdc  REAL,
+        pnl_usdc        REAL,
+        funding_paid    REAL DEFAULT 0,
+        liquidation_price REAL,
+        status          TEXT NOT NULL,
+        exit_reason     TEXT,
+        dry_run         INTEGER DEFAULT 1,
+        created_at      TEXT DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hl_trades_wallet ON hl_trades(source_wallet, entry_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_hl_trades_status ON hl_trades(status)",
+    """CREATE TABLE IF NOT EXISTS hl_subscriptions (
+        wallet      TEXT PRIMARY KEY,
+        status      TEXT NOT NULL DEFAULT 'active',
+        sizing_mult REAL DEFAULT 1.0,
+        started_at  TEXT DEFAULT (datetime('now')),
+        stopped_at  TEXT,
+        notes       TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS hl_rejects (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        at            INTEGER NOT NULL,
+        source_wallet TEXT,
+        coin          TEXT,
+        is_buy        INTEGER,
+        price         REAL,
+        reason        TEXT NOT NULL,
+        detail        TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hl_rejects_at ON hl_rejects(at DESC)",
 ]
 
 
