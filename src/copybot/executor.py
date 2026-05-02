@@ -304,7 +304,14 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         )
         return None, "diversification_cap"
 
-    size_usdc = LIVE_BASE_USDC * sizing
+    # Size base × sizing del bandit. Adicionalmente: en markets thin
+    # (liq < $3000) escalamos a 0.5× para mitigar slippage real (los markets
+    # chicos tienen orderbooks delgados → tu orden mueve el precio).
+    # Límite duro: liq < MIN_MARKET_LIQUIDITY_USDC ya rechazó arriba; el
+    # escalado aquí cubre la franja $1500-3000 = "operable pero arriesgado".
+    liq = m["liquidity"] if (m and m["liquidity"] is not None) else None
+    liq_factor = 0.5 if (liq is not None and liq < 3000) else 1.0
+    size_usdc = LIVE_BASE_USDC * sizing * liq_factor
 
     # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
     # no vale la pena. Esto descarta trades donde sizing_mult dejó el size muy chico.
