@@ -125,6 +125,10 @@ HL_ALLOWED_COINS = [c.strip().upper() for c in os.getenv("HL_ALLOWED_COINS", "BT
 HL_SLEEP_SECONDS = int(os.getenv("HL_SLEEP_SECONDS", "5"))
 HL_SWEEP_SECONDS = int(os.getenv("HL_SWEEP_SECONDS", "30"))
 HL_LIQUIDATION_BUFFER = float(os.getenv("HL_LIQUIDATION_BUFFER", "1.2"))
+# Anti-scalper: max fills copiados por wallet en 24h. Si excede, reject;
+# si excede 2× → auto-drop. Wallets HFT generan +1000 fills/día con
+# pérdidas garantizadas por slippage.
+HL_MAX_FILLS_PER_WALLET_24H = int(os.getenv("HL_MAX_FILLS_PER_WALLET_24H", "30"))
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

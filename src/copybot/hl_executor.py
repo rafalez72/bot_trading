@@ -114,6 +114,31 @@ def _open_position_validate_hl(conn, *, source_wallet, source_fill_id, coin, is_
                     detail=json.dumps({"coin": coin, "allowed": HL_ALLOWED_COINS}))
         return None, "coin_blocked"
 
+    # Anti-scalper: limita fills copiados por wallet en 24h. Los scalpers HFT
+    # generan trades cada minuto que solo cuestan slippage (~-$0.01 por trade).
+    # Auto-drop al wallet si excede 2× del threshold (claramente HFT).
+    from src.config import HL_MAX_FILLS_PER_WALLET_24H
+    recent_fills = conn.execute(
+        "SELECT COUNT(*) c FROM hl_trades WHERE source_wallet=? AND entry_at >= ?",
+        (source_wallet, int(time.time()) - 86400),
+    ).fetchone()["c"]
+    if recent_fills >= HL_MAX_FILLS_PER_WALLET_24H:
+        _log_reject(source_wallet, coin, is_buy, price, "scalper_limit",
+                    detail=json.dumps({"recent_24h": recent_fills,
+                                       "max": HL_MAX_FILLS_PER_WALLET_24H}))
+        if recent_fills >= HL_MAX_FILLS_PER_WALLET_24H * 2:
+            try:
+                conn.execute(
+                    "UPDATE hl_subscriptions SET status='dropped', "
+                    "stopped_at=datetime('now'), notes='hft_auto_drop' WHERE wallet=?",
+                    (source_wallet,),
+                )
+                log.info("HL auto-drop scalper: %s.. (%d fills/24h)",
+                         source_wallet[:10], recent_fills)
+            except Exception:
+                pass
+        return None, "scalper_limit"
+
     # Duplicate
     dup = conn.execute(
         "SELECT id FROM hl_trades WHERE source_fill_id=?", (source_fill_id,),
