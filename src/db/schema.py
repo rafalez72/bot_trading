@@ -367,6 +367,11 @@ _MIGRATIONS = [
         detail        TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_dx_rejects_at ON dx_rejects(at DESC)",
+    # ── Production parity additions: simulamos costos reales para que dry-run
+    # prediga net PnL real (gas + funding rate + fill realista por orderbook).
+    "ALTER TABLE dx_trades ADD COLUMN funding_paid REAL DEFAULT 0",
+    "ALTER TABLE dx_trades ADD COLUMN gas_paid REAL DEFAULT 0",
+    "ALTER TABLE hl_trades ADD COLUMN gas_paid REAL DEFAULT 0",
 ]
 
 

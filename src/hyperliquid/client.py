@@ -75,6 +75,21 @@ class HyperliquidClient:
         """Estado actual de cuenta: marginSummary + assetPositions."""
         return await self._post_info({"type": "clearinghouseState", "user": wallet})
 
+    async def l2_book(self, coin: str) -> dict:
+        """L2 orderbook para un coin. Devuelve {coin, time, levels: [bids, asks]}.
+
+        Cada level: {px, sz, n}. Usado para production-parity fill price
+        (walk levels al size que vamos a tomar)."""
+        return await self._post_info({"type": "l2Book", "coin": coin})
+
+    async def meta_and_asset_ctxs(self) -> Any:
+        """Devuelve [meta, [assetCtx1, ...]] donde cada assetCtx tiene
+        funding rate, oraclePx, openInterest, premium, etc.
+
+        Usado para funding accrual hourly.
+        """
+        return await self._post_info({"type": "metaAndAssetCtxs"})
+
     async def candles(self, coin: str, interval: str = "1m", lookback_seconds: int = 300) -> list[dict]:
         """Histórico de candles para análisis de precio reciente."""
         now_ms = int(time.time() * 1000)

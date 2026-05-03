@@ -129,6 +129,12 @@ HL_LIQUIDATION_BUFFER = float(os.getenv("HL_LIQUIDATION_BUFFER", "1.2"))
 # si excede 2× → auto-drop. Wallets HFT generan +1000 fills/día con
 # pérdidas garantizadas por slippage.
 HL_MAX_FILLS_PER_WALLET_24H = int(os.getenv("HL_MAX_FILLS_PER_WALLET_24H", "30"))
+# Production parity: HL settlement L1 no cobra gas explícito → 0.0. El
+# valor queda configurable por consistencia con DX y por si Hyperliquid
+# llegase a cobrar fee de exec (taker fee) que querramos descontar acá.
+HL_GAS_PER_FILL_USDC = float(os.getenv("HL_GAS_PER_FILL_USDC", "0.0"))
+HL_FUNDING_UPDATE_HOURS = int(os.getenv("HL_FUNDING_UPDATE_HOURS", "1"))
+HL_USE_ORDERBOOK_FILL = os.getenv("HL_USE_ORDERBOOK_FILL", "true").lower() == "true"
 
 # ---------- dYdX v4 (3er bot — perps Cosmos chain, dry-run) ----------
 DX_MODE = os.getenv("DX_MODE", "false").lower() == "true"
@@ -147,6 +153,10 @@ DX_SLEEP_SECONDS = int(os.getenv("DX_SLEEP_SECONDS", "5"))
 DX_SWEEP_SECONDS = int(os.getenv("DX_SWEEP_SECONDS", "30"))
 DX_LIQUIDATION_BUFFER = float(os.getenv("DX_LIQUIDATION_BUFFER", "1.2"))
 DX_MAX_FILLS_PER_WALLET_24H = int(os.getenv("DX_MAX_FILLS_PER_WALLET_24H", "30"))
+# Production parity: costos reales que simulamos para predecir net PnL real.
+DX_GAS_PER_FILL_USDC = float(os.getenv("DX_GAS_PER_FILL_USDC", "0.02"))
+DX_FUNDING_UPDATE_HOURS = int(os.getenv("DX_FUNDING_UPDATE_HOURS", "1"))
+DX_USE_ORDERBOOK_FILL = os.getenv("DX_USE_ORDERBOOK_FILL", "true").lower() == "true"
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

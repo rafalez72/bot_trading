@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-02 (bot HL paralelo + multicast TG + inactivity drop + shadow tracker)
+> **Última actualización**: 2026-05-03 (bot dYdX v4 + dashboard 3 tabs + LCD discovery + production parity gas/funding/orderbook)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -114,9 +114,12 @@ polymarket_copybot/
 | `paper_trades` | Trades simulados del bot (entry/exit/pnl/status/exit_reason/asset/peak_price) |
 | `live_trades` | Trades **reales** en Polymarket CLOB (Fase 5). Mirror de paper_trades + token_id, order_id, tx_hash, fees, dry_run flag, peak_price |
 | `live_rejects` | Cada trade rechazado por el validador (at, source_wallet, condition_id, reason, detail JSON). Observabilidad post-2026-04-30 |
-| `hl_trades` | Trades del bot Hyperliquid paralelo (dry-run). Mirror de live_trades adaptado a perps (coin, is_buy, leverage, liquidation_price, funding_paid). Post-2026-05-02 |
+| `hl_trades` | Trades del bot Hyperliquid paralelo (dry-run). Mirror de live_trades adaptado a perps (coin, is_buy, leverage, liquidation_price, funding_paid, gas_paid). Post-2026-05-02 |
 | `hl_subscriptions` | Wallets HL que el bot copia. status=active/paused/dropped + sizing_mult |
 | `hl_rejects` | Rejects del HL bot (espejo de live_rejects para HL) |
+| `dx_trades` | Trades del bot dYdX v4 paralelo (dry-run). Mirror de hl_trades para dYdX perps (ticker, is_buy, leverage, liquidation_price, gas_paid, funding_paid). Post-2026-05-03 |
+| `dx_subscriptions` | Wallets dYdX que el bot copia. status=active/paused/dropped + sizing_mult |
+| `dx_rejects` | Rejects del dYdX bot (espejo de hl_rejects para dYdX) |
 | `shadow_trades` | Trades observados de wallets DROPPED (no copiados, solo registrados). Para análisis a posteriori si el threshold de drop fue agresivo |
 | `learning_events` | Log de cada decisión de aprendizaje (size_up, size_down, drop, etc.) |
 | `category_perf` | Performance acumulada por categoría de mercado + status (allowed/blocked) |
@@ -193,6 +196,35 @@ HL_SLEEP_SECONDS=5
 HL_SWEEP_SECONDS=30
 HL_LIQUIDATION_BUFFER=1.2
 HL_MIN_EXPECTED_PNL_USDC=0.20
+HL_MAX_FILLS_PER_WALLET_24H=30        # anti-scalper (post-2026-05-03)
+HL_NOTIF_MIN_PNL=0.30                 # silencia micro-PnL de scalpers
+HL_GAS_PER_FILL_USDC=0.0              # HL no cobra gas explícito (settlement L1)
+HL_FUNDING_UPDATE_HOURS=1
+HL_USE_ORDERBOOK_FILL=true            # parity: walks orderbook, simula latencia
+
+# dYdX v4 bot paralelo (dry-run — ver changelog 2026-05-03)
+DX_MODE=true                          # arranca el dx_runner en paralelo
+DX_INDEXER=https://indexer.dydx.trade/v4
+DX_LCD=https://dydx-lcd.publicnode.com
+DX_CAPITAL_USDC=50.0                  # cap ficticio
+DX_BASE_USDC=5.0                      # base por trade
+DX_MAX_PER_WALLET_USDC=10.0
+DX_MAX_LEVERAGE=5.0
+DX_STOP_LOSS_PCT=0.20
+DX_TAKE_PROFIT_PCT=0.50
+DX_TRAIL_ACTIVATION_PCT=0.30
+DX_TRAIL_DROP_PCT=0.25
+DX_DRY_SLIPPAGE_PCT=0.001             # 0.1% (perps muy líquidos)
+DX_ALLOWED_TICKERS=                   # vacío = todos. Default config: BTC-USD,ETH-USD,SOL-USD
+DX_SLEEP_SECONDS=5
+DX_SWEEP_SECONDS=30
+DX_LIQUIDATION_BUFFER=1.2
+DX_MIN_EXPECTED_PNL_USDC=0.20
+DX_MAX_FILLS_PER_WALLET_24H=30        # anti-scalper
+DX_NOTIF_MIN_PNL=0.30
+DX_GAS_PER_FILL_USDC=0.02             # parity: gas Cosmos por fill
+DX_FUNDING_UPDATE_HOURS=1             # parity: hourly funding update
+DX_USE_ORDERBOOK_FILL=true            # parity: walks orderbook real
 
 # Telegram multicast — comma-separated chat_ids para notifs broadcast
 TELEGRAM_BOT_TOKEN=...                # NUNCA commitear al git
@@ -304,6 +336,11 @@ python copybot.py telegram-test              # mensaje de prueba
 | **Shadow tracker** | cada ~1h | pollea wallets dropped, registra sus trades en `shadow_trades` (sin copiar). Post-mortem analysis de drops. Ver `shadow_tracker.py` |
 | **Discovery on-idle** | cada ~6h | si 0 trades del bot en 6h, fuerza `discovery_pending=true` para refresh del top |
 | **HL bot paralelo (dry-run)** | mismo poll que PM | Polling Hyperliquid en task separado. Validación + simulación de fills + SL/TP/trailing/liquidation buffer. Ver `hl_runner.py`, `hl_executor.py` |
+| **dYdX v4 bot paralelo (dry-run)** | mismo poll que HL | Polling indexer.dydx.trade en task separado. Validación + simulación + SL/TP/trailing/liquidation. Ver `dx_runner.py`, `dx_executor.py` |
+| **Anti-scalper filter (HL/DX)** | en open | reject `scalper_wallet` si el wallet hizo > `*_MAX_FILLS_PER_WALLET_24H` (default 30) en 24h. Auto-drop si supera 60. Filtra HFT que generan -$0.01 / fill puro slippage cost |
+| **Funding update hourly (HL/DX)** | cada 1h (`*_FUNDING_UPDATE_HOURS`) | Por cada posición open, fetch funding rate del market y acumula en `funding_paid`. Se descuenta del PnL al cerrar. Production parity con perps reales |
+| **Production parity gas (PM/HL/DX)** | en open + close | Cada fill incrementa `gas_paid`. Al cerrar, PnL se descuenta gas_total + funding_paid. Espeja el costo real |
+| **Orderbook fill (HL/DX)** | en open + close | Si `*_USE_ORDERBOOK_FILL=true`, runner fetcha orderbook real y walks levels para nuestro size. Simula latencia ~2s broadcast. Reemplaza al slippage simple |
 
 ---
 
@@ -651,6 +688,124 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-03 — 3er bot dYdX v4 + dashboard 3 tabs + production parity
+
+**Hito**: agregamos el **3er bot** (dYdX v4) en paralelo a PM y HL, en
+dry-run. Plan: validar 7d en dry-run con **parity total** vs producción
+y pasar a real **el martes**. Esto requirió cerrar todos los gaps de
+realismo que el HL bot tenía abiertos (gas, funding, fill price).
+
+#### Bot dYdX v4 (paralelo, dry-run)
+- `src/dydx/client.py`: async wrapper de `https://indexer.dydx.trade/v4/`
+  (perpetual_markets, fills, positions, orderbook, trades,
+  clearinghouse_state, candles). dYdX **NO geo-bloquea** desde AR.
+- `src/copybot/dx_executor.py`: dry-run open/close/force_close mirror de
+  hl_executor. Validaciones: kill_switch (compartido con PM/HL), sub
+  status, ticker allowlist, anti-scalper, duplicate, leverage cap,
+  expected_pnl, wallet/global capital.
+- `src/copybot/dx_runner.py`: `dx_run_loop()` async — polling parallel
+  (asyncio.gather) + sweep periódico SL/TP/trailing/liquidation. Cursor
+  `dx_cursor:<wallet>` en milisegundos.
+- `_classify_fill` infiere open/close por presencia de posición existente
+  en el wallet (dYdX fills no traen flag de open vs close).
+- 3 tablas nuevas: `dx_trades`, `dx_subscriptions`, `dx_rejects`. Schema
+  migrado idempotente.
+- 17 env vars `DX_*` con defaults seguros. `DX_MODE=false` por default.
+- Notif `dx_close` con prefix `🟣 [DX]`. Threshold `DX_NOTIF_MIN_PNL=0.30`.
+
+#### Discovery automática de wallets dYdX
+Usuario: "no quiero hacer el trabajo manual de entrar, copiar etc."
+Caminos fallidos antes de la solución:
+- Endpoint `/trades` del indexer: NO devuelve addresses (solo size/price).
+- `tx_search` RPC del Cosmos: timeout en 50+ segundos.
+- Numia, Mintscan, DefiLlama: requieren auth, paywall, o no traen users.
+- Parsing de bloques con protobuf: demasiado complejo (Cosmos SDK msg
+  schemas para `MsgPlaceOrder` requieren protoc + bindings custom).
+
+**Solución**: endpoint LCD `/dydxprotocol/subaccounts/subaccount`:
+```python
+async with httpx.AsyncClient() as client:
+    r = await client.get(f"{LCD}/dydxprotocol/subaccounts/subaccount", params=params)
+```
+Paginado 50 pages → 937 candidatos encontrados. Top 10 por equity
+insertados en `dx_subscriptions` (rango $7.2M down to $9k).
+
+#### Dashboard 3 tabs (Poly / Hyperliquid / dYdX)
+- `src/api/server.py`: nuevos endpoints `/api/hl/summary`, `/api/hl/trades`,
+  `/api/dx/summary`, `/api/dx/trades`. Mirror de los `/api/live/*`.
+- `src/api/static/app.js` reescrito: `tabData` getter switcheable entre
+  los 3 bots. Fetch parallel de los 7 endpoints. Refresh c/10s.
+- `src/api/static/index.html` reescrito: 3 botones tab (Poly/Hyperliquid/dYdX)
+  con estilos color-coded (emerald/blue/purple). Layout idéntico por tab
+  reusando `tabData` reactivo.
+- SW bumpeado a v10 (`copybot-v10-multi-tab`) para invalidar cache vieja.
+
+#### Production parity (cierra el gap dry-run vs real)
+Usuario: "haz los cambios necesarios para que no haya diferencia entre
+nuestras pruebas y el entorno real, que sea exactamente igual, el martes
+pasamos al entorno real."
+
+3 gaps cerrados (HL y DX en paralelo):
+1. **Gas explícito por fill**:
+   - Schema: `dx_trades.gas_paid REAL DEFAULT 0` y `hl_trades.gas_paid` (idem).
+   - `open_position` graba `gas_paid = *_GAS_PER_FILL_USDC` al abrir.
+   - `close_position` suma otro fill al cerrar y descuenta del PnL net.
+   - DX: `DX_GAS_PER_FILL_USDC=0.02` (Cosmos gas average por tx).
+   - HL: `HL_GAS_PER_FILL_USDC=0.0` (no cobra gas explícito, settlement L1).
+2. **Funding rate hourly accrual**:
+   - Schema: `dx_trades.funding_paid REAL DEFAULT 0` (HL ya lo tenía).
+   - Módulo nuevo `src/copybot/dx_funding.py`: task async cada
+     `DX_FUNDING_UPDATE_HOURS` (default 1). Por cada posición open
+     fetcha funding rate del market y acumula
+     `funding_incremental = size_usdc × funding_rate × elapsed_h / 8`.
+     Hookeado en `dx_run_loop`.
+   - Mismo módulo paralelo `hl_funding.py` para HL.
+   - Al cerrar: `pnl_net = pnl_gross - gas_total - funding_paid`.
+3. **Orderbook-based fill price**:
+   - `dx_runner._process_wallet` antes de `open_position` fetcha
+     orderbook (`/orderbooks/perpetualMarket/{ticker}`) y walks levels
+     para size = `DX_BASE_USDC × sizing_mult`. Computa VWAP real.
+   - Simula `await asyncio.sleep(2.0)` antes del open: es el delay típico
+     entre que detectamos el fill del trader y nuestro tx llega al
+     mempool. Refetch orderbook tras la latencia para que el precio
+     refleje los movimientos del libro durante esos 2s.
+   - `realistic_entry_price` se pasa a `open_position` como kwarg
+     opcional. Si vacío → fallback a slippage simple (compat).
+   - Ídem `close_position` con `realistic_exit_price`.
+   - Toggle vía `DX_USE_ORDERBOOK_FILL=true` (default on).
+
+**Justificación**: martes pasamos plata real. Si el dry-run no descuenta
+gas+funding y usa precios "perfectos" del fill del trader original, el
+PnL teórico está sobreestimado. La parity garantiza que un trade que
+sale +$0.30 en dry-run sale ~+$0.30 en real (con margen de variabilidad
+del orderbook entre ticks).
+
+#### Anti-scalper filter (HL + DX)
+Hallazgo: wallets HFT (`0x010461c14e..` en HL, varios en DX por LCD top
+equity) generan ~-$0.01 / fill puro slippage cost y spammean Telegram.
+Ejemplos: 4 wallets HL con 2143/278/220/132 fills/24h causaron -$30 en
+24h.
+
+- Reject `scalper_wallet` si fills 24h > `*_MAX_FILLS_PER_WALLET_24H=30`.
+- Auto-drop si supera 60 (umbral más alto que reject para no tocar
+  wallets que están "raspando" el threshold).
+- Threshold `*_NOTIF_MIN_PNL=0.30` para silenciar notifs de micro-PnL.
+
+#### PM cluster_blocked false positive (cleanup)
+- Investigación: 24h con 0 trades del bot, 101 rejects `cluster_blocked`.
+  Diagnóstico mostró que TODOS venían de un solo wallet
+  (`0x2eb8b11603f9..`) que ya estaba dropped. La regla de cluster era
+  correcta pero la métrica era cosmética porque ese wallet no entraba.
+- Real issues: `low_liquidity` en mercados thin, `expires_too_soon` en
+  binarios cortos, `sport_only` en wallets que solo trabajan deportes.
+- **Fixes**:
+  - Liquidity threshold `MIN_MARKET_LIQUIDITY_USDC=5000 → 1500` para
+    permitir entrar en mercados intermedios.
+  - Sizing dinámico `0.5×` en mercados con liquidez `$1500-3000` (no usar
+    full size).
+  - Drop manual de 3 wallets sport-only (clog del top sin actividad real
+    en politics/crypto).
 
 ### 2026-05-02 — Bot Hyperliquid paralelo + mejoras PM
 

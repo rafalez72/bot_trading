@@ -29,6 +29,8 @@ from src.config import (
     DX_TRAIL_DROP_PCT,
     DX_LIQUIDATION_BUFFER,
     DX_SWEEP_SECONDS,
+    DX_BASE_USDC,
+    DX_USE_ORDERBOOK_FILL,
 )
 from src.copybot import dx_executor
 from src.db.schema import db, tx
@@ -66,6 +68,75 @@ def _set_cursor(wallet: str, ms: int) -> None:
             """,
             (f"dx_cursor:{wallet}", str(ms)),
         )
+
+
+# Latencia simulada entre detectar fill del trader y que nuestro tx
+# llegue a mempool. Permite que el orderbook se mueva entre la decisión
+# y nuestro fill — production parity con dYdX v4 (block time ~1s, finality ~2s).
+DX_BROADCAST_LATENCY_S = 2.0
+# No simular latencia en fills "viejos" (catchup post-restart): no hay
+# manera de sample el orderbook de hace N minutos. Si el fill es más
+# viejo que esto, fallback a slippage simple.
+DX_REALTIME_THRESHOLD_S = 30.0
+
+
+async def _realistic_fill_price(
+    client: DydxClient, ticker: str, size_usdc: float, is_buy: int, fill_ts_ms: int
+) -> float | None:
+    """Walks orderbook levels para `size_usdc` y devuelve VWAP realista.
+
+    Buy walks asks (top→down), sell walks bids (top→down).
+    Antes del fetch, simula `DX_BROADCAST_LATENCY_S` segundos para que el
+    libro se mueva como en producción.
+
+    Si el fill es viejo (>DX_REALTIME_THRESHOLD_S desde now), retorna None
+    (caller usa slippage simple — no podemos retro-fechar el orderbook).
+    """
+    if not DX_USE_ORDERBOOK_FILL:
+        return None
+    age_s = time.time() - (fill_ts_ms / 1000.0)
+    if age_s > DX_REALTIME_THRESHOLD_S:
+        return None
+    # Latencia broadcast — el libro se mueve durante estos 2s
+    await asyncio.sleep(DX_BROADCAST_LATENCY_S)
+    try:
+        ob = await client.orderbook(ticker)
+    except Exception as e:
+        log.debug("DX orderbook walk fetch %s err: %s", ticker, e)
+        return None
+    if not isinstance(ob, dict):
+        return None
+    levels = ob.get("asks", []) if is_buy else ob.get("bids", [])
+    if not levels:
+        return None
+    remaining = float(size_usdc)
+    total_qty = 0.0
+    weighted_sum = 0.0
+    for lv in levels:
+        try:
+            px = float(lv["price"])
+            qty = float(lv["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if px <= 0 or qty <= 0:
+            continue
+        level_value = px * qty
+        if remaining <= level_value:
+            qty_taken = remaining / px
+            weighted_sum += px * qty_taken
+            total_qty += qty_taken
+            remaining = 0.0
+            break
+        weighted_sum += px * qty
+        total_qty += qty
+        remaining -= level_value
+    if total_qty <= 0:
+        return None
+    vwap = weighted_sum / total_qty
+    if remaining > 0:
+        # No alcanzó liquidez — log debug pero devolvemos VWAP igual
+        log.debug("DX ob walk %s incompleto: faltó $%.2f de $%.2f", ticker, remaining, size_usdc)
+    return vwap
 
 
 def _has_open(source_wallet: str, ticker: str) -> int | None:
@@ -137,11 +208,18 @@ async def _process_wallet(client: DydxClient, wallet: str) -> tuple[int, int]:
         fill_id = f"{wallet}:{ticker}:{ts_ms}:{eid}"
 
         try:
+            # Production parity: walk orderbook real para el size que vamos
+            # a tomar y simular 2s de broadcast latency. Solo aplica para
+            # fills "frescos" (<30s); fills viejos caen a slippage simple.
+            realistic_px = await _realistic_fill_price(
+                client, ticker, DX_BASE_USDC, is_buy, ts_ms
+            )
             if action == "open":
                 tid_, reason = dx_executor.open_position(
                     source_wallet=wallet, source_fill_id=fill_id,
                     ticker=ticker, is_buy=is_buy, source_price=price,
                     leverage=1.0, timestamp=ts_sec, raw=f,
+                    realistic_entry_price=realistic_px,
                 )
                 if tid_:
                     actions += 1
@@ -149,6 +227,7 @@ async def _process_wallet(client: DydxClient, wallet: str) -> tuple[int, int]:
                 pid = dx_executor.close_position(
                     source_wallet=wallet, ticker=ticker, is_buy=is_buy,
                     source_price=price, timestamp=ts_sec,
+                    realistic_exit_price=realistic_px,
                 )
                 if pid:
                     actions += 1
@@ -236,6 +315,10 @@ async def dx_run_loop() -> None:
     log.info("DX runner: arrancando (sleep=%ds, sweep=%ds)", DX_SLEEP_SECONDS, DX_SWEEP_SECONDS)
     cycle = 0
     last_sweep = 0.0
+
+    # Funding accrual hourly task — production parity (perps cobran funding)
+    from src.copybot.dx_funding import dx_funding_loop
+    funding_task = asyncio.create_task(dx_funding_loop(), name="dx_funding_loop")
 
     async with DydxClient() as client:
         while True:

@@ -28,10 +28,67 @@ from src.config import (
     HL_TRAIL_DROP_PCT,
     HL_LIQUIDATION_BUFFER,
     HL_SWEEP_SECONDS,
+    HL_BASE_USDC,
+    HL_USE_ORDERBOOK_FILL,
 )
 from src.copybot import hl_executor
 from src.db.schema import db, tx
 from src.hyperliquid.client import HyperliquidClient
+
+# Production parity (HL): mismos thresholds que DX
+HL_BROADCAST_LATENCY_S = 2.0
+HL_REALTIME_THRESHOLD_S = 30.0
+
+
+async def _realistic_fill_price(
+    client: HyperliquidClient, coin: str, size_usdc: float, is_buy: int, fill_ts_ms: int
+) -> float | None:
+    """Walk L2 book para `size_usdc` tras simular latencia broadcast.
+    Buy walks asks, sell walks bids. Fills viejos (>30s) → None (caller usa slippage)."""
+    if not HL_USE_ORDERBOOK_FILL:
+        return None
+    age_s = time.time() - (fill_ts_ms / 1000.0)
+    if age_s > HL_REALTIME_THRESHOLD_S:
+        return None
+    await asyncio.sleep(HL_BROADCAST_LATENCY_S)
+    try:
+        book = await client.l2_book(coin)
+    except Exception as e:
+        log.debug("HL l2_book %s err: %s", coin, e)
+        return None
+    if not isinstance(book, dict):
+        return None
+    levels = book.get("levels") or []
+    if not isinstance(levels, list) or len(levels) < 2:
+        return None
+    # levels[0] = bids, levels[1] = asks
+    side_levels = levels[1] if is_buy else levels[0]
+    if not side_levels:
+        return None
+    remaining = float(size_usdc)
+    total_qty = 0.0
+    weighted_sum = 0.0
+    for lv in side_levels:
+        try:
+            px = float(lv["px"])
+            qty = float(lv["sz"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if px <= 0 or qty <= 0:
+            continue
+        level_value = px * qty
+        if remaining <= level_value:
+            qty_taken = remaining / px
+            weighted_sum += px * qty_taken
+            total_qty += qty_taken
+            remaining = 0.0
+            break
+        weighted_sum += px * qty
+        total_qty += qty
+        remaining -= level_value
+    if total_qty <= 0:
+        return None
+    return weighted_sum / total_qty
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -146,11 +203,17 @@ async def _process_wallet(client: HyperliquidClient, wallet: str) -> tuple[int, 
         leverage = _extract_leverage(f)
 
         try:
+            # Production parity: walk L2 book + 2s latency. Fills viejos
+            # caen a slippage simple.
+            realistic_px = await _realistic_fill_price(
+                client, coin, HL_BASE_USDC, is_buy, ts_ms
+            )
             if action == "open":
                 tid_, reason = hl_executor.open_position(
                     source_wallet=wallet, source_fill_id=fill_id,
                     coin=coin, is_buy=is_buy, source_price=price,
                     leverage=leverage, timestamp=ts_sec, raw=f,
+                    realistic_entry_price=realistic_px,
                 )
                 if tid_:
                     actions += 1
@@ -158,6 +221,7 @@ async def _process_wallet(client: HyperliquidClient, wallet: str) -> tuple[int, 
                 pid = hl_executor.close_position(
                     source_wallet=wallet, coin=coin, is_buy=is_buy,
                     source_price=price, timestamp=ts_sec,
+                    realistic_exit_price=realistic_px,
                 )
                 if pid:
                     actions += 1
@@ -247,6 +311,13 @@ async def _sweep_open_positions(client: HyperliquidClient) -> None:
 
 
 async def hl_run_loop() -> None:
+    # Funding accrual hourly task — production parity con perps reales
+    from src.copybot.hl_funding import hl_funding_loop
+    funding_task = asyncio.create_task(hl_funding_loop(), name="hl_funding_loop")
+    return await _hl_run_loop_impl()
+
+
+async def _hl_run_loop_impl() -> None:
     """Loop principal del bot HL. Async task que corre en paralelo al PM bot."""
     log.info("HL runner: arrancando (sleep=%ds, sweep=%ds)", HL_SLEEP_SECONDS, HL_SWEEP_SECONDS)
     cycle = 0

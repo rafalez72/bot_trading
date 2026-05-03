@@ -20,6 +20,7 @@ from src.config import (
     HL_BASE_USDC,
     HL_CAPITAL_USDC,
     HL_DRY_SLIPPAGE_PCT,
+    HL_GAS_PER_FILL_USDC,
     HL_MAX_LEVERAGE,
     HL_MAX_PER_WALLET_USDC,
     HL_MIN_EXPECTED_PNL_USDC,
@@ -184,10 +185,12 @@ def _open_position_validate_hl(conn, *, source_wallet, source_fill_id, coin, is_
 
 
 def open_position(*, source_wallet, source_fill_id, coin, is_buy, source_price,
-                  leverage=1.0, timestamp, raw=None) -> tuple[int | None, str | None]:
+                  leverage=1.0, timestamp, raw=None,
+                  realistic_entry_price=None) -> tuple[int | None, str | None]:
     """Abre una posición SIMULADA en hl_trades.
 
-    Retorna (trade_id, reject_reason). Si reject_reason es None, trade_id es válido.
+    `realistic_entry_price`: opcional, viene del runner (ob walk + 2s lat).
+    Production parity: graba gas_paid del fill al abrir.
     """
     is_buy_int = 1 if is_buy else 0
     with tx() as conn:
@@ -204,8 +207,11 @@ def open_position(*, source_wallet, source_fill_id, coin, is_buy, source_price,
         if reject:
             return None, reject
 
-        # Aplicar slippage al entry
-        actual_entry = _apply_dry_slippage(is_buy_int, source_price)
+        # Precio realista del runner (ob walk) o fallback a slippage simple
+        if realistic_entry_price is not None and realistic_entry_price > 0:
+            actual_entry = float(realistic_entry_price)
+        else:
+            actual_entry = _apply_dry_slippage(is_buy_int, source_price)
         liq_px = _liquidation_price(actual_entry, is_buy_int, leverage)
 
         cur = conn.execute(
@@ -213,12 +219,12 @@ def open_position(*, source_wallet, source_fill_id, coin, is_buy, source_price,
             INSERT INTO hl_trades
                 (source_wallet, source_fill_id, coin, is_buy, leverage,
                  entry_at, entry_price, peak_price, entry_size_usdc,
-                 liquidation_price, status, dry_run)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,1)
+                 liquidation_price, status, dry_run, gas_paid)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)
             """,
             (source_wallet, source_fill_id, coin, is_buy_int, leverage,
              timestamp, actual_entry, actual_entry, size_usdc,
-             liq_px, "open"),
+             liq_px, "open", HL_GAS_PER_FILL_USDC),
         )
         trade_id = cur.lastrowid
 
@@ -229,14 +235,15 @@ def open_position(*, source_wallet, source_fill_id, coin, is_buy, source_price,
     return trade_id, None
 
 
-def close_position(*, source_wallet, coin, is_buy, source_price, timestamp) -> int | None:
-    """Cierra el trade open matching cuando el wallet origen cierra."""
+def close_position(*, source_wallet, coin, is_buy, source_price, timestamp,
+                   realistic_exit_price=None) -> int | None:
+    """Cierra el trade open matching. Production parity:
+       - exit gas: HL_GAS_PER_FILL_USDC (otro fill = otro gas)
+       - PnL net descuenta gas total + funding acumulado
+       - realistic_exit_price (opcional) viene del runner via ob walk
+    """
     is_buy_int = 1 if is_buy else 0
     with tx() as conn:
-        # Buscar trade open del mismo wallet+coin con MISMO is_buy (long-close cierra long, etc.)
-        # En HL: 'Close Long' implica que abrió LONG → buscamos is_buy=1
-        # Si dir='Close Long', el is_buy del CLOSE es 0 (vende), pero matchea trades is_buy=1
-        # Lo gestionamos en el classifier del runner.
         row = conn.execute(
             "SELECT * FROM hl_trades WHERE source_wallet=? AND coin=? AND is_buy=? AND status='open' "
             "ORDER BY entry_at LIMIT 1",
@@ -245,15 +252,21 @@ def close_position(*, source_wallet, coin, is_buy, source_price, timestamp) -> i
         if not row:
             return None
 
-        actual_exit = _apply_dry_slippage(0 if is_buy_int else 1, source_price)
-        pnl = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
+        if realistic_exit_price is not None and realistic_exit_price > 0:
+            actual_exit = float(realistic_exit_price)
+        else:
+            actual_exit = _apply_dry_slippage(0 if is_buy_int else 1, source_price)
+        pnl_gross = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
                        row["entry_size_usdc"], row["leverage"])
+        total_gas = (row["gas_paid"] or 0) + HL_GAS_PER_FILL_USDC
+        funding = row["funding_paid"] or 0
+        pnl = pnl_gross - total_gas - funding
         new_status = "closed_win" if pnl > 0 else "closed_loss"
         conn.execute(
             "UPDATE hl_trades SET exit_at=?, exit_price=?, exit_size_usdc=?, "
-            "pnl_usdc=?, status=?, exit_reason=? WHERE id=?",
+            "pnl_usdc=?, status=?, exit_reason=?, gas_paid=? WHERE id=?",
             (timestamp, actual_exit, row["entry_size_usdc"], pnl, new_status,
-             "source_close", row["id"]),
+             "source_close", total_gas, row["id"]),
         )
 
     log.info("HL CLOSE #%d %s pnl=$%.2f", row["id"], new_status, pnl)
@@ -272,21 +285,25 @@ def close_position(*, source_wallet, coin, is_buy, source_price, timestamp) -> i
 
 
 def force_close(hl_trade_id: int, exit_price: float, *, reason: str) -> None:
-    """SL/TP/trailing/liquidation force close."""
+    """SL/TP/trailing/liquidation force close. Production parity: descuenta
+    gas total + funding acumulado al PnL net."""
     with tx() as conn:
         row = conn.execute("SELECT * FROM hl_trades WHERE id=? AND status='open'", (hl_trade_id,)).fetchone()
         if not row:
             return
         is_buy_int = row["is_buy"]
         actual_exit = _apply_dry_slippage(0 if is_buy_int else 1, exit_price)
-        pnl = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
+        pnl_gross = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
                        row["entry_size_usdc"], row["leverage"])
+        total_gas = (row["gas_paid"] or 0) + HL_GAS_PER_FILL_USDC
+        funding = row["funding_paid"] or 0
+        pnl = pnl_gross - total_gas - funding
         new_status = "closed_win" if pnl > 0 else "closed_loss"
         conn.execute(
             "UPDATE hl_trades SET exit_at=?, exit_price=?, exit_size_usdc=?, "
-            "pnl_usdc=?, status=?, exit_reason=? WHERE id=?",
+            "pnl_usdc=?, status=?, exit_reason=?, gas_paid=? WHERE id=?",
             (int(time.time()), actual_exit, row["entry_size_usdc"], pnl,
-             new_status, reason, hl_trade_id),
+             new_status, reason, total_gas, hl_trade_id),
         )
 
     log.info("HL FORCE_CLOSE #%d %s pnl=$%.2f reason=%s", hl_trade_id, new_status, pnl, reason)

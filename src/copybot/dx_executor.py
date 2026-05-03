@@ -23,6 +23,7 @@ from src.config import (
     DX_BASE_USDC,
     DX_CAPITAL_USDC,
     DX_DRY_SLIPPAGE_PCT,
+    DX_GAS_PER_FILL_USDC,
     DX_MAX_LEVERAGE,
     DX_MAX_PER_WALLET_USDC,
     DX_MIN_EXPECTED_PNL_USDC,
@@ -168,7 +169,17 @@ def _open_position_validate_dx(conn, *, source_wallet, source_fill_id, ticker, i
 
 
 def open_position(*, source_wallet, source_fill_id, ticker, is_buy, source_price,
-                  leverage=1.0, timestamp, raw=None) -> tuple[int | None, str | None]:
+                  leverage=1.0, timestamp, raw=None,
+                  realistic_entry_price=None) -> tuple[int | None, str | None]:
+    """Abre una posición simulada.
+
+    `realistic_entry_price` (opcional): precio computado por el runner usando
+    el orderbook real (walks levels para nuestro size + simula 2s de latencia
+    de broadcast). Si no se pasa, fallback a `source_price` × slippage.
+
+    Production parity: descontamos gas inmediatamente en `gas_paid` (real
+    pagamos gas en cada fill, no solo al cerrar).
+    """
     is_buy_int = 1 if is_buy else 0
     with tx() as conn:
         size_usdc, reject = _open_position_validate_dx(
@@ -179,7 +190,11 @@ def open_position(*, source_wallet, source_fill_id, ticker, is_buy, source_price
         if reject:
             return None, reject
 
-        actual_entry = _apply_dry_slippage(is_buy_int, source_price)
+        # Precio realista del runner (ob walk) o fallback a slippage simple
+        if realistic_entry_price is not None and realistic_entry_price > 0:
+            actual_entry = float(realistic_entry_price)
+        else:
+            actual_entry = _apply_dry_slippage(is_buy_int, source_price)
         liq_px = _liquidation_price(actual_entry, is_buy_int, leverage)
 
         cur = conn.execute(
@@ -187,31 +202,30 @@ def open_position(*, source_wallet, source_fill_id, ticker, is_buy, source_price
             INSERT INTO dx_trades
                 (source_wallet, source_fill_id, ticker, is_buy, leverage,
                  entry_at, entry_price, peak_price, entry_size_usdc,
-                 liquidation_price, status, dry_run)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,1)
+                 liquidation_price, status, dry_run, gas_paid, funding_paid)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,0)
             """,
             (source_wallet, source_fill_id, ticker, is_buy_int, leverage,
              timestamp, actual_entry, actual_entry, size_usdc,
-             liq_px, "open"),
+             liq_px, "open", DX_GAS_PER_FILL_USDC),
         )
         trade_id = cur.lastrowid
 
-    log.info("DX OPEN #%d %s %s %s @ %.4f size=$%.2f lev=%.1f",
+    log.info("DX OPEN #%d %s %s %s @ %.4f size=$%.2f lev=%.1f gas=$%.3f",
              trade_id, source_wallet[:14], ticker,
-             "LONG" if is_buy_int else "SHORT", actual_entry, size_usdc, leverage)
+             "LONG" if is_buy_int else "SHORT", actual_entry, size_usdc, leverage,
+             DX_GAS_PER_FILL_USDC)
     return trade_id, None
 
 
-def close_position(*, source_wallet, ticker, is_buy, source_price, timestamp) -> int | None:
-    """Cierra trade open matching cuando wallet original cierra.
-
-    En dYdX el fill direction (buy/sell) es la del wallet, no nuestra. Si
-    abrió LONG (is_buy=1), después cierra con is_buy=0. Para matchear el
-    trade open con is_buy_int correcto, invertimos: si recibimos is_buy=0
-    (sell), buscamos open con is_buy=1 (long).
+def close_position(*, source_wallet, ticker, is_buy, source_price, timestamp,
+                   realistic_exit_price=None) -> int | None:
+    """Cierra trade open matching. Production parity:
+      - exit gas: $0.02 (otro fill = otro gas)
+      - PnL net descuenta gas total (entry + exit) y funding acumulado
+      - Si runner provee realistic_exit_price (ob walk), se usa ese
     """
     is_buy_int = 1 if is_buy else 0
-    # Match trade abierto que tenga is_buy OPUESTO al fill que cierra
     matching_is_buy = 1 - is_buy_int
     with tx() as conn:
         row = conn.execute(
@@ -222,16 +236,22 @@ def close_position(*, source_wallet, ticker, is_buy, source_price, timestamp) ->
         if not row:
             return None
 
-        # Slippage en la salida (lado opuesto al original)
-        actual_exit = _apply_dry_slippage(is_buy_int, source_price)
-        pnl = _calc_pnl(row["entry_price"], actual_exit, matching_is_buy,
+        if realistic_exit_price is not None and realistic_exit_price > 0:
+            actual_exit = float(realistic_exit_price)
+        else:
+            actual_exit = _apply_dry_slippage(is_buy_int, source_price)
+        pnl_gross = _calc_pnl(row["entry_price"], actual_exit, matching_is_buy,
                        row["entry_size_usdc"], row["leverage"])
+        # Descontar costos friccionales: gas (entry + exit) + funding acumulado
+        total_gas = (row["gas_paid"] or 0) + DX_GAS_PER_FILL_USDC
+        funding = row["funding_paid"] or 0
+        pnl = pnl_gross - total_gas - funding
         new_status = "closed_win" if pnl > 0 else "closed_loss"
         conn.execute(
             "UPDATE dx_trades SET exit_at=?, exit_price=?, exit_size_usdc=?, "
-            "pnl_usdc=?, status=?, exit_reason=? WHERE id=?",
+            "pnl_usdc=?, status=?, exit_reason=?, gas_paid=? WHERE id=?",
             (timestamp, actual_exit, row["entry_size_usdc"], pnl, new_status,
-             "source_close", row["id"]),
+             "source_close", total_gas, row["id"]),
         )
 
     log.info("DX CLOSE #%d %s pnl=$%.2f", row["id"], new_status, pnl)
@@ -249,21 +269,24 @@ def close_position(*, source_wallet, ticker, is_buy, source_price, timestamp) ->
 
 
 def force_close(dx_trade_id: int, exit_price: float, *, reason: str) -> None:
+    """Production parity: descuenta gas + funding al PnL net."""
     with tx() as conn:
         row = conn.execute("SELECT * FROM dx_trades WHERE id=? AND status='open'", (dx_trade_id,)).fetchone()
         if not row:
             return
         is_buy_int = row["is_buy"]
-        # Salida = side opuesto al entry
         actual_exit = _apply_dry_slippage(0 if is_buy_int else 1, exit_price)
-        pnl = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
+        pnl_gross = _calc_pnl(row["entry_price"], actual_exit, is_buy_int,
                        row["entry_size_usdc"], row["leverage"])
+        total_gas = (row["gas_paid"] or 0) + DX_GAS_PER_FILL_USDC
+        funding = row["funding_paid"] or 0
+        pnl = pnl_gross - total_gas - funding
         new_status = "closed_win" if pnl > 0 else "closed_loss"
         conn.execute(
             "UPDATE dx_trades SET exit_at=?, exit_price=?, exit_size_usdc=?, "
-            "pnl_usdc=?, status=?, exit_reason=? WHERE id=?",
+            "pnl_usdc=?, status=?, exit_reason=?, gas_paid=? WHERE id=?",
             (int(time.time()), actual_exit, row["entry_size_usdc"], pnl,
-             new_status, reason, dx_trade_id),
+             new_status, reason, total_gas, dx_trade_id),
         )
 
     log.info("DX FORCE_CLOSE #%d %s pnl=$%.2f reason=%s",
