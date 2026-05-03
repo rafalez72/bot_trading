@@ -51,6 +51,25 @@ Bot que **copia trades** de los mejores wallets de Polymarket (prediction market
 
 ## 3. Estructura de archivos
 
+### Paths de trabajo (importante para futuras sesiones)
+
+| Máquina | Path | Notas |
+|---------|------|-------|
+| Mac (dev actual) | `/tmp/bt` | Clone temporal. **Usar este para editar** |
+| Mac (original, NO usar) | `~/Documents/dev/crondata/polymarket_copybot` | macOS TCC bloquea acceso a Claude desde aquí. Si Full Disk Access se habilita y Claude se reinicia, podríamos volver — pero `/tmp/bt` funciona y se mantiene |
+| Lenovo (prod) | `~/polymarket_copybot` (Git Bash) | Clone permanente. Cron `update_and_restart.bat` cada 5 min pullea + redeploy Docker |
+| Repo remoto | `https://github.com/rafalez72/bot_trading` | Único hub de sync Mac↔Lenovo |
+| Imagen Docker | `ghcr.io/rafalez72/bot_trading:latest` | GitHub Actions buildea + pushea |
+
+Subdirectorios clave dentro del proyecto:
+- `src/api/static/` — PWA dashboard servido en `http://100.98.174.60:8000` (index.html, app.js, sw.js, style.css)
+- `src/copybot/` — runners + executors + autoaprendizaje (PM, HL, DX)
+- `src/polymarket/` `src/hyperliquid/` `src/dydx/` — clients http async
+- `data/copybot.db` — SQLite local de cada máquina (NO sincronizar)
+- `logs/` — runtime logs (NO en repo)
+
+### Árbol del proyecto
+
 ```
 polymarket_copybot/
 ├── copybot.py                  # CLI principal (entry point)
