@@ -807,6 +807,28 @@ Ejemplos: 4 wallets HL con 2143/278/220/132 fills/24h causaron -$30 en
   - Drop manual de 3 wallets sport-only (clog del top sin actividad real
     en politics/crypto).
 
+#### Activación de la parity en lenovo (post-deploy `7a85c82`)
+Para encender las nuevas funciones agregar al `.env` de lenovo:
+```env
+HL_USE_ORDERBOOK_FILL=true
+DX_USE_ORDERBOOK_FILL=true
+HL_FUNDING_UPDATE_HOURS=1
+DX_FUNDING_UPDATE_HOURS=1
+```
+Los defaults en `config.py` ya están seteados (`orderbook=true`, gas y
+funding accrual on), así que si NO editás el `.env` igual arranca con
+los nuevos comportamientos. Las vars del `.env` solo son necesarias si
+querés overridear (ej. apagar el ob walk durante un debugging:
+`*_USE_ORDERBOOK_FILL=false`).
+
+Verificación post-deploy:
+- `docker logs bot_trading --tail 50 | grep "DX funding\|HL funding"` —
+  debería loguear `arrancando (cada 3600s)` al startup de cada runner.
+- Tras 1h de uptime con posiciones open: el log muestra
+  `DX funding: N posiciones actualizadas` (idem HL).
+- Al cerrar un trade: `pnl_usdc` en `dx_trades`/`hl_trades` ya
+  trae descontados gas + funding.
+
 ### 2026-05-02 — Bot Hyperliquid paralelo + mejoras PM
 
 **Hito**: bot Hyperliquid corriendo **en paralelo** al PM real, en dry-run
