@@ -9,7 +9,7 @@
     <meta name="apple-mobile-web-app-title" content="Copy Bot">
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
-    <title>Polymarket Copy Bot</title>
+    <title>Copy Bot Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
     <link rel="stylesheet" href="/static/style.css">
@@ -17,13 +17,10 @@
 <body class="bg-slate-950 text-slate-100 min-h-screen">
     <div x-data="dashboard()" x-init="init()" class="px-3 py-2 max-w-md mx-auto">
 
-        <!-- Header compacto -->
         <header class="flex items-center justify-between mb-2">
             <div class="flex items-center gap-2">
                 <h1 class="text-sm font-bold">Copy Bot</h1>
-                <span class="text-[10px] px-1.5 py-0.5 rounded border"
-                      :class="modeLabel.cls"
-                      x-text="modeLabel.txt"></span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded border" :class="tabData.badge.cls" x-text="tabData.badge.txt"></span>
             </div>
             <div class="flex items-center gap-2">
                 <span class="text-[10px] text-slate-500">
@@ -37,9 +34,13 @@
             </div>
         </header>
 
-        <!-- Kill switch banner (solo si activo) -->
-        <div x-show="killActive"
-             class="bg-rose-950/60 border border-rose-800 rounded-lg px-3 py-2 mb-2 flex items-center gap-2">
+        <div class="grid grid-cols-3 gap-1 mb-2 bg-slate-900 border border-slate-800 rounded-lg p-1">
+            <button @click="tab='pm'" :class="tab==='pm' ? 'bg-emerald-900/60 text-emerald-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">Poly</button>
+            <button @click="tab='hl'" :class="tab==='hl' ? 'bg-blue-900/60 text-blue-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">Hyperliquid</button>
+            <button @click="tab='dx'" :class="tab==='dx' ? 'bg-purple-900/60 text-purple-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">dYdX</button>
+        </div>
+
+        <div x-show="tab==='pm' && killActive" class="bg-rose-950/60 border border-rose-800 rounded-lg px-3 py-2 mb-2 flex items-center gap-2">
             <span class="text-base">⛔</span>
             <div class="flex-1 min-w-0">
                 <p class="text-xs font-semibold text-rose-300">Kill switch activo</p>
@@ -47,114 +48,91 @@
             </div>
         </div>
 
-        <!-- PnL grande -->
         <div class="grid grid-cols-2 gap-2 mb-2">
             <div class="bg-slate-900 border border-slate-800 rounded-lg p-2.5">
                 <p class="text-[10px] text-slate-400 uppercase tracking-wider">PnL 24h</p>
-                <p class="text-2xl font-bold leading-tight"
-                   :class="pnl24h >= 0 ? 'text-emerald-400' : 'text-rose-400'"
-                   x-text="fmtUsdSigned(pnl24h)"></p>
-                <p class="text-[10px] text-slate-500 mt-0.5">
-                    <span x-text="liveSummary?.today?.wins ?? 0"></span>W /
-                    <span x-text="liveSummary?.today?.losses ?? 0"></span>L
-                </p>
+                <p class="text-2xl font-bold leading-tight" :class="tabData.pnl24h >= 0 ? 'text-emerald-400' : 'text-rose-400'" x-text="fmtUsdSigned(tabData.pnl24h)"></p>
+                <p class="text-[10px] text-slate-500 mt-0.5"><span x-text="tabData.wins24h"></span>W / <span x-text="tabData.losses24h"></span>L</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-lg p-2.5">
                 <p class="text-[10px] text-slate-400 uppercase tracking-wider">PnL total</p>
-                <p class="text-2xl font-bold leading-tight"
-                   :class="pnlTotal >= 0 ? 'text-emerald-400' : 'text-rose-400'"
-                   x-text="fmtUsdSigned(pnlTotal)"></p>
-                <p class="text-[10px] text-slate-500 mt-0.5">
-                    ROI <span x-text="(liveSummary?.totals?.roi_pct ?? 0).toFixed(1) + '%'"></span>
-                </p>
+                <p class="text-2xl font-bold leading-tight" :class="tabData.pnlTotal >= 0 ? 'text-emerald-400' : 'text-rose-400'" x-text="fmtUsdSigned(tabData.pnlTotal)"></p>
+                <p class="text-[10px] text-slate-500 mt-0.5">ROI <span x-text="tabData.roi"></span></p>
             </div>
         </div>
 
-        <!-- Stats row -->
         <div class="grid grid-cols-4 gap-1.5 mb-2 text-center">
             <div class="bg-slate-900 border border-slate-800 rounded-lg py-1.5">
                 <p class="text-[9px] text-slate-500 uppercase">WR</p>
-                <p class="text-sm font-bold text-indigo-300" x-text="fmtPct(winRate)"></p>
+                <p class="text-sm font-bold text-indigo-300" x-text="fmtPct(tabData.wr)"></p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-lg py-1.5">
                 <p class="text-[9px] text-slate-500 uppercase">Abiertas</p>
-                <p class="text-sm font-bold text-amber-300" x-text="openCount"></p>
+                <p class="text-sm font-bold text-amber-300" x-text="tabData.openCount"></p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-lg py-1.5">
                 <p class="text-[9px] text-slate-500 uppercase">Wallets</p>
-                <p class="text-sm font-bold text-emerald-300" x-text="walletsActive"></p>
+                <p class="text-sm font-bold text-emerald-300" x-text="tabData.walletsActive"></p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-lg py-1.5">
                 <p class="text-[9px] text-slate-500 uppercase">Drop</p>
-                <p class="text-sm font-bold text-rose-300" x-text="walletsDropped"></p>
+                <p class="text-sm font-bold text-rose-300" x-text="tabData.walletsDropped"></p>
             </div>
         </div>
 
-        <!-- Posiciones abiertas -->
-        <div class="mb-2" x-show="openCount > 0">
+        <div class="mb-2" x-show="tabData.openCount > 0">
             <p class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Abiertas</p>
             <div class="space-y-1">
-                <template x-for="t in liveTrades.filter(x => x.status === 'open').slice(0, 3)" :key="t.id">
+                <template x-for="t in tabData.trades.filter(x => x.status === 'open').slice(0, 3)" :key="t.id">
                     <div class="bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5 flex items-center justify-between text-xs">
                         <div class="flex-1 min-w-0">
                             <span class="text-slate-300 font-mono" x-text="shortWallet(t.source_wallet)"></span>
+                            <span class="text-slate-400 ml-1" x-text="(t[tabData.tradeKey] || '').toString().slice(0,12)"></span>
                             <span class="text-slate-500 ml-1.5" x-text="'$' + (t.entry_size_usdc ?? 0).toFixed(2)"></span>
-                            <span class="text-slate-500 ml-1.5" x-text="'@' + (t.entry_price ?? 0).toFixed(3)"></span>
                         </div>
-                        <span class="text-[10px] text-slate-500" x-show="t.peak_price"
-                              x-text="'peak ' + (t.peak_price ?? 0).toFixed(3)"></span>
                     </div>
                 </template>
             </div>
         </div>
 
-        <!-- Últimos trades cerrados -->
         <div class="mb-2">
             <p class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Últimos cierres</p>
             <div class="space-y-0.5">
-                <template x-for="t in liveTrades.filter(x => x.status !== 'open').slice(0, 6)" :key="t.id">
+                <template x-for="t in tabData.trades.filter(x => x.status !== 'open').slice(0, 6)" :key="t.id">
                     <div class="bg-slate-900/60 border border-slate-800/60 rounded px-2 py-1 flex items-center justify-between text-xs">
                         <div class="flex items-center gap-1.5 flex-1 min-w-0">
                             <span x-text="(t.pnl_usdc ?? 0) >= 0 ? '🟢' : '🔴'"></span>
-                            <span class="font-bold tabular-nums"
-                                  :class="(t.pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
-                                  x-text="fmtUsdSigned(t.pnl_usdc)"></span>
+                            <span class="font-bold tabular-nums" :class="(t.pnl_usdc ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'" x-text="fmtUsdSigned(t.pnl_usdc)"></span>
+                            <span class="text-slate-400 text-[10px]" x-text="(t[tabData.tradeKey] || '').toString().slice(0,10)"></span>
                             <span class="text-slate-500 font-mono text-[10px]" x-text="shortWallet(t.source_wallet)"></span>
                         </div>
                         <span class="text-[10px] text-slate-600" x-text="hhmm(t.exit_at)"></span>
                     </div>
                 </template>
-                <p x-show="liveTrades.filter(x => x.status !== 'open').length === 0"
-                   class="text-[10px] text-slate-600 text-center py-2">sin cierres aún</p>
+                <p x-show="tabData.trades.filter(x => x.status !== 'open').length === 0" class="text-[10px] text-slate-600 text-center py-2">sin cierres aún</p>
             </div>
         </div>
 
-        <!-- Top performers -->
-        <div class="mb-2" x-show="liveSummary?.top_wallets?.length > 0">
+        <div class="mb-2" x-show="tabData.topWallets.length > 0">
             <p class="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Top wallets</p>
             <div class="space-y-0.5">
-                <template x-for="w in (liveSummary?.top_wallets || []).slice(0, 4)" :key="w.wallet">
+                <template x-for="w in tabData.topWallets.slice(0, 4)" :key="w.wallet">
                     <div class="bg-slate-900/60 border border-slate-800/60 rounded px-2 py-1 flex items-center justify-between text-xs">
                         <div class="flex items-center gap-2">
-                            <span class="text-slate-400 font-mono text-[10px]" x-text="w.wallet.slice(0,10)+'…'"></span>
-                            <span class="text-slate-500 text-[10px]">
-                                <span x-text="w.wins"></span>W/<span x-text="w.losses"></span>L
-                            </span>
+                            <span class="text-slate-400 font-mono text-[10px]" x-text="(w.wallet || '').slice(0,12) + '…'"></span>
+                            <span class="text-slate-500 text-[10px]"><span x-text="w.wins"></span>W/<span x-text="w.losses"></span>L</span>
                         </div>
-                        <span class="font-bold tabular-nums"
-                              :class="(w.pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
-                              x-text="fmtUsdSigned(w.pnl)"></span>
+                        <span class="font-bold tabular-nums" :class="(w.pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'" x-text="fmtUsdSigned(w.pnl)"></span>
                     </div>
                 </template>
             </div>
         </div>
 
-        <!-- Footer mini -->
         <div class="text-[10px] text-slate-600 text-center mt-2">
-            <span x-show="liveSummary?.config">
-                base $<span x-text="liveSummary?.config?.base_usdc"></span>
-                · cap $<span x-text="liveSummary?.config?.capital_usdc"></span>
-                · wallet $<span x-text="liveSummary?.config?.max_per_wallet_usdc"></span>
+            <span x-show="tabData.config">
+                base $<span x-text="tabData.config?.base_usdc"></span>
+                · cap $<span x-text="tabData.config?.capital_usdc"></span>
+                · wallet $<span x-text="tabData.config?.max_per_wallet_usdc"></span>
             </span>
         </div>
     </div>

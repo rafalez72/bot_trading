@@ -45,6 +45,7 @@ ENABLED_NOTIFICATIONS = {
     "log_error", "startup",
     "outage",  # alertas de servicio caído (Polymarket / Vercel proxy)
     "hl_close",  # cierres del bot HL paralelo (dry-run)
+    "dx_close",  # cierres del bot dYdX v4 paralelo (dry-run)
 }
 
 
@@ -249,6 +250,7 @@ def recovery_alert(service: str, target: str) -> None:
 # ---------- Hyperliquid (paralelo, dry-run) ----------
 
 HL_NOTIF_MIN_PNL = 0.30  # Threshold: solo notificar cierres con |PnL| >= $0.30
+DX_NOTIF_MIN_PNL = 0.30  # Idem para dYdX
 
 
 def hl_close(*, source_wallet: str, coin: str, is_buy: int,
@@ -273,6 +275,28 @@ def hl_close(*, source_wallet: str, coin: str, is_buy: int,
         txt = (
             f"🔴 *[HL] PERDIDO* ${abs(pnl_usdc):.2f} ({coin} {direction})\n"
             f"PnL acumulado HL: ${accumulated:+.2f}"
+        )
+    txt += "\n🧪 _dry-run_"
+    send(txt)
+
+
+def dx_close(*, source_wallet: str, ticker: str, is_buy: int,
+             pnl_usdc: float, accumulated: float, exit_reason: str) -> None:
+    """Notif al cerrar una posición dYdX dry-run. Prefix [DX]."""
+    if "dx_close" not in ENABLED_NOTIFICATIONS:
+        return
+    if abs(pnl_usdc) < DX_NOTIF_MIN_PNL:
+        return
+    direction = "LONG" if is_buy else "SHORT"
+    if pnl_usdc >= 0:
+        txt = (
+            f"🟢 *[DX] GANADO* ${pnl_usdc:.2f} ({ticker} {direction})\n"
+            f"PnL acumulado DX: ${accumulated:+.2f}"
+        )
+    else:
+        txt = (
+            f"🔴 *[DX] PERDIDO* ${abs(pnl_usdc):.2f} ({ticker} {direction})\n"
+            f"PnL acumulado DX: ${accumulated:+.2f}"
         )
     txt += "\n🧪 _dry-run_"
     send(txt)

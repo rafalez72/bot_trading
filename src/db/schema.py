@@ -324,6 +324,49 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_shadow_wallet ON shadow_trades(wallet, timestamp DESC)",
     "CREATE INDEX IF NOT EXISTS idx_shadow_observed ON shadow_trades(observed_at DESC)",
+    # ── dYdX v4 (3er bot — perps en Cosmos chain, dry-run paralelo)
+    """CREATE TABLE IF NOT EXISTS dx_trades (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_wallet   TEXT NOT NULL,
+        source_fill_id  TEXT UNIQUE,
+        ticker          TEXT NOT NULL,
+        is_buy          INTEGER NOT NULL,
+        leverage        REAL DEFAULT 1.0,
+        entry_at        INTEGER NOT NULL,
+        exit_at         INTEGER,
+        entry_price     REAL NOT NULL,
+        exit_price      REAL,
+        peak_price      REAL,
+        entry_size_usdc REAL NOT NULL,
+        exit_size_usdc  REAL,
+        pnl_usdc        REAL,
+        liquidation_price REAL,
+        status          TEXT NOT NULL,
+        exit_reason     TEXT,
+        dry_run         INTEGER DEFAULT 1,
+        created_at      TEXT DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_dx_trades_wallet ON dx_trades(source_wallet, entry_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_dx_trades_status ON dx_trades(status)",
+    """CREATE TABLE IF NOT EXISTS dx_subscriptions (
+        wallet      TEXT PRIMARY KEY,
+        status      TEXT NOT NULL DEFAULT 'active',
+        sizing_mult REAL DEFAULT 1.0,
+        started_at  TEXT DEFAULT (datetime('now')),
+        stopped_at  TEXT,
+        notes       TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS dx_rejects (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        at            INTEGER NOT NULL,
+        source_wallet TEXT,
+        ticker        TEXT,
+        is_buy        INTEGER,
+        price         REAL,
+        reason        TEXT NOT NULL,
+        detail        TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_dx_rejects_at ON dx_rejects(at DESC)",
 ]
 
 

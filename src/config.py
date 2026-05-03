@@ -130,5 +130,23 @@ HL_LIQUIDATION_BUFFER = float(os.getenv("HL_LIQUIDATION_BUFFER", "1.2"))
 # pérdidas garantizadas por slippage.
 HL_MAX_FILLS_PER_WALLET_24H = int(os.getenv("HL_MAX_FILLS_PER_WALLET_24H", "30"))
 
+# ---------- dYdX v4 (3er bot — perps Cosmos chain, dry-run) ----------
+DX_MODE = os.getenv("DX_MODE", "false").lower() == "true"
+DX_CAPITAL_USDC = float(os.getenv("DX_CAPITAL_USDC", "50.0"))
+DX_BASE_USDC = float(os.getenv("DX_BASE_USDC", "5.0"))
+DX_MAX_PER_WALLET_USDC = float(os.getenv("DX_MAX_PER_WALLET_USDC", "10.0"))
+DX_MAX_LEVERAGE = float(os.getenv("DX_MAX_LEVERAGE", "5.0"))
+DX_MIN_EXPECTED_PNL_USDC = float(os.getenv("DX_MIN_EXPECTED_PNL_USDC", "0.20"))
+DX_STOP_LOSS_PCT = float(os.getenv("DX_STOP_LOSS_PCT", "0.20"))
+DX_TAKE_PROFIT_PCT = float(os.getenv("DX_TAKE_PROFIT_PCT", "0.50"))
+DX_TRAIL_ACTIVATION_PCT = float(os.getenv("DX_TRAIL_ACTIVATION_PCT", "0.30"))
+DX_TRAIL_DROP_PCT = float(os.getenv("DX_TRAIL_DROP_PCT", "0.25"))
+DX_DRY_SLIPPAGE_PCT = float(os.getenv("DX_DRY_SLIPPAGE_PCT", "0.001"))
+DX_ALLOWED_TICKERS = [t.strip().upper() for t in os.getenv("DX_ALLOWED_TICKERS", "").split(",") if t.strip()]
+DX_SLEEP_SECONDS = int(os.getenv("DX_SLEEP_SECONDS", "5"))
+DX_SWEEP_SECONDS = int(os.getenv("DX_SWEEP_SECONDS", "30"))
+DX_LIQUIDATION_BUFFER = float(os.getenv("DX_LIQUIDATION_BUFFER", "1.2"))
+DX_MAX_FILLS_PER_WALLET_24H = int(os.getenv("DX_MAX_FILLS_PER_WALLET_24H", "30"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)

@@ -295,6 +295,16 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar HL runner: %s", e)
 
+    # dYdX v4 paralelo (dry-run). Activado por DX_MODE=true.
+    dx_task: asyncio.Task | None = None
+    if os.getenv("DX_MODE", "false").lower() == "true" and not once:
+        try:
+            from src.copybot.dx_runner import dx_run_loop
+            dx_task = asyncio.create_task(dx_run_loop())
+            log.info("DX runner: arrancado en paralelo (dry-run)")
+        except Exception as e:
+            log.warning("no se pudo arrancar DX runner: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

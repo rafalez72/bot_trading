@@ -1,5 +1,5 @@
 // Service worker minimalista: cachea el shell, deja la API siempre fresca.
-const CACHE = 'copybot-v9-single-tab';
+const CACHE = 'copybot-v10-multi-tab';
 const SHELL = ['/', '/static/app.js', '/static/style.css', '/manifest.json'];
 
 self.addEventListener('install', (e) => {

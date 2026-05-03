@@ -342,6 +342,124 @@ def api_live_pnl_timeline(bucket: str = Query("hour", regex="^(hour|day)$")) -> 
     return {"bucket": bucket, "points": points}
 
 
+# ---------- Hyperliquid (HL bot dry-run) ----------
+@app.get("/api/hl/summary")
+def api_hl_summary() -> dict:
+    """Summary del bot HL (dry-run, perps Hyperliquid)."""
+    import time as _t
+    from src.config import HL_CAPITAL_USDC, HL_BASE_USDC, HL_MAX_PER_WALLET_USDC
+
+    today_ts = int(_t.time()) - 86400
+    with db() as conn:
+        wl = conn.execute(
+            "SELECT SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM hl_trades"
+        ).fetchone()
+        opens = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(entry_size_usdc),0) inv FROM hl_trades WHERE status='open'"
+        ).fetchone()
+        today = conn.execute(
+            "SELECT SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM hl_trades "
+            "WHERE exit_at >= ? AND status LIKE 'closed_%'",
+            (today_ts,),
+        ).fetchone()
+        wallets_n = conn.execute("SELECT COUNT(*) n FROM hl_subscriptions WHERE status='active'").fetchone()["n"]
+        wallets_drop = conn.execute("SELECT COUNT(*) n FROM hl_subscriptions WHERE status='dropped'").fetchone()["n"]
+        top = conn.execute(
+            "SELECT source_wallet wallet, COUNT(*) n, "
+            "SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM hl_trades "
+            "WHERE status LIKE 'closed_%' GROUP BY source_wallet ORDER BY pnl DESC LIMIT 5"
+        ).fetchall()
+    wins = (wl["wins"] or 0) if wl else 0
+    losses = (wl["losses"] or 0) if wl else 0
+    pnl = float((wl["pnl"] or 0) if wl else 0)
+    win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else 0
+    return {
+        "config": {"capital_usdc": HL_CAPITAL_USDC, "base_usdc": HL_BASE_USDC,
+                   "max_per_wallet_usdc": HL_MAX_PER_WALLET_USDC},
+        "open": {"n": opens["n"] if opens else 0, "invested_usdc": float(opens["inv"] if opens else 0)},
+        "totals": {"wins": wins, "losses": losses, "win_rate": win_rate, "pnl_usdc": pnl},
+        "today": {"wins": (today["wins"] or 0) if today else 0,
+                  "losses": (today["losses"] or 0) if today else 0,
+                  "pnl_usdc": float((today["pnl"] or 0) if today else 0)},
+        "wallets": {"active": wallets_n, "dropped": wallets_drop},
+        "top_wallets": [dict(r) for r in top],
+    }
+
+
+@app.get("/api/hl/trades")
+def api_hl_trades(limit: int = Query(20, ge=1, le=200)) -> list[dict]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM hl_trades ORDER BY entry_at DESC LIMIT ?", (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------- dYdX v4 (DX bot dry-run) ----------
+@app.get("/api/dx/summary")
+def api_dx_summary() -> dict:
+    """Summary del bot DX (dry-run, perps dYdX v4)."""
+    import time as _t
+    from src.config import DX_CAPITAL_USDC, DX_BASE_USDC, DX_MAX_PER_WALLET_USDC
+
+    today_ts = int(_t.time()) - 86400
+    with db() as conn:
+        wl = conn.execute(
+            "SELECT SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM dx_trades"
+        ).fetchone()
+        opens = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(entry_size_usdc),0) inv FROM dx_trades WHERE status='open'"
+        ).fetchone()
+        today = conn.execute(
+            "SELECT SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM dx_trades "
+            "WHERE exit_at >= ? AND status LIKE 'closed_%'",
+            (today_ts,),
+        ).fetchone()
+        wallets_n = conn.execute("SELECT COUNT(*) n FROM dx_subscriptions WHERE status='active'").fetchone()["n"]
+        wallets_drop = conn.execute("SELECT COUNT(*) n FROM dx_subscriptions WHERE status='dropped'").fetchone()["n"]
+        top = conn.execute(
+            "SELECT source_wallet wallet, COUNT(*) n, "
+            "SUM(CASE WHEN status='closed_win' THEN 1 ELSE 0 END) wins, "
+            "SUM(CASE WHEN status='closed_loss' THEN 1 ELSE 0 END) losses, "
+            "COALESCE(SUM(pnl_usdc),0) pnl FROM dx_trades "
+            "WHERE status LIKE 'closed_%' GROUP BY source_wallet ORDER BY pnl DESC LIMIT 5"
+        ).fetchall()
+    wins = (wl["wins"] or 0) if wl else 0
+    losses = (wl["losses"] or 0) if wl else 0
+    pnl = float((wl["pnl"] or 0) if wl else 0)
+    win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else 0
+    return {
+        "config": {"capital_usdc": DX_CAPITAL_USDC, "base_usdc": DX_BASE_USDC,
+                   "max_per_wallet_usdc": DX_MAX_PER_WALLET_USDC},
+        "open": {"n": opens["n"] if opens else 0, "invested_usdc": float(opens["inv"] if opens else 0)},
+        "totals": {"wins": wins, "losses": losses, "win_rate": win_rate, "pnl_usdc": pnl},
+        "today": {"wins": (today["wins"] or 0) if today else 0,
+                  "losses": (today["losses"] or 0) if today else 0,
+                  "pnl_usdc": float((today["pnl"] or 0) if today else 0)},
+        "wallets": {"active": wallets_n, "dropped": wallets_drop},
+        "top_wallets": [dict(r) for r in top],
+    }
+
+
+@app.get("/api/dx/trades")
+def api_dx_trades(limit: int = Query(20, ge=1, le=200)) -> list[dict]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dx_trades ORDER BY entry_at DESC LIMIT ?", (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------- Estáticos / PWA ----------
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
