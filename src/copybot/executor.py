@@ -410,6 +410,7 @@ def open_position(
         size_usdc=size_usdc,
         price=price,
         dry_run=LIVE_DRY_RUN,
+        condition_id=condition_id,
     )
     if not order.ok:
         log.warning("BUY no matcheada: %s (cid=%s.. price=%.3f)",
@@ -511,6 +512,7 @@ def close_position(
         size_usdc=sell_size_usdc,
         price=price,
         dry_run=is_dry or LIVE_DRY_RUN,
+        condition_id=condition_id,
     )
     if not order.ok:
         log.warning("SELL no matcheada para live_trade #%d: %s", trade_id, order.error)
@@ -583,6 +585,7 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
     order = place_market_order(
         token_id=token_id, side="SELL", size_usdc=sell_size_usdc,
         price=exit_price, dry_run=is_dry or LIVE_DRY_RUN,
+        condition_id=condition_id,
     )
     if not order.ok:
         log.warning("force_close SELL no matcheada para live #%d: %s",

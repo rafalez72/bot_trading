@@ -109,11 +109,20 @@ def get_client():
         return None
 
 
-def get_token_id(condition_id: str, outcome_index: int) -> Optional[str]:
-    """Devuelve el token_id (ERC1155) de un outcome de un mercado.
+# Cache módulo: condition_id → (neg_risk: bool, tick_size: str, tokens: list)
+_market_meta_cache: dict = {}
 
-    El CLOB lo trae en /markets/<condition_id>. Cacheamos en memoria por sesión.
+
+def _get_market_meta(condition_id: str) -> Optional[dict]:
+    """Devuelve {neg_risk, tick_size, tokens} cacheado para un mercado.
+
+    Necesario para firmar órdenes en CLOB: si neg_risk=True o tick≠0.01,
+    el server rechaza con `order_version_mismatch` si no se pasan
+    explícitamente en `PartialCreateOrderOptions`.
     """
+    cached = _market_meta_cache.get(condition_id)
+    if cached is not None:
+        return cached
     client = get_client()
     if client is None:
         return None
@@ -121,13 +130,27 @@ def get_token_id(condition_id: str, outcome_index: int) -> Optional[str]:
         market = client.get_market(condition_id)
         if not market:
             return None
-        tokens = market.get("tokens") or []
-        if outcome_index is None or outcome_index >= len(tokens):
-            return None
-        return tokens[outcome_index].get("token_id")
+        meta = {
+            "neg_risk": bool(market.get("neg_risk")),
+            "tick_size": str(market.get("minimum_tick_size") or "0.01"),
+            "tokens": market.get("tokens") or [],
+        }
+        _market_meta_cache[condition_id] = meta
+        return meta
     except Exception as e:
-        log.warning("get_token_id falló cid=%s oi=%s: %s", condition_id[:10], outcome_index, e)
+        log.warning("_get_market_meta falló cid=%s: %s", condition_id[:10], e)
         return None
+
+
+def get_token_id(condition_id: str, outcome_index: int) -> Optional[str]:
+    """Devuelve el token_id (ERC1155) de un outcome de un mercado."""
+    meta = _get_market_meta(condition_id)
+    if not meta:
+        return None
+    tokens = meta["tokens"]
+    if outcome_index is None or outcome_index >= len(tokens):
+        return None
+    return tokens[outcome_index].get("token_id")
 
 
 def get_balance() -> Optional[float]:
@@ -215,12 +238,16 @@ def estimate_slippage(
     }
 
 
-def _build_and_post(client, *, token_id, side, shares, price):
+def _build_and_post(client, *, token_id, side, shares, price, condition_id=None):
     """Helper: arma una orden FAK (IOC, permite partial fill) y la postea.
 
     Devuelve (success, response_dict). Atrapa excepciones y devuelve (False, {error}).
+
+    Si se pasa `condition_id`, fetcha neg_risk + tick_size del mercado y los
+    pasa via PartialCreateOrderOptions — necesario para mercados neg-risk
+    (Sports/política con tick≠0.01) que sino fallan con `order_version_mismatch`.
     """
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY, SELL
 
     order_args = OrderArgs(
@@ -229,8 +256,21 @@ def _build_and_post(client, *, token_id, side, shares, price):
         size=shares,
         side=BUY if side.upper() == "BUY" else SELL,
     )
+
+    options = None
+    if condition_id:
+        meta = _get_market_meta(condition_id)
+        if meta:
+            options = PartialCreateOrderOptions(
+                neg_risk=meta["neg_risk"],
+                tick_size=meta["tick_size"],
+            )
+
     try:
-        signed = client.create_order(order_args)
+        if options is not None:
+            signed = client.create_order(order_args, options)
+        else:
+            signed = client.create_order(order_args)
     except Exception as e:
         return False, {"errorMsg": f"create_order: {e}"}
 
@@ -252,6 +292,7 @@ def place_market_order(
     price: float,  # precio de referencia
     dry_run: bool = False,
     skip_slippage_check: bool = False,
+    condition_id: Optional[str] = None,  # para neg_risk/tick_size correctos
 ) -> OrderResult:
     """Manda una orden IOC al CLOB con pre-check de slippage y retry.
 
@@ -300,6 +341,7 @@ def place_market_order(
     # --- Intento 1: precio target ---
     success, resp = _build_and_post(
         client, token_id=token_id, side=side, shares=shares, price=price,
+        condition_id=condition_id,
     )
     if not success:
         return OrderResult(ok=False, error=resp.get("errorMsg", "post error"), raw=resp)
@@ -334,6 +376,7 @@ def place_market_order(
     )
     success2, resp2 = _build_and_post(
         client, token_id=token_id, side=side, shares=remaining, price=retry_price,
+        condition_id=condition_id,
     )
     if not success2:
         return OrderResult(
