@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-03 (bot dYdX v4 + dashboard 3 tabs + LCD discovery + production parity gas/funding/orderbook)
+> **Última actualización**: 2026-05-04 (fix LIVE creds inválidas + tuning HL rate-limit + DX más estricto + LIVE real arrancado)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -452,7 +452,8 @@ FASE 7: (eliminada — deploy.sh reemplazado por git push)
 - Tailscale instalado en ambos
 - Lenovo IP Tailscale: `100.98.174.60`
 - Usuario en Windows: `melina`
-- SSH desde Mac: `ssh melina@100.98.174.60`
+- SSH desde Mac: `ssh melina@100.98.174.60` (pass guardada localmente, no en repo)
+
 
 ### Comandos para FASE 4 (ejecutar en Lenovo via Git Bash)
 
@@ -707,6 +708,71 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-04 — fix LIVE: API creds inválidas + tuning HL/DX/PM live
+
+**Hito**: el modo LIVE real estaba **roto desde el 2026-05-01**. Todos los
+BUY del bot fallaban con `order_version_mismatch` y nunca se ejecutó
+ninguna orden real. Identificada la causa raíz, regeneradas las creds
+y aplicadas mejoras de rate limiting + tamaños conservadores.
+
+#### Problema (root cause)
+- En el `.env` de la Lenovo había `POLYMARKET_API_KEY/SECRET/PASSPHRASE`
+  **inválidas** (probablemente expiradas o de otra cuenta). Devolvían 401
+  en `/balance-allowance`, `/orders`, `/trades` y derivados.
+- En `/order` (post de órdenes), las creds pasaban auth parcial pero el
+  server validaba el `signer` field contra el dueño de las creds y
+  rechazaba con `order_version_mismatch` (HTTP 400).
+- Síntomas observados: `live_summary.balance_usdc=null`, `live_trades=0`,
+  13 BUY rejects en 7 días, ningún trade real ejecutado nunca.
+
+#### Diagnóstico
+- Verificado que la EOA derivada del `POLYMARKET_PRIVATE_KEY`
+  (`0x17BBf714cc...58bce7`) **es** la owner Magic Link de la cuenta
+  `rafalezcano72@gmail.com` (proxy `0xC44a79BC...8Db9C` con $99.19).
+- Verificado on-chain que la wallet opera CLOB perfecto desde la UI
+  (3 trades CONFIRMED en últimos 2 días).
+- El allowance ERC20 USDC del proxy reporta $0 — pero **es falso
+  positivo**: Polymarket POLY_PROXY usa meta-tx via relayer, no
+  allowance ERC20 tradicional. No requiere fix.
+
+#### Fix
+1. Regeneradas las creds API vía el proxy Vercel
+   (`bot-trading-lemon.vercel.app/clob`) que bypassa el WAF de Polymarket.
+   Sig type confirmado = `1` (POLY_PROXY).
+2. Reemplazadas las 3 vars en `.env` de Lenovo + backup
+   `.env.bak.precfix`.
+3. `docker compose restart` en bot_trading-{runner,server}-1.
+4. Verificado: `live_summary.balance_usdc=$97.15` (ya no null), 0 errores
+   `order_version_mismatch` post-restart.
+
+#### Mejoras aplicadas en la misma ventana
+| Var | De | A | Por qué |
+|---|---|---|---|
+| `LIVE_BASE_USDC` | 10.0 | **5.0** | Conservador para 1ras 24-48h en real |
+| `LIVE_MAX_PER_WALLET_USDC` | 20.0 | **10.0** | Idem (cap exposure por wallet) |
+| `HL_SLEEP_SECONDS` | (default 5) | **10** | 904 errores 429/h en HL — saturación |
+| `HL_SWEEP_SECONDS` | (default 30) | **60** | Idem |
+| `DX_MIN_EXPECTED_PNL_USDC` | 0.20 | **0.40** | DX en -$1.52 hoy con sample chico — más estricto |
+
+#### Siguiente
+- Monitorear las 24-48h en LIVE real. Si el bot ejecuta y los rejects
+  siguen en 0, subir gradualmente `LIVE_BASE_USDC` hacia 10.
+- Si DX sigue rojo después de 100 trades de sample, considerar pausar
+  con `DX_MODE=false`.
+- Telegram va a notificar cada cierre con 🟢 GANADO / 🔴 PERDIDO + PnL
+  acumulado + link a polygonscan tx.
+
+#### Notas operativas
+- SSH a Lenovo: `ssh melina@100.98.174.60` (Tailscale). Pass en sección
+  "Conexión Mac ↔ Lenovo" de este doc.
+- El bot corre como 2 contenedores: `bot_trading-runner-1` (loop) y
+  `bot_trading-server-1` (FastAPI). `docker compose restart` los reinicia
+  en ~5s.
+- El cron `update_and_restart.bat` cada 5 min hace `git pull` + redeploy,
+  así que cualquier commit a `main` propaga al bot en <5min.
+
+---
 
 ### 2026-05-03 — 3er bot dYdX v4 + dashboard 3 tabs + production parity
 
