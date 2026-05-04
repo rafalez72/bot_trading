@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from typing import Iterable
 
 import numpy as np
@@ -40,6 +41,11 @@ MIN_TRADES_FOR_CLUSTERING = 50          # wallets con menos no entran al kmeans
 PENALIZE_WIN_RATE = 0.40
 BLOCK_WIN_RATE = 0.30
 MIN_CLUSTER_TRADES = 12                 # antes de evaluar performance del cluster
+
+# Override de seguridad: si CLUSTER_BLOCK_DISABLED=true, todos los clusters
+# quedan 'allowed'. Útil durante transición a live cuando el cluster_perf
+# basado en paper_trades quedó self-fulfilling-prophecy y bloquea whales.
+CLUSTER_BLOCK_DISABLED = os.getenv("CLUSTER_BLOCK_DISABLED", "false").lower() in ("true", "1", "yes")
 
 
 def _wallet_features() -> tuple[list[str], np.ndarray]:
@@ -200,7 +206,9 @@ def update_cluster_perf() -> dict:
             n = r["n_trades"] or 0
             wr = (r["wins"] / n) if n else 0.0
             pnl = r["pnl"] or 0
-            if n >= MIN_CLUSTER_TRADES:
+            if CLUSTER_BLOCK_DISABLED:
+                status = "allowed"
+            elif n >= MIN_CLUSTER_TRADES:
                 if wr < BLOCK_WIN_RATE and pnl < 0:
                     status = "blocked"
                 elif wr < PENALIZE_WIN_RATE and pnl < 0:
