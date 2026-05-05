@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-04 (fix LIVE creds inválidas + tuning HL rate-limit + DX más estricto + LIVE real arrancado)
+> **Última actualización**: 2026-05-05 (incidente trades fantasma + 9 fixes críticos: SDK v2, reconciler, WAL, _last_price, Telegram sync mode)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -708,6 +708,136 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-05 — incidente trades fantasma + 9 fixes críticos LIVE
+
+**Hito**: día caótico de debug en producción real. El bot venía operando
+LIVE desde el 2026-05-04 pero descubrimos múltiples bugs concurrentes
+que provocaron pérdidas de ~$50 USDC en posiciones sin tracking, sin
+stop_loss y sin notificaciones. **9 fixes pusheados (`755c838` →
+`ce077cd`)**, sistema blindado contra los modos de falla observados.
+
+#### Bugs descubiertos y fixes
+
+1. **Cluster auto-block self-fulfilling** (`755c838`)
+   `cluster_perf` evalúa solo con `paper_trades`. Cuando el bot copió
+   mal en paper, los whales (PnL real >$300k) quedaron `blocked` para
+   siempre. Fix: env `CLUSTER_BLOCK_DISABLED=true`.
+
+2. **`order_version_mismatch` en TODO BUY** (`2cce1b6`)
+   Polymarket migró el CLOB a v2 fines de abril. El SDK
+   `py-clob-client@0.34.6` firma con domain version vieja. Fix: migrar a
+   `py-clob-client-v2@1.0.0`. (issues GitHub #335 #336 #337).
+
+3. **Bug redondeo shares para tick=0.001** (`f40ac03`)
+   `maker_amount` con >2 decimales rechazado por server. Fix: cuantizar
+   shares a múltiplos de 10 (resp. 100) según tick.
+
+4. **`DISCOVERY_TOP_N` hardcoded** (`c4aa9dd`)
+   Discovery cada hora reseteaba 40 → 20 wallets. Fix: env configurable.
+
+5. **Errores transient SDK floodeaban Telegram** (`b85f4c8`)
+   Logs ERROR del SDK CLOB v2 (timeouts, FAK no_match, 404) triggereaban
+   notifs spam. Fix: subir level del logger del SDK a CRITICAL.
+
+6. **TRADES FANTASMA — bug central** (`4480d2f`)
+   Bot ejecutó ~17 BUYs on-chain pero solo 5 quedaron en `live_trades`.
+   12 posiciones (~$80) **sin tracking → sin SL/TP → -$50+ perdidos**.
+   Causas concurrentes:
+   - SQLite "database is locked" con 3 runners paralelos
+   - SDK CLOB devolvía exception cuando la orden SÍ filleó parcialmente
+   - Sin auditoría persistente de qué BUYs se intentaron
+
+   Fixes:
+   - `db/schema.py`: WAL mode + `busy_timeout=30s` + `_retry_locked()` para BEGIN/COMMIT
+   - `polymarket/clob_client.py`: `_outbox_log()` JSONL persistente en
+     `data/orders_outbox.jsonl` + `_resp_indicates_fill()` que detecta
+     tx_hash, makingAmount>0, status=matched/filled (recupera success
+     aunque el SDK tire exception)
+   - `copybot/reconciler.py` (NUEVO): cada 5 min compara trades on-chain
+     del proxy via Data API contra `live_trades`. Auto-INSERTa los
+     fantasma con `source_wallet='RECONCILED'`. Notif Telegram cuando
+     encuentra. Sin esto, máximo 5 min de gap de tracking.
+   - `runner.py`: hook `reconcile_once()` cada 5 min en loop principal
+   - `copybot.py`: comando `reconcile` para correr manual
+
+7. **Telegram listener async se colgaba** (`2c6d35f`, `a98816d`)
+   Listener arrancaba pero NO consumía updates ni respondía a `/status`.
+   La task moría silenciosamente porque `asyncio.create_task` no propaga
+   excepciones. Múltiples intentos con `asyncio.wait_for` no funcionaron
+   — `httpx.AsyncClient` se colgaba indefinidamente, probablemente por
+   pool exhaustion / starvation con HL/DX/PM compitiendo en el event
+   loop.
+
+   Fix definitivo: refactor a **sync mode** con `requests` library
+   ejecutado en thread separado vía `asyncio.to_thread()`. Aislamiento
+   completo del event loop.
+
+8. **Retry en `_log_reject`** (`a98816d`)
+   Aún con WAL+30s, edge cases de "database is locked". Fix: retry
+   hasta 5 veces con backoff antes de loggear failure.
+
+9. **`_last_price` ignoraba el filtro asset → SL nunca disparaba** (`ce077cd`)
+   `data-api.polymarket.com/trades?asset=...` IGNORA el parámetro asset
+   y devuelve trades aleatorios del proxy. Resultado: TODAS las
+   posiciones open recibían el mismo precio fake (~0.79) → drop
+   calculado siempre negativo → **stop_loss y trailing NUNCA disparaban**.
+   Bug catastrófico. Esto explica HAVU cayendo al 0% sin que el bot
+   hiciera nada, NY Yankees a -44% sin SL, etc.
+
+   Fix: usar `clob.polymarket.com/midpoint?token_id=...` (filtra correcto
+   por token_id) con fallback a `/price?side=SELL`.
+
+#### Mejoras de configuración aplicadas (en `.env` de Lenovo)
+
+| Var | De | A |
+|---|---|---|
+| `LIVE_BASE_USDC` | 10 | 5 |
+| `LIVE_MAX_PER_WALLET_USDC` | 20 | 10 |
+| `HL_SLEEP_SECONDS` / `SWEEP` | 5/30 | 10/60 |
+| `DX_MIN_EXPECTED_PNL_USDC` | 0.20 | 0.40 |
+| `MIN_TIME_TO_EXPIRY_SECONDS` | 600 | 60 |
+| `TRAIL_DROP_PCT` | 0.25 | 0.35 |
+| `TRAIL_ACTIVATION_PCT` | 0.30 | 0.50 |
+| `HL_CAPITAL_USDC` / `BASE` | 50/5 | 100/10 |
+| `DX_CAPITAL_USDC` / `BASE` | 50/5 | 100/10 |
+| `DISCOVERY_TOP_N` | 20 | 40 |
+| `CLUSTER_BLOCK_DISABLED` | (no) | true |
+| `LIVE_DRY_RUN` | true | **false** (LIVE real) |
+
+Filtros del selector relajados en `filter_thresholds`:
+- `MIN_SCORE` 0.65 → 0.45
+- `MIN_WIN_RATE` 0.65 → 0.45
+- `MIN_TOTAL_TRADES` 198 → 50
+- `MIN_VOLUME` 36k → 5k
+- → candidatos disponibles: 20 → **239**
+
+#### Estado al cierre del día
+
+- ✅ Bot operando LIVE real con SDK v2
+- ✅ 40 wallets activos (whales + scalpers mixto)
+- ✅ Reconciler cada 5min auto-recupera trades fantasma
+- ✅ DB con WAL + retry — robusta contra locks
+- ✅ Outbox audit log persistente
+- ✅ `_last_price` con endpoint correcto — SL/TP empiezan a disparar
+- ✅ Telegram listener (sync mode) responde comandos
+- ✅ Notifs OUT (gain/loss/startup/error) funcionan
+
+#### Cuenta
+
+- Cartera: $143.48 (post depósito $120 USDC durante el día)
+- Disponible operar: $139.10
+- Pérdidas del día: ~$50 (trades fantasma sin SL antes del fix `ce077cd`)
+- 2 posiciones residuales con tracking activo
+
+#### Próximos pasos
+
+- Validar que SL/TP disparen con `_last_price` arreglado
+- Acumular 50+ trades para análisis real
+- Considerar bloquear categorías perdedoras
+- Auditar `data/orders_outbox.jsonl` semanalmente vs `live_trades`
+
+---
 
 ### 2026-05-04 — fix LIVE: API creds inválidas + tuning HL/DX/PM live
 
