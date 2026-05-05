@@ -498,6 +498,13 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
     )
+    # Silenciar errores transitorios del SDK que van a Telegram como ERROR:
+    #  - FAK no_match: la orden no encontró contraparte en el momento exacto (normal)
+    #  - timeouts del proxy Vercel (transient HTTP)
+    #  - 404 No orderbook (markets que cerraron)
+    # Subimos el level del logger del SDK para que no escupan ERROR a stderr.
+    logging.getLogger("py_clob_client_v2.http_helpers.helpers").setLevel(logging.CRITICAL)
+    logging.getLogger("py_clob_client.http_helpers.helpers").setLevel(logging.CRITICAL)
     try:
         asyncio.run(run_loop())
     except KeyboardInterrupt:
