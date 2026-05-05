@@ -191,19 +191,40 @@ def reset_kill_switch() -> None:
 # ---------------- Stop-loss / take-profit ----------------
 
 async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
+    """Devuelve el midpoint actual del orderbook para `asset` (token_id ERC1155).
+
+    BUG-FIX 2026-05-05: antes usaba data-api.polymarket.com/trades?asset=... pero
+    ese endpoint IGNORA el filtro asset y devuelve trades aleatorios → todos los
+    assets reportaban el mismo precio falso → SL nunca disparaba. Ahora usa el
+    endpoint del CLOB que SÍ filtra por token_id.
+
+    Fallback chain:
+      1. CLOB /midpoint  (preferido — precio justo bid/ask)
+      2. CLOB /price?side=SELL  (precio actual de venta)
+      3. None  (si el mercado no tiene orderbook)
+    """
+    # Usamos el proxy Vercel para el CLOB porque desde Argentina puede haber
+    # geo-block. El bot ya usa CLOB_API que apunta al proxy.
+    from src.config import CLOB_API
     try:
-        r = await client.get(
-            f"{DATA_API}/trades", params={"asset": asset, "limit": 1}
-        )
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not data:
-            return None
-        return float(data[0].get("price") or 0)
+        r = await client.get(f"{CLOB_API}/midpoint", params={"token_id": asset}, timeout=8.0)
+        if r.status_code == 200:
+            mid = r.json().get("mid")
+            if mid is not None:
+                return float(mid)
     except Exception as e:
-        log.debug("price fetch failed asset=%s: %s", asset, e)
-        return None
+        log.debug("midpoint fetch failed asset=%s: %s", str(asset)[:14], e)
+    # Fallback: precio SELL (lo que recibirías si vendieras ahora)
+    try:
+        r = await client.get(f"{CLOB_API}/price",
+                             params={"token_id": asset, "side": "SELL"}, timeout=8.0)
+        if r.status_code == 200:
+            p = r.json().get("price")
+            if p is not None:
+                return float(p)
+    except Exception as e:
+        log.debug("price fetch failed asset=%s: %s", str(asset)[:14], e)
+    return None
 
 
 async def sweep_stops() -> dict:
