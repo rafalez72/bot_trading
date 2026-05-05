@@ -50,18 +50,31 @@ log = logging.getLogger(__name__)
 def _log_reject(source_wallet, condition_id, outcome_index, side, price, reason, detail=None):
     """Registra un reject en live_rejects para observabilidad.
 
-    Best-effort: nunca debe romper el flujo principal. Si la INSERT falla
-    (DB locked, schema viejo, etc.) loguea warning y sigue.
+    Best-effort: nunca debe romper el flujo principal. Retry hasta 5 veces
+    si la DB está locked (WAL+busy_timeout=30s normalmente cubre, pero hay
+    edge cases con 3 runners paralelos donde no es suficiente).
     """
-    try:
-        with tx() as conn:
-            conn.execute(
-                "INSERT INTO live_rejects (at, source_wallet, condition_id, outcome_index, side, price, reason, detail) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (int(time.time()), source_wallet, condition_id, outcome_index, side, price, reason, detail),
-            )
-    except Exception as e:
-        log.warning("failed to log reject: %s", e)
+    import sqlite3 as _sq
+    last_err = None
+    for attempt in range(5):
+        try:
+            with tx() as conn:
+                conn.execute(
+                    "INSERT INTO live_rejects (at, source_wallet, condition_id, outcome_index, side, price, reason, detail) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (int(time.time()), source_wallet, condition_id, outcome_index, side, price, reason, detail),
+                )
+            return
+        except _sq.OperationalError as e:
+            if "locked" not in str(e).lower():
+                log.warning("failed to log reject: %s", e)
+                return
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            log.warning("failed to log reject: %s", e)
+            return
+    log.warning("failed to log reject after 5 retries: %s", last_err)
 
 
 _MONTH_MAP = {

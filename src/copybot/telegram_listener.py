@@ -192,35 +192,42 @@ async def _send_to_chat(token: str, chat_id: int, text: str) -> None:
 async def _drain_initial(client: httpx.AsyncClient, token: str) -> int:
     """Consume updates pendientes al arrancar.
 
-    NUEVO (post-2026-05-05): NO procesamos los pending — solo avanzamos el
-    offset para "olvidarlos". Si los procesáramos, podríamos responder a
-    comandos viejos (ej: /status de hace 3h cuando el contexto cambió).
+    NUEVO (post-2026-05-05): asyncio.wait_for con timeout duro de 15s
+    para que NUNCA se cuelgue indefinido. Si pasa de 15s, el supervisor
+    del runner reinicia el listener.
     """
-    log.info("telegram listener: _drain_initial start")
+    log.info("telegram listener: _drain_initial start (cliente nuevo)")
+    # NUEVO 2026-05-05: usar un cliente HTTP NUEVO con timeout duro + wait_for.
+    # El cliente compartido del run() puede heredar pool exhaustion de los otros
+    # runners (HL/DX/PM hacen miles de requests). Cliente fresco aislado.
     try:
-        r = await client.get(
-            f"{API_BASE}/bot{token}/getUpdates",
-            params={"timeout": 0, "limit": 100},
-            timeout=10.0,
-        )
-        log.info("telegram listener: drain getUpdates status=%d", r.status_code)
-        if r.status_code != 200:
-            log.warning("telegram drain non-200: %s", r.text[:200])
-            return 0
-        result = r.json().get("result") or []
-        if not result:
-            log.info("telegram listener: no pending updates")
-            return 0
-        last_id = max(int(u["update_id"]) for u in result)
-        # ack
-        await client.get(
-            f"{API_BASE}/bot{token}/getUpdates",
-            params={"offset": last_id + 1, "timeout": 0, "limit": 1},
-            timeout=10.0,
-        )
-        log.info("telegram listener: drained %d pending updates (last_id=%d)",
-                 len(result), last_id)
-        return last_id + 1
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as fresh:
+            r = await asyncio.wait_for(
+                fresh.get(
+                    f"{API_BASE}/bot{token}/getUpdates",
+                    params={"timeout": 0, "limit": 100},
+                ),
+                timeout=12.0,
+            )
+            log.info("telegram listener: drain getUpdates status=%d", r.status_code)
+            if r.status_code != 200:
+                log.warning("telegram drain non-200: %s", r.text[:200])
+                return 0
+            result = r.json().get("result") or []
+            if not result:
+                log.info("telegram listener: no pending updates")
+                return 0
+            last_id = max(int(u["update_id"]) for u in result)
+            await asyncio.wait_for(
+                fresh.get(
+                    f"{API_BASE}/bot{token}/getUpdates",
+                    params={"offset": last_id + 1, "timeout": 0, "limit": 1},
+                ),
+                timeout=12.0,
+            )
+            log.info("telegram listener: drained %d pending updates (last_id=%d)",
+                     len(result), last_id)
+            return last_id + 1
     except Exception as e:
         log.exception("telegram listener: _drain_initial falló: %s", e)
         return 0
@@ -243,41 +250,82 @@ async def run() -> None:
 
     log.info("telegram listener: arrancando (chat_id autorizado=%s)", allowed)
 
+    # NUEVO 2026-05-05: ENFOQUE DEFINITIVO — usar requests sync en un thread
+    # separado vía asyncio.to_thread(). El listener async con httpx tiene un
+    # bug donde se cuelga indefinidamente cuando hay muchos clients concurrentes
+    # (HL/DX/PM polling). Workaround: ejecutar getUpdates en thread síncrono,
+    # totalmente aislado del event loop.
+    import requests as _requests
     backoff = 1.0
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        offset = await _drain_initial(client, token)
-        while True:
-            try:
-                r = await client.get(
-                    f"{API_BASE}/bot{token}/getUpdates",
-                    params={
-                        "timeout": POLL_TIMEOUT_SEC,
-                        "offset": offset,
-                        "allowed_updates": '["message"]',
-                    },
-                )
-                if r.status_code != 200:
-                    log.warning("telegram getUpdates %d: %s",
-                                r.status_code, r.text[:200])
-                    await asyncio.sleep(backoff)
-                    backoff = min(BACKOFF_MAX_SEC, backoff * 2)
-                    continue
-                backoff = 1.0
-                updates = r.json().get("result") or []
-                for u in updates:
-                    try:
-                        await _process_update(u, allowed, token)
-                    except Exception as e:
-                        log.exception("telegram update handler failed: %s", e)
-                    offset = max(offset, int(u["update_id"]) + 1)
-            except asyncio.CancelledError:
-                log.info("telegram listener: cancelado")
-                raise
-            except (httpx.RequestError, asyncio.TimeoutError) as e:
-                log.debug("telegram poll error (network): %s", e)
+    offset = 0
+
+    def _drain_sync() -> int:
+        try:
+            r = _requests.get(
+                f"{API_BASE}/bot{token}/getUpdates",
+                params={"timeout": 0, "limit": 100},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return 0
+            result = r.json().get("result") or []
+            if not result:
+                return 0
+            last = max(int(u["update_id"]) for u in result)
+            _requests.get(
+                f"{API_BASE}/bot{token}/getUpdates",
+                params={"offset": last + 1, "timeout": 0, "limit": 1},
+                timeout=10,
+            )
+            log.info("telegram listener: drained %d pending (last_id=%d)",
+                     len(result), last)
+            return last + 1
+        except Exception as e:
+            log.exception("telegram drain sync falló: %s", e)
+            return 0
+
+    def _poll_sync(off: int) -> tuple[int, list]:
+        """Long-poll síncrono. Devuelve (status_code, updates)."""
+        try:
+            r = _requests.get(
+                f"{API_BASE}/bot{token}/getUpdates",
+                params={
+                    "timeout": POLL_TIMEOUT_SEC,
+                    "offset": off,
+                    "allowed_updates": '["message"]',
+                },
+                timeout=POLL_TIMEOUT_SEC + 5,
+            )
+            if r.status_code != 200:
+                return r.status_code, []
+            return 200, r.json().get("result") or []
+        except Exception as e:
+            log.debug("telegram poll sync error: %s", e)
+            return 0, []
+
+    offset = await asyncio.to_thread(_drain_sync)
+    log.info("telegram listener: loop principal start (offset=%d, sync mode)", offset)
+    while True:
+        try:
+            status, updates = await asyncio.to_thread(_poll_sync, offset)
+            if status != 200 and status != 0:
+                log.warning("telegram getUpdates status=%d", status)
                 await asyncio.sleep(backoff)
                 backoff = min(BACKOFF_MAX_SEC, backoff * 2)
-            except Exception as e:
-                log.exception("telegram listener loop error: %s", e)
-                await asyncio.sleep(backoff)
-                backoff = min(BACKOFF_MAX_SEC, backoff * 2)
+                continue
+            backoff = 1.0
+            if updates:
+                log.info("telegram listener: %d updates recibidos", len(updates))
+            for u in updates:
+                try:
+                    await _process_update(u, allowed, token)
+                except Exception as e:
+                    log.exception("telegram update handler failed: %s", e)
+                offset = max(offset, int(u["update_id"]) + 1)
+        except asyncio.CancelledError:
+            log.info("telegram listener: cancelado")
+            raise
+        except Exception as e:
+            log.exception("telegram listener loop error: %s", e)
+            await asyncio.sleep(backoff)
+            backoff = min(BACKOFF_MAX_SEC, backoff * 2)
