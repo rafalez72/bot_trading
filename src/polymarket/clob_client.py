@@ -75,10 +75,10 @@ def get_client():
         return None
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds
     except ImportError:
-        log.error("py-clob-client no instalado. Corré: pip install py-clob-client")
+        log.error("py-clob-client-v2 no instalado. Corré: pip install py-clob-client-v2")
         return None
 
     creds = ApiCreds(
@@ -159,7 +159,7 @@ def get_balance() -> Optional[float]:
     if client is None:
         return None
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         bal = client.get_balance_allowance(params)
         # bal es {balance: "1234567890" (en wei micro-USDC), allowance: "..."}
@@ -188,14 +188,21 @@ def estimate_slippage(
 
     try:
         ob = client.get_order_book(token_id)
-        # ob.asks/bids son lists de OrderSummary {price, size}.
-        # Asks vienen ordenados ascendente; bids descendente.
-        # Si el SDK los trae al revés, normalizamos.
-        asks = sorted([(float(o.price), float(o.size)) for o in (ob.asks or [])])
-        bids = sorted(
-            [(float(o.price), float(o.size)) for o in (ob.bids or [])],
-            reverse=True,
-        )
+        # v2 devuelve dict con keys "asks"/"bids" que son lists de dict {price, size}.
+        # v1 devolvía objeto con .asks/.bids como lists de OrderSummary.
+        # Normalizamos ambas formas.
+        def _entry(o):
+            if hasattr(o, "price"):
+                return float(o.price), float(o.size)
+            return float(o["price"]), float(o["size"])
+        if isinstance(ob, dict):
+            asks_raw = ob.get("asks") or []
+            bids_raw = ob.get("bids") or []
+        else:
+            asks_raw = ob.asks or []
+            bids_raw = ob.bids or []
+        asks = sorted([_entry(o) for o in asks_raw])
+        bids = sorted([_entry(o) for o in bids_raw], reverse=True)
     except Exception as e:
         return {"ok": False, "error": f"get_order_book: {e}"}
 
@@ -247,8 +254,8 @@ def _build_and_post(client, *, token_id, side, shares, price, condition_id=None)
     pasa via PartialCreateOrderOptions — necesario para mercados neg-risk
     (Sports/política con tick≠0.01) que sino fallan con `order_version_mismatch`.
     """
-    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-    from py_clob_client.order_builder.constants import BUY, SELL
+    from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
 
     order_args = OrderArgs(
         token_id=token_id,
