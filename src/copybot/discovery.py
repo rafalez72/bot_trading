@@ -112,7 +112,9 @@ async def run_cycle(*, force: bool = False) -> dict:
 
     # 5) Re-select top
     try:
-        out["select"] = select_traders(top_n=20)
+        import os
+        top_n = int(os.getenv("DISCOVERY_TOP_N", "20"))
+        out["select"] = select_traders(top_n=top_n)
     except Exception as e:
         log.exception("select failed: %s", e)
 
