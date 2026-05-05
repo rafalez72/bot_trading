@@ -142,9 +142,35 @@ CREATE INDEX IF NOT EXISTS idx_learn_time ON learning_events(created_at DESC);
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
+    # timeout=30 → SQLite espera hasta 30s a que se libere el lock antes de
+    # tirar "database is locked". Con 3 runners paralelos (PM/HL/DX) escribiendo,
+    # evita que se pierdan INSERTs (eso causó trades fantasma 2026-05-05 —
+    # BUYs ejecutados on-chain sin row en live_trades).
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=30.0)  # autocommit
     conn.row_factory = sqlite3.Row
+    # WAL: writers no bloquean readers (mucha mejor concurrencia que rollback journal)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        pass
     return conn
+
+
+def _retry_locked(fn, max_retries: int = 5, base_delay: float = 0.1):
+    """Retry helper para 'database is locked'."""
+    import time as _t
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            last_err = e
+            _t.sleep(base_delay * (2 ** attempt))  # 0.1, 0.2, 0.4, 0.8, 1.6
+    raise last_err
 
 
 _MIGRATIONS = [
@@ -397,14 +423,19 @@ def db() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def tx() -> Iterator[sqlite3.Connection]:
-    """Transacción explícita."""
+    """Transacción explícita con retry on database is locked."""
     conn = _connect()
     try:
-        conn.execute("BEGIN")
+        # Retry el BEGIN si está locked (timeout=30 normalmente lo cubre, pero
+        # con 3 runners paralelos a veces da locked igual)
+        _retry_locked(lambda: conn.execute("BEGIN IMMEDIATE"))
         yield conn
-        conn.execute("COMMIT")
+        _retry_locked(lambda: conn.execute("COMMIT"))
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

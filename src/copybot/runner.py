@@ -368,6 +368,21 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("update_cluster_perf error: %s", e)
 
+            # Reconciliador on-chain (cada ~5 min) — detecta trades fantasma
+            # (BUYs ejecutados sin row en live_trades) y los trackea.
+            # CRÍTICO: previene pérdidas como las del 2026-05-05.
+            if cycle % max(1, 300 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.reconciler import reconcile_once
+                    rec = reconcile_once()
+                    if rec.get("inserted", 0) > 0:
+                        console.print(
+                            f"[yellow]reconciler:[/yellow] {rec['inserted']} trades "
+                            f"fantasma encontrados on-chain y trackeados"
+                        )
+                except Exception as e:
+                    log.exception("reconciler error: %s", e)
+
             # Auto-drop wallets con reject_clog (cada ~10 min)
             if cycle % max(1, 600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:

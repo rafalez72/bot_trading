@@ -376,6 +376,18 @@ def cmd_tune(args: argparse.Namespace) -> None:
     console.print(f"\nThresholds actuales:\n{get_all()}")
 
 
+def cmd_reconcile(_args: argparse.Namespace) -> None:
+    """Reconcilia trades on-chain del proxy con live_trades del bot.
+
+    Crea rows para trades fantasma (BUYs ejecutados sin tracking en DB).
+    """
+    from src.copybot.reconciler import reconcile_once
+    summary = reconcile_once()
+    print(f"Reconcile summary:")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
+
+
 def cmd_reset_thresholds(_args: argparse.Namespace) -> None:
     from src.copybot.auto_filter import get_all, reset_to_defaults
 
@@ -606,6 +618,11 @@ def main() -> None:
         "reset-thresholds",
         help="Vuelve los thresholds del selector a sus defaults iniciales",
     ).set_defaults(func=cmd_reset_thresholds)
+
+    sub.add_parser(
+        "reconcile",
+        help="Reconcilia trades on-chain del proxy con live_trades (trades fantasma)",
+    ).set_defaults(func=cmd_reconcile)
 
     sub.add_parser("categories", help="Performance por categoría").set_defaults(func=cmd_categories)
 

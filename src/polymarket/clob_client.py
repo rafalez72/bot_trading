@@ -250,14 +250,56 @@ def estimate_slippage(
     }
 
 
+_OUTBOX_PATH = "/app/data/orders_outbox.jsonl"
+
+
+def _outbox_log(event: str, payload: dict) -> None:
+    """Audit trail persistente de cada intento/respuesta de orden, en JSONL.
+
+    Crítico para reconciliación: si la DB falla al INSERT live_trades, el
+    outbox queda como única evidencia local de que el bot mandó la orden.
+    """
+    import json as _json, time as _t, os as _os
+    try:
+        _os.makedirs(_os.path.dirname(_OUTBOX_PATH), exist_ok=True)
+        with open(_OUTBOX_PATH, "a") as f:
+            f.write(_json.dumps({"ts": int(_t.time()), "event": event, **payload}) + "\n")
+    except Exception:
+        pass  # never let outbox break the order flow
+
+
+def _resp_indicates_fill(resp: dict) -> bool:
+    """Detecta si una response de post_order indica que la orden filleó al menos
+    parcialmente. Útil para distinguir errores reales de errores donde la orden
+    SÍ se ejecutó pero el SDK retornó algo raro.
+    """
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("transactionsHashes") or resp.get("transactionHash"):
+        return True
+    making = resp.get("makingAmount") or 0
+    taking = resp.get("takingAmount") or 0
+    try:
+        if float(making) > 0 or float(taking) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if resp.get("status") in ("matched", "filled"):
+        return True
+    return False
+
+
 def _build_and_post(client, *, token_id, side, shares, price, condition_id=None):
     """Helper: arma una orden FAK (IOC, permite partial fill) y la postea.
 
-    Devuelve (success, response_dict). Atrapa excepciones y devuelve (False, {error}).
+    Devuelve (success, response_dict).
 
-    Si se pasa `condition_id`, fetcha neg_risk + tick_size del mercado y los
-    pasa via PartialCreateOrderOptions — necesario para mercados neg-risk
-    (Sports/política con tick≠0.01) que sino fallan con `order_version_mismatch`.
+    NUEVO post-2026-05-05 (trades fantasma):
+    - Audit log persistente en outbox antes y después de cada intento
+    - Si el SDK tira excepción pero la response sugiere fill (txHash, makingAmount>0,
+      status=matched), tratamos como éxito y devolvemos la response.
+
+    Si se pasa `condition_id`, fetcha neg_risk + tick_size del mercado.
     """
     from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client_v2.order_builder.constants import BUY, SELL
@@ -278,21 +320,51 @@ def _build_and_post(client, *, token_id, side, shares, price, condition_id=None)
                 tick_size=meta["tick_size"],
             )
 
+    _outbox_log("attempt", {
+        "token_id": token_id, "condition_id": condition_id,
+        "side": side, "shares": shares, "price": price,
+    })
+
     try:
         if options is not None:
             signed = client.create_order(order_args, options)
         else:
             signed = client.create_order(order_args)
     except Exception as e:
+        _outbox_log("create_failed", {"token_id": token_id, "error": str(e)[:300]})
         return False, {"errorMsg": f"create_order: {e}"}
 
-    # Probamos FAK (Fill-And-Kill = IOC: lo que matchee, matchea; el resto se cancela).
-    # Si la versión del SDK no expone FAK, caemos a FOK.
     try:
         order_type = getattr(OrderType, "FAK", None) or OrderType.FOK
         resp = client.post_order(signed, order_type)
+        _outbox_log("post_ok", {"token_id": token_id, "resp": resp or {}})
         return True, (resp or {})
     except Exception as e:
+        # CRITICAL: aún si el SDK tiró exception, la orden puede haberse ejecutado
+        # parcialmente. Intentamos extraer la response del exception (algunos
+        # PolyApiException incluyen body con tx_hash o makingAmount > 0).
+        err_str = str(e)
+        partial_resp = {}
+        try:
+            # PolyApiException tiene .response_data o similar; fallback a parsing
+            for attr in ("response_data", "args"):
+                v = getattr(e, attr, None)
+                if isinstance(v, dict):
+                    partial_resp = v
+                    break
+                if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict):
+                    partial_resp = v[0]
+                    break
+        except Exception:
+            pass
+
+        if _resp_indicates_fill(partial_resp):
+            _outbox_log("post_succeeded_despite_error", {
+                "token_id": token_id, "error": err_str[:300], "resp": partial_resp,
+            })
+            return True, partial_resp
+
+        _outbox_log("post_failed", {"token_id": token_id, "error": err_str[:300]})
         return False, {"errorMsg": f"post_order: {e}"}
 
 
