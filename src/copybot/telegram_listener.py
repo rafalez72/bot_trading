@@ -190,30 +190,40 @@ async def _send_to_chat(token: str, chat_id: int, text: str) -> None:
 
 
 async def _drain_initial(client: httpx.AsyncClient, token: str) -> int:
-    """Consume updates pendientes al arrancar (mensajes viejos del bot).
+    """Consume updates pendientes al arrancar.
 
-    Devuelve el offset desde donde escuchar nuevo tráfico.
+    NUEVO (post-2026-05-05): NO procesamos los pending — solo avanzamos el
+    offset para "olvidarlos". Si los procesáramos, podríamos responder a
+    comandos viejos (ej: /status de hace 3h cuando el contexto cambió).
     """
+    log.info("telegram listener: _drain_initial start")
     try:
         r = await client.get(
             f"{API_BASE}/bot{token}/getUpdates",
             params={"timeout": 0, "limit": 100},
             timeout=10.0,
         )
+        log.info("telegram listener: drain getUpdates status=%d", r.status_code)
         if r.status_code != 200:
+            log.warning("telegram drain non-200: %s", r.text[:200])
             return 0
         result = r.json().get("result") or []
         if not result:
+            log.info("telegram listener: no pending updates")
             return 0
         last_id = max(int(u["update_id"]) for u in result)
-        # ack: pasar offset = last_id+1 para que Telegram los olvide
+        # ack
         await client.get(
             f"{API_BASE}/bot{token}/getUpdates",
             params={"offset": last_id + 1, "timeout": 0, "limit": 1},
             timeout=10.0,
         )
-        log.info("telegram listener: drained %d pending updates", len(result))
+        log.info("telegram listener: drained %d pending updates (last_id=%d)",
+                 len(result), last_id)
         return last_id + 1
+    except Exception as e:
+        log.exception("telegram listener: _drain_initial falló: %s", e)
+        return 0
     except Exception as e:
         log.warning("telegram initial drain failed: %s", e)
         return 0

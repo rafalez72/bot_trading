@@ -280,7 +280,27 @@ async def run_loop(*, once: bool = False) -> None:
     if not once:
         try:
             from src.copybot import telegram_listener
-            telegram_task = asyncio.create_task(telegram_listener.run())
+
+            async def _telegram_supervisor():
+                """Mantiene el listener vivo: si crashea con exception, restart con backoff.
+
+                Antes (2026-05-05): si _drain_initial o el primer client.get
+                tiraba exception, la task moría silenciosamente y el listener
+                no respondía a comandos. asyncio.create_task no propaga
+                excepciones de tareas terminadas a menos que las awaits.
+                """
+                while True:
+                    try:
+                        log.info("telegram supervisor: arrancando listener.run()")
+                        await telegram_listener.run()
+                        log.warning("telegram listener.run() terminó normal — restart en 5s")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.exception("telegram listener crashed: %s — restart en 10s", e)
+                    await asyncio.sleep(10)
+
+            telegram_task = asyncio.create_task(_telegram_supervisor())
         except Exception as e:
             log.warning("no se pudo arrancar telegram listener: %s", e)
 
