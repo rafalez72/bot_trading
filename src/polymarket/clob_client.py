@@ -204,6 +204,11 @@ def estimate_slippage(
         asks = sorted([_entry(o) for o in asks_raw])
         bids = sorted([_entry(o) for o in bids_raw], reverse=True)
     except Exception as e:
+        # Silenciar el caso común "No orderbook" (mercado AMM-only o que cerró)
+        # — es benigno, no merece alerta a Telegram
+        msg = str(e)
+        if "No orderbook exists" in msg or "404" in msg:
+            return {"ok": False, "error": "no_orderbook"}
         return {"ok": False, "error": f"get_order_book: {e}"}
 
     book = asks if side.upper() == "BUY" else bids
@@ -332,9 +337,28 @@ def place_market_order(
 
     if price <= 0:
         return OrderResult(ok=False, error=f"precio invalido: {price}")
-    shares = round(size_usdc / price, 2)
+
+    # Polymarket exige maker_amount con max 2 decimales (centavos USDC). Como
+    # maker = shares × price, hay que elegir shares tal que el producto tenga
+    # max 2 decimales:
+    #   - tick=0.01 (price con 2 decimales): shares enteros → maker siempre 2 dec ✓
+    #   - tick=0.001 (price con 3 decimales): shares múltiplos de 10 → maker 2 dec ✓
+    # Si no, el server rechaza con "invalid amounts, max 2 decimals".
+    tick_size = "0.01"
+    if condition_id:
+        meta = _get_market_meta(condition_id)
+        if meta:
+            tick_size = meta["tick_size"]
+
+    raw_shares = size_usdc / price
+    if tick_size in ("0.001", "0.0001"):
+        # Cuantizar a múltiplos de 10 (resp. 100) para que maker tenga 2 decimales
+        step = 10 if tick_size == "0.001" else 100
+        shares = (int(raw_shares) // step) * step
+    else:
+        shares = int(raw_shares)
     if shares <= 0:
-        return OrderResult(ok=False, error="size_usdc demasiado chico")
+        return OrderResult(ok=False, error=f"size_usdc demasiado chico (tick={tick_size}, raw_shares={raw_shares:.2f})")
 
     # --- Pre-check del orderbook ---
     if not skip_slippage_check:
