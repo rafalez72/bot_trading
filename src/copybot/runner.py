@@ -263,6 +263,18 @@ async def run_loop(*, once: bool = False) -> None:
             "Esto consume USDC reales si dry_run=false.[/red]"
         )
 
+    # Drenar outbox de live_trades antes de operar — si el proceso anterior
+    # tuvo INSERTs que fallaron por DB locked, los recuperamos ahora.
+    try:
+        from src.copybot.executor import drain_live_outbox
+        n_drained = drain_live_outbox()
+        if n_drained:
+            console.print(
+                f"[yellow]outbox:[/yellow] {n_drained} live_trades drenados al startup"
+            )
+    except Exception as e:
+        log.exception("drain_live_outbox falló al startup: %s", e)
+
     # Instalar el handler de errores → Telegram (rate-limited)
     try:
         from src.copybot.notifier import install_error_handler, startup
@@ -324,6 +336,18 @@ async def run_loop(*, once: bool = False) -> None:
             log.info("DX runner: arrancado en paralelo (dry-run)")
         except Exception as e:
             log.warning("no se pudo arrancar DX runner: %s", e)
+
+    # WS bridge a Polymarket RTDS para reducir latencia de detección de trades
+    # (de ~5-7s polling a <1s push). Complementa el polling — no lo reemplaza.
+    # Idempotencia vía source_trade_id "ws:<txh>" en tradebook.open_position.
+    ws_task: asyncio.Task | None = None
+    if os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true" and not once:
+        try:
+            from src.copybot.ws_bridge import ws_run_loop
+            ws_task = asyncio.create_task(ws_run_loop())
+            log.info("WS bridge: arrancado en paralelo (latencia reducida)")
+        except Exception as e:
+            log.warning("no se pudo arrancar WS bridge: %s", e)
 
     cycle = 0
     last_sweep = 0.0

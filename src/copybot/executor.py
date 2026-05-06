@@ -39,12 +39,201 @@ from src.config import (
     MIN_MARKET_VOLUME_USDC,
     MIN_TIME_TO_EXPIRY_SECONDS,
 )
+from src.config import DB_PATH
 from src.copybot.learning import on_paper_trade_closed
 from src.copybot.paper import EPSILON, _check_kill_switch, _ensure_market_stub
 from src.copybot.realism import expected_net_pnl, post_close_costs
 from src.db.schema import db, tx
 
 log = logging.getLogger(__name__)
+
+
+# Outbox para INSERTs de live_trades que fallaron persistentemente
+# (database is locked tras retries). Se drena al startup del runner. Garantiza
+# que un fill on-chain real nunca se pierda solo porque la DB estaba locked.
+LIVE_OUTBOX_PATH = DB_PATH.parent / "live_trades_outbox.jsonl"
+
+
+def _insert_live_trade_row(payload: dict) -> int | None:
+    """Inserta el row en live_trades dentro de tx(). Idempotente por source_trade_id.
+
+    Devuelve el live_trade.id si insertó, None si ya existía (duplicado).
+    Cualquier sqlite OperationalError ('locked') propaga al caller para retry.
+    """
+    with tx() as conn:
+        # Idempotencia: si ya existe, no duplicar (puede pasar si el outbox
+        # se drena después de que el reconciler ya creó el row).
+        if payload.get("source_trade_id"):
+            dup = conn.execute(
+                "SELECT id FROM live_trades WHERE source_trade_id=?",
+                (payload["source_trade_id"],),
+            ).fetchone()
+            if dup:
+                return None
+        cur = conn.execute(
+            """
+            INSERT INTO live_trades
+                (source_wallet, source_trade_id, condition_id, token_id, outcome,
+                 outcome_index, side, entry_price, entry_size_usdc, entry_shares,
+                 entry_at, entry_order_id, entry_tx_hash, status, raw, asset, dry_run,
+                 peak_price)
+            VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+            """,
+            (
+                payload["source_wallet"],
+                payload["source_trade_id"],
+                payload["condition_id"],
+                payload["token_id"],
+                payload.get("outcome"),
+                payload.get("outcome_index"),
+                payload["entry_price"],
+                payload["entry_size_usdc"],
+                payload["entry_shares"],
+                payload["entry_at"],
+                payload.get("entry_order_id"),
+                payload.get("entry_tx_hash"),
+                payload.get("raw"),
+                payload.get("asset"),
+                payload.get("dry_run", 0),
+                payload.get("peak_price", payload["entry_price"]),
+            ),
+        )
+        return cur.lastrowid
+
+
+def _persist_live_trade_with_outbox(payload: dict) -> int | None:
+    """Inserta el row, con retries y fallback a outbox si la DB sigue locked.
+
+    Retries: 5 intentos exponenciales (0.1, 0.2, 0.4, 0.8, 1.6s) — además de
+    los 30s de busy_timeout que ya hace SQLite. Total ~33s peor caso.
+    Si todo falla, escribe el payload a LIVE_OUTBOX_PATH (jsonl) y devuelve None.
+    El runner drenará el outbox en el próximo startup.
+    """
+    import sqlite3 as _sq
+    last_err: Exception | None = None
+    delay = 0.1
+    for attempt in range(5):
+        try:
+            return _insert_live_trade_row(payload)
+        except _sq.OperationalError as e:
+            if "locked" not in str(e).lower():
+                # otros errores no son retryables — al outbox directo
+                last_err = e
+                break
+            last_err = e
+            log.warning(
+                "live_trades INSERT locked (attempt %d/5): %s",
+                attempt + 1, e,
+            )
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            # cualquier otra excepción: al outbox para análisis posterior,
+            # no perdemos el trade
+            last_err = e
+            break
+
+    # Fallback: escribir al outbox. Best-effort: si esto también falla,
+    # al menos lo logueamos.
+    try:
+        LIVE_OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LIVE_OUTBOX_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "queued_at": int(time.time()),
+                "last_error": str(last_err)[:300] if last_err else None,
+                "payload": payload,
+            }, separators=(",", ":")) + "\n")
+        log.error(
+            "live_trades INSERT falló persistente — escrito a outbox %s "
+            "(source_trade_id=%s tx_hash=%s). Se drenará al próximo startup.",
+            LIVE_OUTBOX_PATH, payload.get("source_trade_id"),
+            payload.get("entry_tx_hash"),
+        )
+        try:
+            from src.copybot.notifier import send
+            send(
+                f"⚠️ *OUTBOX*: live_trade INSERT falló — encolado a disco. "
+                f"wallet=`{payload.get('source_wallet','?')[:10]}` "
+                f"tx=`{(payload.get('entry_tx_hash') or 'no-tx')[:14]}`"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception(
+            "OUTBOX FAIL — no se pudo escribir el trade ni a DB ni a disco: %s",
+            e,
+        )
+    return None
+
+
+def drain_live_outbox() -> int:
+    """Drena LIVE_OUTBOX_PATH al startup. Idempotente (usa source_trade_id).
+
+    Lee el JSONL línea por línea, intenta insertar cada payload con
+    `_insert_live_trade_row`. Las líneas que se insertan correctamente (o que
+    eran duplicados ya en DB) se descartan. Las que fallan otra vez quedan
+    en un nuevo outbox para reintento.
+
+    Devuelve cantidad de trades drenados (insertados o ya-presentes).
+    """
+    if not LIVE_OUTBOX_PATH.exists():
+        return 0
+    try:
+        with open(LIVE_OUTBOX_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("drain_live_outbox: no se pudo leer %s: %s", LIVE_OUTBOX_PATH, e)
+        return 0
+
+    drained = 0
+    failed: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not payload:
+                # línea corrupta — no la reencolamos (evita loop infinito)
+                continue
+            try:
+                _insert_live_trade_row(payload)
+                drained += 1
+            except Exception as e:
+                log.warning(
+                    "drain_live_outbox: INSERT aún falla (source_trade_id=%s): %s",
+                    payload.get("source_trade_id"), e,
+                )
+                failed.append(line)
+        except json.JSONDecodeError:
+            # línea corrupta — descartar
+            continue
+
+    # Reescribir outbox solo con los que siguen fallando (atomico-ish: escribimos
+    # a un .tmp y renombramos).
+    try:
+        if failed:
+            tmp = LIVE_OUTBOX_PATH.with_suffix(".jsonl.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(failed) + "\n")
+            tmp.replace(LIVE_OUTBOX_PATH)
+        else:
+            LIVE_OUTBOX_PATH.unlink()
+    except Exception as e:
+        log.warning("drain_live_outbox: no se pudo limpiar outbox: %s", e)
+
+    if drained:
+        log.warning(
+            "drain_live_outbox: %d trades drenados al startup (de %d en outbox)",
+            drained, len(lines),
+        )
+        try:
+            from src.copybot.notifier import send
+            send(f"📤 *OUTBOX drenado*: {drained} live_trades recuperados al startup.")
+        except Exception:
+            pass
+    return drained
 
 
 def _log_reject(source_wallet, condition_id, outcome_index, side, price, reason, detail=None):
@@ -445,27 +634,30 @@ def open_position(
         actual_shares = size_usdc / actual_price
 
     market_slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
-    with tx() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO live_trades
-                (source_wallet, source_trade_id, condition_id, token_id, outcome,
-                 outcome_index, side, entry_price, entry_size_usdc, entry_shares,
-                 entry_at, entry_order_id, entry_tx_hash, status, raw, asset, dry_run,
-                 peak_price)
-            VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
-            """,
-            (
-                source_wallet, source_trade_id, condition_id, token_id, outcome,
-                outcome_index, actual_price, size_usdc, actual_shares,
-                timestamp, order.order_id, order.tx_hash,
-                json.dumps(raw, separators=(",", ":")) if raw else None,
-                token_id,
-                1 if LIVE_DRY_RUN else 0,
-                actual_price,  # peak_price arranca == entry_price
-            ),
-        )
-        live_id = cur.lastrowid
+    # CRÍTICO: el fill ya está on-chain. Si este INSERT falla, perdemos
+    # tracking de una posición real → no SL/TP → reconciler la rescata como
+    # 'RECONCILED' sin atribución al wallet. Para evitarlo: retries
+    # exponenciales y, si todo falla, encolamos a disco (outbox) que el
+    # runner drena al próximo startup.
+    insert_payload = {
+        "source_wallet": source_wallet,
+        "source_trade_id": source_trade_id,
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": outcome,
+        "outcome_index": outcome_index,
+        "entry_price": actual_price,
+        "entry_size_usdc": size_usdc,
+        "entry_shares": actual_shares,
+        "entry_at": timestamp,
+        "entry_order_id": order.order_id,
+        "entry_tx_hash": order.tx_hash,
+        "raw": json.dumps(raw, separators=(",", ":")) if raw else None,
+        "asset": token_id,
+        "dry_run": 1 if LIVE_DRY_RUN else 0,
+        "peak_price": actual_price,  # peak_price arranca == entry_price
+    }
+    live_id = _persist_live_trade_with_outbox(insert_payload)
 
     try:
         from src.copybot.notifier import live_open

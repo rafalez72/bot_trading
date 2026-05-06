@@ -79,10 +79,67 @@ def _existing_keys(since_ts: int) -> set[tuple]:
     return out
 
 
+# Ventana (segundos) para matchear el fill on-chain del proxy contra un BUY
+# del wallet original que se estaba copiando. El bot tarda ~10-30s en
+# tomar la decisión + mandar la orden + matchearla. ±60s cubre el caso
+# normal con holgura sin abrir la puerta a falsos positivos cuando varias
+# wallets compran el mismo outcome casi al mismo tiempo.
+RECONCILE_ATTRIBUTION_WINDOW_SEC = 60
+
+
+def _find_source_wallet_for_fill(conn, cid: str, oi: int, ts: int) -> Optional[str]:
+    """Busca el wallet copiado que probablemente originó este fill on-chain.
+
+    Cruza contra `trades` (que indexa trades de TODOS los wallets monitoreados,
+    no solo del proxy del bot). Match: mismo condition_id + outcome_index +
+    side=BUY, timestamp dentro de [ts-window, ts] (la copia llega DESPUÉS
+    del trade original; permitimos un pequeño margen +window por skew de clock).
+
+    Solo retorna el wallet si está en `copy_subscriptions` con status active
+    o paused (era una sub legítima en algún momento). Si hay múltiples
+    candidatos, prefiere el más cercano en tiempo (más probable que sea
+    el que disparó la copia).
+
+    Devuelve el wallet (lowercase) o None si no hay match confiable.
+    """
+    if not cid or oi is None or ts <= 0:
+        return None
+    lo = ts - RECONCILE_ATTRIBUTION_WINDOW_SEC
+    hi = ts + RECONCILE_ATTRIBUTION_WINDOW_SEC
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.wallet, t.timestamp
+            FROM trades t
+            JOIN copy_subscriptions cs ON cs.wallet = t.wallet
+            WHERE t.condition_id = ?
+              AND t.outcome_index = ?
+              AND UPPER(t.side) = 'BUY'
+              AND t.timestamp BETWEEN ? AND ?
+              AND cs.status IN ('active', 'paused')
+            ORDER BY ABS(t.timestamp - ?) ASC
+            LIMIT 1
+            """,
+            (cid, oi, lo, hi, ts),
+        ).fetchall()
+    except Exception as e:
+        log.debug("reconciler: attribution lookup falló: %s", e)
+        return None
+    if not rows:
+        return None
+    return rows[0]["wallet"]
+
+
 def _reconcile_buy(t: dict) -> Optional[int]:
     """Crea un row 'reconciled' en live_trades para un BUY on-chain detectado.
 
     Devuelve live_trade.id si insertó, None si era duplicado.
+
+    Atribución mejorada (2026-05-05): antes de marcar como RECONCILED genérico,
+    intenta encontrar el wallet original que se estaba copiando cruzando contra
+    la tabla `trades` (timestamp ±60s, mismo cid+outcome+side, sub activa/paused).
+    Si lo encuentra, conserva la atribución para que learning/bandit/categories
+    no queden ciegos. Si no, fallback a 'RECONCILED' como antes.
     """
     cid = t.get("conditionId")
     oi = t.get("outcomeIndex")
@@ -114,6 +171,25 @@ def _reconcile_buy(t: dict) -> Optional[int]:
         if r:
             return None
 
+        # Intento de atribución al wallet original copiado.
+        attributed = _find_source_wallet_for_fill(conn, cid, oi, ts)
+        if attributed:
+            source_wallet = attributed
+            source_trade_id = f"reconciled-attr:{tx_hash or cid+':'+str(ts)}"
+            raw_blob = {
+                "reconciled": True,
+                "attributed_to": attributed,
+                "raw_data_api": t,
+            }
+            log.info(
+                "reconciler: fill cid=%s.. atribuido a wallet=%s.. (ts=%d)",
+                cid[:12], attributed[:10], ts,
+            )
+        else:
+            source_wallet = "RECONCILED"
+            source_trade_id = f"reconciled:{tx_hash or cid+':'+str(ts)}"
+            raw_blob = {"reconciled": True, "raw_data_api": t}
+
         cur = conn.execute(
             """
             INSERT INTO live_trades
@@ -124,12 +200,12 @@ def _reconcile_buy(t: dict) -> Optional[int]:
             VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?, 0, ?, NULL)
             """,
             (
-                "RECONCILED",
-                f"reconciled:{tx_hash or cid+':'+str(ts)}",
+                source_wallet,
+                source_trade_id,
                 cid, asset, outcome, oi,
                 price, size_usdc, size,
                 ts, None, tx_hash,
-                json.dumps({"reconciled": True, "raw_data_api": t}, separators=(",", ":")),
+                json.dumps(raw_blob, separators=(",", ":")),
                 asset,
                 price,
             ),

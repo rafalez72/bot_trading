@@ -16,7 +16,7 @@ from src.db.schema import db, tx
 
 log = logging.getLogger(__name__)
 
-MIN_TRADES_FOR_BLOCK = 15
+MIN_TRADES_FOR_BLOCK = 10
 BLOCK_WIN_RATE = 0.40
 UNBLOCK_WIN_RATE = 0.55  # para volver a abrir hace falta más alto
 
