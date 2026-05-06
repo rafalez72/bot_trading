@@ -52,8 +52,17 @@ def _resolved_payout(outcome_prices_json: str | None, outcome_index: int | None)
 REJECT_REASONS = {
     "no_subscription", "inactive", "duplicate", "kill_switch", "capital_full",
     "market_concentration", "low_liquidity", "low_volume", "extreme_price",
-    "category_blocked", "policy_blocked", "cluster_blocked",
+    "category_blocked", "policy_blocked", "cluster_blocked", "stale_trade",
 }
+
+# Trades del wallet original más viejos que esto cuando los procesamos = no
+# copiar. Razón: nuestro polling tiene latencia (~5-7s) + el trade puede haber
+# llegado en una tanda histórica. Si el trade ya tiene >MAX_TRADE_AGE_SECONDS
+# de antigüedad, perdimos el edge — entramos tarde a un movimiento ya hecho.
+# Caso real 2026-05-06: 2 trades LoL Game 2 entry@0.45 con el match casi
+# terminado → expiraron a $0.001 minutos después → -$10 cada uno.
+import os as _os
+MAX_TRADE_AGE_SECONDS = int(_os.getenv("MAX_TRADE_AGE_SECONDS", "60"))
 
 
 def _check_kill_switch(conn) -> bool:
@@ -130,6 +139,15 @@ def open_position(
     with tx() as conn:
         if _check_kill_switch(conn):
             return None, "kill_switch"
+
+        # Anti-stale: si el trade del source wallet tiene más de
+        # MAX_TRADE_AGE_SECONDS de antigüedad cuando lo procesamos, no
+        # copiar. Caso 2026-05-06: 2 trades LoL Game 2 entry tardío → -$10
+        # cada uno cuando el match terminó a $0.001 minutos después.
+        import time as _time
+        age = int(_time.time()) - int(timestamp or 0)
+        if age > MAX_TRADE_AGE_SECONDS:
+            return None, "stale_trade"
 
         sub = conn.execute(
             "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",

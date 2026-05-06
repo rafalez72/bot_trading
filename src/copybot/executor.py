@@ -383,6 +383,14 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "kill_switch")
         return None, "kill_switch"
 
+    # Anti-stale: ver paper.open_position. Mismo umbral compartido.
+    from src.copybot.paper import MAX_TRADE_AGE_SECONDS
+    age = int(time.time()) - int(timestamp or 0)
+    if age > MAX_TRADE_AGE_SECONDS:
+        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
+                    "stale_trade", detail=json.dumps({"age_s": age}))
+        return None, "stale_trade"
+
     sub = conn.execute(
         "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
         (source_wallet,),
