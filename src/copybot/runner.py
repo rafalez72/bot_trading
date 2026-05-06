@@ -130,8 +130,15 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
             continue
 
         try:
+            # open_position y close_position son SYNC (httpx sync al CLOB +
+            # tx() con BEGIN IMMEDIATE en SQLite). Si los corremos directo
+            # acá BLOQUEAN el event loop entero — wait_for/cancel no
+            # funcionan, y el heartbeat al inicio del próximo cycle nunca
+            # se llama. Resultado: bot colgado, watchdog kill loop.
+            # to_thread los corre en thread pool y libera el event loop.
             if side == "BUY":
-                pid, reason = open_position(
+                pid, reason = await asyncio.to_thread(
+                    open_position,
                     source_wallet=wallet,
                     source_trade_id=tid,
                     condition_id=cid,
@@ -153,7 +160,8 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
                         wallet[:10], cid[:10], reason,
                     )
             else:  # SELL
-                pid = close_position(
+                pid = await asyncio.to_thread(
+                    close_position,
                     source_wallet=wallet,
                     condition_id=cid,
                     outcome_index=oi,
