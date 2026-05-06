@@ -425,31 +425,42 @@ async def run_loop(*, once: bool = False) -> None:
             # Reconciliador on-chain (cada ~5 min) — detecta trades fantasma
             # (BUYs ejecutados sin row en live_trades) y los trackea.
             # CRÍTICO: previene pérdidas como las del 2026-05-05.
+            # NOTA (2026-05-06): wrappeado en asyncio.to_thread para que httpx
+            # sync no bloquee el async loop si la API cuelga. Causaba watchdog
+            # kills cada 10min porque el cycle no completaba a tiempo.
             if cycle % max(1, 300 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
                     from src.copybot.reconciler import reconcile_once
-                    rec = reconcile_once()
+                    rec = await asyncio.wait_for(
+                        asyncio.to_thread(reconcile_once),
+                        timeout=30,
+                    )
                     if rec.get("inserted", 0) > 0:
                         console.print(
                             f"[yellow]reconciler:[/yellow] {rec['inserted']} trades "
                             f"fantasma encontrados on-chain y trackeados"
                         )
+                except asyncio.TimeoutError:
+                    log.warning("reconciler timeout (>30s) — saltando este ciclo")
                 except Exception as e:
                     log.exception("reconciler error: %s", e)
 
-            # Phantom cleanup (cada ~30 min, solo en LIVE). Para markets negRisk
-            # settle_resolved no dispara — se acumulan rows open ocupando cap.
-            # Esta función consulta /positions del proxy y cierra como
-            # closed_external los que ya no existen on-chain. Libera cap.
+            # Phantom cleanup (cada ~30 min, solo en LIVE). Idem reconciler:
+            # to_thread + timeout para no bloquear el async loop.
             if TRADEBOOK_MODE.startswith("live") and cycle % max(1, 1800 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
                     from src.copybot.executor import cleanup_phantom_positions
-                    n_phantom = cleanup_phantom_positions()
+                    n_phantom = await asyncio.wait_for(
+                        asyncio.to_thread(cleanup_phantom_positions),
+                        timeout=30,
+                    )
                     if n_phantom:
                         console.print(
                             f"[yellow]phantom cleanup:[/yellow] {n_phantom} "
                             f"live_trades cerrados (ya no existen on-chain)"
                         )
+                except asyncio.TimeoutError:
+                    log.warning("cleanup_phantom timeout (>30s) — saltando")
                 except Exception as e:
                     log.exception("cleanup_phantom_positions error: %s", e)
 
