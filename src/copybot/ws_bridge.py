@@ -114,8 +114,20 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             # tradebook.open_position por source_trade_id corta el segundo.
             source_trade_id = f"ws:{txh}"
 
+            # CRÍTICO (fix 2026-05-06): `open_position`, `close_position` y
+            # `_set_cursor` son SYNC y hacen DB writes + HTTP calls al CLOB
+            # (varios segundos por orden real). Llamarlos directamente desde
+            # el callback async BLOQUEA el event loop. Cuando llegan varios
+            # matches consecutivos, las tareas async (polling main, HL, DX,
+            # heartbeat WS) se quedan sin CPU → cursores no avanzan, DB
+            # locked, el bot deja de operar.
+            #
+            # Solución: `asyncio.to_thread` offloads cada llamada a un thread
+            # pool. El event loop queda libre. El thread pool default de
+            # asyncio (~32 workers) maneja bursts sin problema.
             if side == "BUY":
-                pid, reason = open_position(
+                pid, reason = await asyncio.to_thread(
+                    open_position,
                     source_wallet=wallet_lc,
                     source_trade_id=source_trade_id,
                     condition_id=cid,
@@ -137,7 +149,8 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                         wallet_lc[:10], (cid or "")[:10], reason,
                     )
             else:  # SELL
-                pid = close_position(
+                pid = await asyncio.to_thread(
+                    close_position,
                     source_wallet=wallet_lc,
                     condition_id=cid,
                     outcome_index=oi,
@@ -154,7 +167,7 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             # Avanzar el cursor del polling para que el polling no reprocese
             # el mismo trade en el próximo ciclo (mismo schema que runner).
             try:
-                _set_cursor(wallet_lc, ts)
+                await asyncio.to_thread(_set_cursor, wallet_lc, ts)
             except Exception:
                 log.exception("WS: no se pudo avanzar cursor de %s", wallet_lc[:10])
         except Exception:
