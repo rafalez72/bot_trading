@@ -150,11 +150,20 @@ def _watchdog_loop() -> None:
 
 
 def start_watchdog() -> None:
-    """Spawn del thread daemon. Idempotente."""
+    """Spawn del thread daemon. Idempotente.
+
+    IMPORTANTE: escribe un heartbeat fresco ANTES de spawn del thread.
+    Si no, después de un docker restart el watchdog puede leer el heartbeat
+    viejo del container muerto y disparar un kill inmediatamente, causando
+    un loop infinito de restarts. Caso real 2026-05-06 11:00 UTC.
+    """
     global _watchdog_started
     if _watchdog_started:
         log.warning("watchdog already started — noop")
         return
+    # Heartbeat inicial fresco para evitar false-positive de un kill anterior
+    record_heartbeat()
+    log.info("watchdog: heartbeat inicial escrito (anti-falsa-stale post-restart)")
     t = threading.Thread(
         target=_watchdog_loop, name="bot-watchdog", daemon=True
     )
