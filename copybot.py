@@ -342,6 +342,66 @@ def cmd_reset_killswitch(_args: argparse.Namespace) -> None:
     console.print("[green]✓[/green] Kill switch desactivado. Bot reanudado.")
 
 
+def cmd_paper_reset(args: argparse.Namespace) -> None:
+    """Backup paper_trades a tabla con timestamp + truncate + reset killswitch.
+
+    Conserva el histórico (para análisis) pero el bot ve PnL=$0 desde ahora.
+    Mismo patrón usado en el switch a real del 2026-05-01 (live_trades_dryrun_<ts>).
+    """
+    import time as _t
+    from src.db.schema import db, tx
+
+    if not args.yes:
+        console.print(
+            "[red]Esto va a dejar el PnL paper en $0[/red] (backup en tabla aparte).\n"
+            "Si estás seguro: agregá --yes"
+        )
+        return
+
+    ts = int(_t.time())
+    backup_table = f"paper_trades_backup_{ts}"
+
+    with db() as conn:
+        n_before = conn.execute(
+            "SELECT COUNT(*) c FROM paper_trades"
+        ).fetchone()["c"]
+
+    with tx() as conn:
+        # Backup
+        conn.execute(
+            f"CREATE TABLE {backup_table} AS SELECT * FROM paper_trades"
+        )
+        # Truncate
+        conn.execute("DELETE FROM paper_trades")
+        # Resetear cursor de aprendizaje del kill switch para que la ventana
+        # arranque desde ahora (no quedan trades viejos en paper_trades pero
+        # por las dudas).
+        conn.execute(
+            "INSERT INTO bot_state (key, value, updated_at) "
+            "VALUES ('kill_switch_reset_at', ?, datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            (str(ts),),
+        )
+        # Desactivar kill_switch si estaba activo
+        conn.execute(
+            "INSERT INTO bot_state (key, value, updated_at) "
+            "VALUES ('kill_switch', 'inactive', datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value='inactive', updated_at=datetime('now')"
+        )
+        # Audit
+        conn.execute(
+            "INSERT INTO learning_events (wallet, event_type, trigger, metric_snapshot) "
+            "VALUES ('SYSTEM', 'paper_reset', ?, ?)",
+            (f"backup={backup_table}", f'{{"trades_archived":{n_before}}}'),
+        )
+
+    console.print(
+        f"[green]✓[/green] {n_before} paper_trades archivados en "
+        f"[cyan]{backup_table}[/cyan].\n"
+        "PnL ahora arranca en $0. Kill switch desactivado."
+    )
+
+
 def cmd_cluster_status(_args: argparse.Namespace) -> None:
     from src.copybot.clusters import status
 
@@ -609,6 +669,13 @@ def main() -> None:
     sub.add_parser(
         "reset-killswitch", help="Desactiva el kill switch manualmente"
     ).set_defaults(func=cmd_reset_killswitch)
+
+    p_pr = sub.add_parser(
+        "paper-reset",
+        help="Archiva paper_trades a una tabla backup_<ts> y resetea PnL a $0",
+    )
+    p_pr.add_argument("--yes", action="store_true", help="Confirma la operación")
+    p_pr.set_defaults(func=cmd_paper_reset)
 
     p_tn = sub.add_parser("tune", help="Ejecuta auto-tune de thresholds")
     p_tn.add_argument("--force", action="store_true")
