@@ -402,6 +402,25 @@ def cmd_paper_reset(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_live_cleanup(_args: argparse.Namespace) -> None:
+    """Dispara cleanup_phantom_positions manualmente.
+
+    Ese cleanup normalmente corre cada 30min en LIVE mode, pero en paper
+    no corre. Con paper activo + LIVE residuales en la DB, las phantoms
+    se acumulan e inflan el dashboard. Este comando las limpia on-demand.
+    """
+    from src.copybot.executor import cleanup_phantom_positions
+
+    n = cleanup_phantom_positions(min_age_seconds=0)  # sin grace period
+    if n:
+        console.print(
+            f"[green]✓[/green] {n} phantom positions limpiadas "
+            "(no existen on-chain → marcadas closed_external)."
+        )
+    else:
+        console.print("[dim]Sin phantoms para limpiar.[/dim]")
+
+
 def cmd_validate_real_readiness(args: argparse.Namespace) -> None:
     """Checklist mecánica — corré después de >=24h paper post-fix.
 
@@ -817,6 +836,11 @@ def main() -> None:
     )
     p_vr.add_argument("--hours", type=int, default=24, help="Ventana de análisis en horas (default 24)")
     p_vr.set_defaults(func=cmd_validate_real_readiness)
+
+    sub.add_parser(
+        "live-cleanup",
+        help="Limpia live_trades fantasma comparando con posiciones on-chain",
+    ).set_defaults(func=cmd_live_cleanup)
 
     p_tn = sub.add_parser("tune", help="Ejecuta auto-tune de thresholds")
     p_tn.add_argument("--force", action="store_true")
