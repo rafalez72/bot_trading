@@ -161,7 +161,10 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
                         wallet[:10], cid[:10], oi, price, pid,
                     )
                 elif reason and reason not in ("duplicate",):
-                    log.debug(
+                    # 2026-05-06: subido de DEBUG a INFO para diagnóstico de
+                    # filtros que rechazan en silencio. Si genera demasiado log,
+                    # bajar a DEBUG después de validar que los filtros operan ok.
+                    log.info(
                         "skip OPEN  %s  cid=%s..  → %s",
                         wallet[:10], cid[:10], reason,
                     )
