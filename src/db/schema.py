@@ -142,24 +142,31 @@ CREATE INDEX IF NOT EXISTS idx_learn_time ON learning_events(created_at DESC);
 
 
 def _connect() -> sqlite3.Connection:
-    # timeout=30 → SQLite espera hasta 30s a que se libere el lock antes de
-    # tirar "database is locked". Con 3 runners paralelos (PM/HL/DX) escribiendo,
-    # evita que se pierdan INSERTs (eso causó trades fantasma 2026-05-05 —
-    # BUYs ejecutados on-chain sin row en live_trades).
-    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=30.0)  # autocommit
+    # timeout=5 + busy_timeout=5000 → SQLite espera hasta 5s antes de tirar
+    # "database is locked". ANTES era 30s pero eso bloquea el event loop
+    # asyncio cuando tx() se llama desde async tasks (HL/DX/PM runners).
+    # Con 30s + retry x5 (153s peor caso) el cycle del runner principal nunca
+    # completaba y disparaba watchdog kill loop. 2026-05-06 multiple hangs.
+    # Para INSERTs criticos (live_trades) hay outbox separado en
+    # _persist_live_trade_with_outbox que maneja sus propios retries.
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    # WAL: writers no bloquean readers (mucha mejor concurrencia que rollback journal)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
     except sqlite3.OperationalError:
         pass
     return conn
 
 
-def _retry_locked(fn, max_retries: int = 5, base_delay: float = 0.1):
-    """Retry helper para 'database is locked'."""
+def _retry_locked(fn, max_retries: int = 2, base_delay: float = 0.5):
+    """Retry helper para 'database is locked'.
+
+    Worst case: 5s busy_timeout + 0.5s sleep + 5s busy_timeout = ~10.5s.
+    Anteriormente: 5 retries con backoff exp + 30s busy_timeout = 153s.
+    El ciclo asyncio no puede tolerar 153s de bloqueo (watchdog kill).
+    """
     import time as _t
     last_err = None
     for attempt in range(max_retries):
@@ -169,7 +176,7 @@ def _retry_locked(fn, max_retries: int = 5, base_delay: float = 0.1):
             if "locked" not in str(e).lower():
                 raise
             last_err = e
-            _t.sleep(base_delay * (2 ** attempt))  # 0.1, 0.2, 0.4, 0.8, 1.6
+            _t.sleep(base_delay)
     raise last_err
 
 
