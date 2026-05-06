@@ -40,6 +40,8 @@ KILL_THRESHOLD_S = 600   # 10 min: force exit → docker restart
 # solo GET fetch entre cada restart.
 HEARTBEAT_FILE = str(DB_PATH.parent / "heartbeat.ts")
 
+_watchdog_started = False
+
 
 def record_heartbeat() -> None:
     """Llamar al final/inicio de cada cycle. Atomic FS write — NO toca DB."""
