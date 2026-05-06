@@ -42,7 +42,15 @@ MAX_WALLET_24H_PCT = float(os.getenv("MAX_WALLET_24H_PCT", "0.50"))
 # El timestamp de expiry se extrae del slug (formato: 'btc-updown-5m-1777505400').
 # Si no se puede parsear, NO bloquea (fail-open) — los slugs sin epoch suelen
 # ser markets de eventos largos (deportes, política).
-MIN_TIME_TO_EXPIRY_SECONDS = int(os.getenv("MIN_TIME_TO_EXPIRY_SECONDS", "600"))  # 10 min
+# 2026-05-06 (tarde): bajado de 600 (10min) a 180 (3min). Causa: post discover-now
+# el roster de wallets pasó a operar mayoritariamente markets cortos (5m crypto,
+# sport in-play). Con 600s el filtro rechazaba 100% de los trades nuevos
+# (40 rejects en 2h, 0 opens). Con 180s y STOPLOSS_SWEEP_SECONDS=15 + SL=20%,
+# el bot tiene tiempo para 6+ ciclos de SL antes que el market expire.
+# Cap defensivo: si el .env sobreescribe con valor >300, lo limito porque
+# valores altos demostraron rechazar el 100% del flow.
+_min_exp_user = int(os.getenv("MIN_TIME_TO_EXPIRY_SECONDS", "180"))
+MIN_TIME_TO_EXPIRY_SECONDS = min(_min_exp_user, 300)  # cap 5min
 
 # ---------- Live trading (Fase 5 - plata real) ----------
 # LIVE_MODE=false → paper trading (default).
