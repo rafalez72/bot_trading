@@ -275,6 +275,16 @@ async def run_loop(*, once: bool = False) -> None:
     except Exception as e:
         log.exception("drain_live_outbox falló al startup: %s", e)
 
+    # Watchdog en thread sistema (independiente del asyncio loop). Detecta
+    # cuelgues silenciosos del cycle principal y fuerza restart via docker
+    # `restart: unless-stopped` cuando supera 10min sin heartbeat.
+    # Caso real 2026-05-06: 7h de zombie post-cuelgue del WS.
+    try:
+        from src.copybot.health import start_watchdog
+        start_watchdog()
+    except Exception as e:
+        log.exception("watchdog falló al arrancar: %s", e)
+
     # Instalar el handler de errores → Telegram (rate-limited)
     try:
         from src.copybot.notifier import install_error_handler, startup
@@ -561,6 +571,14 @@ async def run_loop(*, once: bool = False) -> None:
                     f"wallets={len(wallets)} examined={total_examined} "
                     f"actions={total_actions} ({dt:.1f}s)"
                 )
+
+            # Heartbeat — el watchdog en thread sistema chequea esto cada 60s.
+            # Si pasan >10min sin update, mata el proceso → docker restart.
+            try:
+                from src.copybot.health import record_heartbeat
+                record_heartbeat()
+            except Exception as e:
+                log.warning("record_heartbeat: %s", e)
 
             if once:
                 return
