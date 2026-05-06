@@ -176,6 +176,24 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
     return len(new_trades), actions
 
 
+async def _safe_process_wallet(
+    client: PolymarketClient, wallet: str, timeout: float = 30.0
+) -> tuple[int, int]:
+    """Wrapper con timeout. Si una wallet se cuelga (httpx, CLOB, DB lock),
+    abortamos esa iteración y devolvemos (0,0) para que el gather no quede
+    bloqueado y el cycle complete a tiempo (anti-watchdog-kill 2026-05-06)."""
+    try:
+        return await asyncio.wait_for(
+            _process_wallet(client, wallet), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        log.warning("wallet %s: timeout (%.0fs) — saltando ciclo", wallet[:10], timeout)
+        return 0, 0
+    except Exception as e:
+        log.warning("wallet %s: error en _process_wallet: %s", wallet[:10], e)
+        return 0, 0
+
+
 def _maybe_send_daily_summary() -> None:
     """Si pasaron >=24h del último envío, manda resumen y graba ts."""
     import time as _t
@@ -365,6 +383,16 @@ async def run_loop(*, once: bool = False) -> None:
     discovery_state: dict = {"discovery_task": None}
     async with PolymarketClient() as client:
         while True:
+            # Heartbeat al INICIO del ciclo, no solo al final. Si la iteración
+            # entera se cuelga >600s en algún paso, el watchdog dispara KILL —
+            # pero registrando heartbeat acá garantizamos que cada ciclo iniciado
+            # cuenta como signal de vida, no solo los completados.
+            try:
+                from src.copybot.health import record_heartbeat
+                record_heartbeat()
+            except Exception:
+                pass
+
             cycle += 1
             wallets = _active_wallets()
             if not wallets:
@@ -377,12 +405,22 @@ async def run_loop(*, once: bool = False) -> None:
                 continue
 
             t0 = time.time()
-            # Polling paralelo: todos los wallets a la vez (httpx maneja concurrencia,
-            # SQLite con WAL + asyncio single-thread tolera escrituras intercaladas).
-            results = await asyncio.gather(
-                *(_process_wallet(client, w) for w in wallets),
-                return_exceptions=True,
-            )
+            # Polling paralelo: cada wallet con timeout individual de 30s
+            # (anti-cuelgue por httpx/CLOB/DB-lock) + timeout global de 90s
+            # como red de seguridad. Causa watchdog-kill repetido 2026-05-06.
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(_safe_process_wallet(client, w) for w in wallets),
+                        return_exceptions=True,
+                    ),
+                    timeout=90.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "gather de %d wallets excedió 90s — saltando este ciclo", len(wallets)
+                )
+                results = [(0, 0)] * len(wallets)
             total_examined = 0
             total_actions = 0
             for w, r in zip(wallets, results):
