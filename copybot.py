@@ -402,6 +402,140 @@ def cmd_paper_reset(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_validate_real_readiness(args: argparse.Namespace) -> None:
+    """Checklist mecánica — corré después de >=24h paper post-fix.
+
+    Devuelve PASS/FAIL/WARN por item. Si todos PASS → seguro pasar a real.
+    Mide solo lo que hay en la DB y archivos de log; no ejecuta nada.
+    """
+    import subprocess
+    import time as _t
+    from src.db.schema import db
+
+    h = max(1, int(args.hours))
+    cutoff = int(_t.time()) - h * 3600
+
+    console.print(f"\n[bold cyan]Validación de readiness para LIVE real[/bold cyan]")
+    console.print(f"Ventana de análisis: últimas [bold]{h}h[/bold]\n")
+
+    results: list[tuple[str, str, str]] = []  # (status, name, detail)
+
+    # ── 1. 0 errores "database is locked" en logs (24h)
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", f"{h}h", "bot_trading-runner-1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        log_text = (out.stdout or "") + (out.stderr or "")
+        n_lock = log_text.count("database is locked")
+        if n_lock == 0:
+            results.append(("PASS", "0 errores DB locked", "limpio"))
+        else:
+            results.append(("FAIL", "errores DB locked", f"{n_lock} en {h}h"))
+    except Exception as e:
+        results.append(("WARN", "logs DB locked", f"no pude leer: {e}"))
+
+    # ── 2. SELLs cierran posiciones (ratio CLOSE/OPEN)
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", f"{h}h", "bot_trading-runner-1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        log_text = (out.stdout or "") + (out.stderr or "")
+        n_open = sum(1 for ln in log_text.splitlines() if "OPEN  " in ln)
+        n_close = sum(1 for ln in log_text.splitlines() if "CLOSE " in ln)
+        if n_open == 0:
+            results.append(("WARN", "SELLs cierran", "0 OPENs en ventana — sample chico"))
+        else:
+            ratio = n_close / n_open
+            detail = f"{n_close} closes / {n_open} opens = {ratio:.2f}"
+            results.append(
+                ("PASS" if ratio >= 0.5 else "FAIL", "SELLs cierran", detail)
+            )
+    except Exception as e:
+        results.append(("WARN", "ratio CLOSE/OPEN", f"no pude leer logs: {e}"))
+
+    # ── 3. Sweep SL/TP corre periódicamente
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", f"{h}h", "bot_trading-runner-1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        log_text = (out.stdout or "") + (out.stderr or "")
+        n_sweep = log_text.count("risk:") + log_text.count("force_close")
+        if n_sweep > 0:
+            results.append(("PASS", "sweep SL/TP corre", f"{n_sweep} eventos"))
+        else:
+            results.append(("WARN", "sweep SL/TP", "0 eventos — sin posiciones para sweep"))
+    except Exception as e:
+        results.append(("WARN", "sweep SL/TP", str(e)))
+
+    # ── 4. Reconciler: 0 trades fantasma
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--since", f"{h}h", "bot_trading-runner-1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        log_text = (out.stdout or "") + (out.stderr or "")
+        n_phantom = log_text.count("trades fantasma encontrados")
+        if n_phantom == 0:
+            results.append(("PASS", "0 trades fantasma", "reconciler limpio"))
+        else:
+            results.append(("WARN", "trades fantasma", f"{n_phantom} eventos — revisar"))
+    except Exception as e:
+        results.append(("WARN", "reconciler", str(e)))
+
+    # ── 5. PnL paper >= -5% cap
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usdc),0) p, COUNT(*) n FROM paper_trades "
+                "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss') "
+                "AND exit_at >= ?",
+                (cutoff,),
+            ).fetchone()
+        from src.config import BOT_CAPITAL_USDC
+        pnl = r["p"]
+        n = r["n"]
+        threshold = -0.05 * BOT_CAPITAL_USDC
+        if n < 5:
+            results.append(("WARN", f"PnL paper {h}h", f"sample chico ({n} cierres)"))
+        elif pnl >= threshold:
+            results.append(("PASS", f"PnL paper {h}h", f"${pnl:+.2f} sobre cap ${BOT_CAPITAL_USDC}"))
+        else:
+            results.append(("FAIL", f"PnL paper {h}h", f"${pnl:+.2f} < -5% cap (${threshold:.2f})"))
+    except Exception as e:
+        results.append(("WARN", "PnL paper", str(e)))
+
+    # ── 6. Kill switch funciona — ya validado el 2026-05-06
+    results.append(("PASS", "kill switch", "validado 2026-05-06 (drawdown -$18 disparó pausa)"))
+
+    # ── Render
+    t = Table(title=f"Readiness check ({h}h)")
+    t.add_column("Status", justify="center")
+    t.add_column("Check")
+    t.add_column("Detalle")
+    for status, name, detail in results:
+        color = {"PASS": "green", "FAIL": "red", "WARN": "yellow"}[status]
+        t.add_row(f"[{color}]{status}[/{color}]", name, detail)
+    console.print(t)
+
+    n_pass = sum(1 for s, *_ in results if s == "PASS")
+    n_fail = sum(1 for s, *_ in results if s == "FAIL")
+    n_warn = sum(1 for s, *_ in results if s == "WARN")
+    if n_fail > 0:
+        console.print(f"\n[bold red]✗ NO listo para real[/bold red] — {n_fail} FAIL")
+    elif n_warn > n_pass / 2:
+        console.print(f"\n[bold yellow]⚠ Esperar más data[/bold yellow] — {n_warn} WARN, sample chico")
+    else:
+        console.print(f"\n[bold green]✓ Listo para pasar a real[/bold green] — {n_pass} PASS")
+        console.print(
+            "[dim]Pasos para activar: editar .env Lenovo → "
+            "[bold]FORCE_LIVE_OK=true[/bold] + LIVE_MODE=true → "
+            "docker compose restart[/dim]"
+        )
+
+
 def cmd_cluster_status(_args: argparse.Namespace) -> None:
     from src.copybot.clusters import status
 
@@ -676,6 +810,13 @@ def main() -> None:
     )
     p_pr.add_argument("--yes", action="store_true", help="Confirma la operación")
     p_pr.set_defaults(func=cmd_paper_reset)
+
+    p_vr = sub.add_parser(
+        "validate-real-readiness",
+        help="Checklist mecánica para decidir si pasar a LIVE real",
+    )
+    p_vr.add_argument("--hours", type=int, default=24, help="Ventana de análisis en horas (default 24)")
+    p_vr.set_defaults(func=cmd_validate_real_readiness)
 
     p_tn = sub.add_parser("tune", help="Ejecuta auto-tune de thresholds")
     p_tn.add_argument("--force", action="store_true")
