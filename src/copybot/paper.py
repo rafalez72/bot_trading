@@ -17,15 +17,21 @@ import json
 import logging
 from typing import Iterable
 
+import time
+
 from src.config import (
     BOT_CAPITAL_USDC,
     COPY_BASE_USDC,
     MAX_PER_MARKET_PCT,
+    MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
     MIN_MARKET_VOLUME_USDC,
+    MIN_TIME_TO_EXPIRY_SECONDS,
 )
+from src.copybot._slug_expiry import parse_slug_expiry
 from src.copybot.learning import on_paper_trade_closed
 from src.copybot.realism import (
+    expected_net_pnl,
     post_close_costs,
     realistic_entry_price,
     realistic_exit_price,
@@ -53,6 +59,8 @@ REJECT_REASONS = {
     "no_subscription", "inactive", "duplicate", "kill_switch", "capital_full",
     "market_concentration", "low_liquidity", "low_volume", "extreme_price",
     "category_blocked", "policy_blocked", "cluster_blocked", "stale_trade",
+    "expires_too_soon", "diversification_cap", "expected_pnl_too_low",
+    "wallet_concentration",
 }
 
 # Trades del wallet original más viejos que esto cuando los procesamos = no
@@ -192,6 +200,22 @@ def open_position(
         # Si no está en `markets`, creamos stub con slug/title del raw del trade
         # (cubre los mercados negRisk que la Gamma API no devuelve por conditionId)
         m = _ensure_market_stub(conn, condition_id, raw)
+
+        # Smart expiry filter: bloquea markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS
+        # (default 600s = 10min). Cubre slugs con epoch al final, slugs con
+        # date+hour ET, y -YYYY-MM-DD$ al final. Fail-open si no parsea.
+        slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
+        if not slug and m:
+            try:
+                slug = m["slug"]
+            except (KeyError, IndexError):
+                slug = None
+        expiry_ts = parse_slug_expiry(slug)
+        if expiry_ts is not None:
+            time_left = expiry_ts - int(time.time())
+            if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
+                return None, "expires_too_soon"
+
         cat = None
         if m:
             liq = m["liquidity"]
@@ -221,11 +245,47 @@ def open_position(
         if price < 0.05 or price > 0.95:
             return None, "extreme_price"
 
+        # Diversification cap: si un solo wallet ya hizo > MAX_WALLET_24H_PCT
+        # de TODOS los trades en 24h, rechazamos. Guard total>=10 para sample chico.
+        div_row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
+            FROM paper_trades
+            WHERE entry_at >= strftime('%s','now') - 86400
+            """,
+            (source_wallet,),
+        ).fetchone()
+        total_24h = (div_row["total"] or 0) if div_row else 0
+        this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
+        if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
+            return None, "diversification_cap"
+
         size_usdc = COPY_BASE_USDC * sizing
 
         # Realismo: el bot paga MÁS que el source por slippage de ejecución
         liquidity = m["liquidity"] if m else None
         price = realistic_entry_price(price, liquidity)
+
+        # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
+        # no vale la pena. Descarta trades con sizing_mult muy chico.
+        from src.config import PAPER_MIN_EXPECTED_PNL_USDC, PAPER_MAX_PER_WALLET_USDC
+        expected = expected_net_pnl(size_usdc)
+        if expected < PAPER_MIN_EXPECTED_PNL_USDC:
+            return None, "expected_pnl_too_low"
+
+        # Cap por wallet: forzosa diversificación entre traders.
+        wallet_open = conn.execute(
+            """
+            SELECT COALESCE(SUM(entry_size_usdc), 0) as v
+            FROM paper_trades
+            WHERE source_wallet=? AND status='open'
+            """,
+            (source_wallet,),
+        ).fetchone()["v"]
+        if wallet_open + size_usdc > PAPER_MAX_PER_WALLET_USDC + EPSILON:
+            return None, "wallet_concentration"
 
         # Cap por mercado: max MAX_PER_MARKET_PCT del capital en un solo cid
         per_market_cap = BOT_CAPITAL_USDC * MAX_PER_MARKET_PCT

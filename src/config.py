@@ -83,6 +83,16 @@ POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 # Default 2 — es lo que usa la cuenta creada via email/Magic en polymarket.com
 POLYMARKET_SIG_TYPE = int(os.getenv("POLYMARKET_SIG_TYPE", "2"))
 
+# ---------- Paper: mejoras simétricas con LIVE ----------
+# Antes paper.py no tenía estos filtros que sí tenía executor.py — eso hacía que
+# el paper "test" fuera más permisivo que el live "real" y fallara la promesa de
+# "test = real". Agregados 2026-05-06.
+# Cap por wallet copiado en paper (forzosa diversificación).
+PAPER_MAX_PER_WALLET_USDC = float(os.getenv("PAPER_MAX_PER_WALLET_USDC", "8.0"))
+
+# Mínimo de PnL esperado para que el trade paper se abra (anti-fees-comen-todo).
+PAPER_MIN_EXPECTED_PNL_USDC = float(os.getenv("PAPER_MIN_EXPECTED_PNL_USDC", "0.30"))
+
 # ---------- Live trading: mejoras de fricción ----------
 # Cap por wallet copiado en live (forzosa diversificación).
 # Default $10 con cap total $30 → max 3 wallets concurrentes con full size.

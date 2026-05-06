@@ -108,8 +108,8 @@ def _help_text() -> str:
     return (
         "*Comandos disponibles*\n"
         "/status — estado breve del bot\n"
-        "/killswitch — desactiva el kill switch\n"
-        "/resetkill — alias de /killswitch\n"
+        "/pause — pausa el bot (no abre nuevas posiciones)\n"
+        "/resume — reanuda el bot (alias: /killswitch, /resetkill)\n"
         "/help — esta ayuda"
     )
 
@@ -125,17 +125,32 @@ def _handle_command(cmd: str) -> str | None:
         except Exception as e:
             log.exception("status failed: %s", e)
             return f"⚠️ Error al leer estado: `{str(e)[:200]}`"
-    if norm in ("/killswitch", "/resetkill"):
+    if norm == "/pause":
+        try:
+            from src.copybot.risk import kill_switch_status, pause_bot
+            ks = kill_switch_status()
+            if ks.get("active"):
+                return "ℹ️ Bot ya estaba pausado.\nMotivo: " + (ks.get("reason") or "—")
+            pause_bot(reason="pausa manual via Telegram")
+            return (
+                "⏸️ *Bot pausado*\n"
+                "No se abrirán nuevas posiciones. El sweep SL/TP sigue corriendo.\n"
+                "Para reanudar: /resume"
+            )
+        except Exception as e:
+            log.exception("pause failed: %s", e)
+            return f"⚠️ No se pudo pausar: `{str(e)[:200]}`"
+    if norm in ("/resume", "/killswitch", "/resetkill"):
         try:
             from src.copybot.risk import kill_switch_status, reset_kill_switch
             ks = kill_switch_status()
             if not ks.get("active"):
-                return "ℹ️ Kill switch ya estaba inactivo. Nada que hacer."
+                return "ℹ️ Bot ya estaba activo. Nada que hacer."
             reset_kill_switch()
-            return "✅ Kill switch *desactivado*. Bot reanudado."
+            return "▶️ *Bot reanudado*\nVuelve a abrir posiciones."
         except Exception as e:
-            log.exception("reset kill failed: %s", e)
-            return f"⚠️ No se pudo resetear: `{str(e)[:200]}`"
+            log.exception("resume failed: %s", e)
+            return f"⚠️ No se pudo reanudar: `{str(e)[:200]}`"
     return None  # comando no reconocido — no respondemos para evitar ruido
 
 

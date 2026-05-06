@@ -188,6 +188,22 @@ def reset_kill_switch() -> None:
         pass
 
 
+def pause_bot(reason: str = "manual pause") -> None:
+    """Activa el kill switch manualmente (bloquea nuevos opens).
+
+    A diferencia del kill switch automático (que dispara por drawdown),
+    este es voluntario — el usuario lo activa via /pause en Telegram para
+    detener el bot temporalmente sin tocar config. Para reanudar:
+    /resume (o /killswitch).
+    """
+    _set_kill(True, reason)
+    try:
+        from src.copybot.notifier import kill_switch_activated
+        kill_switch_activated(reason=reason, pnl_24h=0.0)
+    except Exception:
+        pass
+
+
 # ---------------- Stop-loss / take-profit ----------------
 
 async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:

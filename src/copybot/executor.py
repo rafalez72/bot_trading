@@ -266,93 +266,9 @@ def _log_reject(source_wallet, condition_id, outcome_index, side, price, reason,
     log.warning("failed to log reject after 5 retries: %s", last_err)
 
 
-_MONTH_MAP = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-}
-
-
-def _parse_slug_expiry(slug: str | None) -> int | None:
-    """Extrae el timestamp UTC de expiry del slug usando múltiples estrategias.
-
-    Hallazgo del 2026-05-01: el filtro original solo cubría slugs con epoch al
-    final (`-5m-1777505400`). Pero hay otros formatos:
-      • `bitcoin-up-or-down-may-1-2026-4am-et`    → fecha + hora ET
-      • `atp-tiffon-coppeja-2026-05-01`           → solo fecha (deporte)
-      • `lol-gx-navi-2026-04-29`                  → idem (esports)
-
-    Estrategias en orden:
-      1. Epoch unix al final.
-      2. <month>-<day>-<year>-<H><am|pm>(-et)? → fecha + hora ET (UTC-4 EDT).
-      3. -YYYY-MM-DD$ al final → fecha cruda. CONSERVADOR: usamos las 00:00 UTC
-         del día como expiry, así si la fecha es HOY o pasado → time_left negativo
-         → reject. Para deportes esto es seguro porque el match puede terminar
-         en cualquier momento del día.
-
-    Devuelve epoch UTC o None si no parseó.
-    """
-    if not slug:
-        return None
-    s = slug.lower()
-
-    # 1. Epoch al final
-    m = re.search(r"-(\d{10,13})$", s)
-    if m:
-        try:
-            ts = int(m.group(1))
-        except (TypeError, ValueError):
-            ts = None
-        if ts is not None:
-            if ts > 10**12:
-                ts = ts // 1000
-            if 1700000000 < ts < 1900000000:
-                return ts
-
-    # 2. <month>-<day>-<year>-<H><am|pm>(-et)?
-    months_pat = "|".join(_MONTH_MAP.keys())
-    m = re.search(
-        rf"-({months_pat})-(\d{{1,2}})-(\d{{4}})-(\d{{1,2}})(am|pm)(?:-et)?$",
-        s,
-    )
-    if m:
-        try:
-            from datetime import datetime, timezone, timedelta
-            month = _MONTH_MAP[m.group(1)]
-            day = int(m.group(2))
-            year = int(m.group(3))
-            hour = int(m.group(4))
-            if m.group(5) == "pm" and hour != 12:
-                hour += 12
-            if m.group(5) == "am" and hour == 12:
-                hour = 0
-            # ET = UTC-4 (EDT, en vigor mar-nov, mayoría del año). Convertir
-            # local ET a UTC sumando 4h.
-            utc_dt = datetime(year, month, day, hour, 0, tzinfo=timezone.utc) + timedelta(hours=4)
-            return int(utc_dt.timestamp())
-        except Exception:
-            pass
-
-    # 3. -YYYY-MM-DD$ al final → fecha cruda. Usamos END of day (23:59:59 UTC)
-    # como expiry asumido. Razón: markets deportivos típicamente se juegan a la
-    # noche/tarde y resuelven por la noche. Si usamos 00:00 UTC del día, todo
-    # partido de "hoy" queda con time_left negativo y se rechaza. Con 23:59:59
-    # permitimos entrar durante el día y el filtro de 10min bloquea solo el
-    # tail end. Si la fecha es ayer o anterior → expiry pasado → block (correcto).
-    m = re.search(r"-(\d{4})-(\d{1,2})-(\d{1,2})$", s)
-    if m:
-        try:
-            from datetime import datetime, timezone
-            year = int(m.group(1))
-            month = int(m.group(2))
-            day = int(m.group(3))
-            event_utc = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
-            return int(event_utc.timestamp())
-        except Exception:
-            pass
-
-    return None
+# _MONTH_MAP y _parse_slug_expiry movidos a _slug_expiry.py para que paper.py
+# también pueda usarlos sin import circular. Re-exportados acá por compat.
+from src.copybot._slug_expiry import parse_slug_expiry as _parse_slug_expiry  # noqa: F401, E402
 
 
 def _apply_dry_slippage(side: str, price: float) -> float:
