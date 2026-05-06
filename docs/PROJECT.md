@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-05 (incidente trades fantasma + 9 fixes críticos: SDK v2, reconciler, WAL, _last_price, Telegram sync mode)
+> **Última actualización**: 2026-05-06 (incidente LIVE perdiendo + bug SQLite locked + emergency switch a paper + paridad paper=real + comandos /pause)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -162,12 +162,20 @@ DB_PATH=data/copybot.db
 LOG_LEVEL=INFO
 
 # Capital y trading
-BOT_CAPITAL_USDC=100.0           # cap fijo (no compounding)
-COPY_BASE_USDC=5.0               # apuesta base por copia (paper)
+BOT_CAPITAL_USDC=96.0            # cap fijo (no compounding) — matchea balance Polymarket
+COPY_BASE_USDC=4.0               # apuesta base por copia (paper) — bajado de 5
 COPY_POLL_SECONDS=5              # polling paralelo (gather), bajado de 10
+MAX_TRADE_AGE_SECONDS=60         # rechaza copies con >60s antigüedad (filtro stale_trade,
+                                 # post-2026-05-06: caso LoL Game 2 -$10x2)
+
+# Paper-only filters (paridad con LIVE — post-2026-05-06)
+PAPER_MIN_EXPECTED_PNL_USDC=0.30  # rechaza si PnL esperado < umbral
+PAPER_MAX_PER_WALLET_USDC=8.0     # cap por wallet en open (paper)
 
 # Live trading (Fase 5)
-LIVE_MODE=true                   # activa executor.py
+LIVE_MODE=true                   # activa executor.py — necesita FORCE_LIVE_OK también
+FORCE_LIVE_OK=false              # GUARD post-incidente 2026-05-06. Sin esto = paper.
+                                 # Setear true SOLO después de validar 24h paper.
 LIVE_DRY_RUN=true                # simula órdenes (dry-run)
 LIVE_CAPITAL_USDC=100.0
 LIVE_BASE_USDC=10.0              # subido de 5 → 10 para justificar fees
@@ -318,6 +326,12 @@ python copybot.py backtest [--hours 168]     # replay histórico
 python copybot.py reset-killswitch           # desactivar kill switch manual
 python copybot.py reset-thresholds           # volver thresholds del selector a defaults
 
+# Paper / live mantenimiento (post-2026-05-06)
+python copybot.py paper-reset --yes          # archiva paper_trades a backup_<ts>, PnL=$0
+python copybot.py live-cleanup               # limpia live_trades fantasma (compara on-chain)
+python copybot.py validate-real-readiness --hours 24
+                                             # checklist 6-puntos para decidir paso a real
+
 # Dashboard
 python copybot.py serve [--port 8000]        # FastAPI + PWA
 
@@ -372,9 +386,11 @@ python copybot.py telegram-test              # mensaje de prueba
 
 **Comandos entrantes (telegram_listener, long polling)**:
 - `/status` — modo, kill_switch, PnL 24h, wallets activos, posiciones abiertas
-- `/killswitch` o `/resetkill` — desactiva el kill switch
+- `/pause` — **ACTIVA** el kill switch (bloquea nuevos opens). Post-2026-05-06.
+- `/resume` — desactiva el kill switch. Aliases legacy: `/killswitch`, `/resetkill`
 - `/help` — lista de comandos
-- Solo responde al `TELEGRAM_CHAT_ID` configurado en `.env` (otros chat_ids se ignoran).
+- Solo responde al PRIMER chat_id de `TELEGRAM_CHAT_ID` (owner). Los amigos
+  suscriptos solo reciben notifs (read-only).
 
 **Desactivadas (stubs en el código):**
 - `trader_dropped` (eliminada por pedido del usuario)
@@ -709,7 +725,129 @@ PnL acumulado: +$1,470.66 sobre cap $100
 
 ## 16. Bitácora de avances (changelog cronológico)
 
-### 2026-05-06 — tuning .env + bug RECONCILED + WS + auto-block n>=10
+### 2026-05-06 (tarde) — incidente LIVE perdiendo + bug SQLite locked + emergency switch a paper + paridad paper=real
+
+**Hito**: bot LIVE estuvo varias horas operando con un bug que hacía que
+solo se procesaran BUYs (los SELLs fallaban con "database is locked" y se
+descartaban silenciosamente, dejando posiciones huérfanas que no cerraban).
+Usuario detectó y reportó "todo el día solo compro y nunca vendio" + perdiendo
+plata real. Resuelto con 6 commits + emergency switch a paper.
+
+#### Diagnóstico (commit ee5c825)
+**Bug del SQLite lock**: 3 runners (PM/HL/DX) + sweep + telegram listener +
+reconciler + funding update todos abren conexiones SQLite y hacen
+`BEGIN IMMEDIATE` en paralelo. Con `busy_timeout=5s` + `_retry_locked` x2
+(commit `0d5644a`), el peor caso es ~10.5s. Cuando coincidían varios writers,
+algunos excedían el timeout → `sqlite3.OperationalError: database is locked`
+→ excepción en `runner._process_wallet` → SELL descartado.
+
+**Bug del cursor**: en `runner._process_wallet`, `last_ts = max(last_ts, ts)`
+estaba FUERA del try/except. Cuando la SELL fallaba, igual se avanzaba el
+cursor → la SELL se perdía permanentemente → la posición quedaba abierta
+indefinidamente. Solo se cerraban por SL/TP/settle eventualmente, pero las
+de mercados que cierran en out-of-the-money quedaban a $0.
+
+#### Fix #1: lock + cursor + emergency guard FORCE_LIVE_OK (`ee5c825`)
+1. **`src/db/schema.py`**: agregado `threading.RLock` proceso-wide en `tx()`.
+   Las escrituras intra-proceso se serializan en Python (~ms) en vez de
+   rebotar contra SQLite. `busy_timeout` subido a 15s como red para
+   choque inter-proceso (runner ↔ FastAPI server).
+2. **`src/copybot/runner.py`**: si la op SYNC tira excepción, NO avanzar
+   cursor. La SELL fallida se reintenta en el próximo cycle. `break` del
+   for para no procesar trades dependientes después.
+3. **`src/config.py`**: nueva guarda `FORCE_LIVE_OK`. `LIVE_MODE` ahora =
+   `LIVE_REQUESTED && FORCE_LIVE_OK`. Sin `FORCE_LIVE_OK=true` en .env, el
+   bot opera en paper. Es un seguro de "no arranque real por accidente
+   post-incidente".
+
+#### Fix #2: nuevos comandos CLI
+- **`paper-reset --yes`** (`8274917`): archiva `paper_trades` a
+  `paper_trades_backup_<ts>` y trunca. PnL paper arranca en $0. Mismo patrón
+  del wipe del 2026-05-01.
+- **`validate-real-readiness [--hours 24]`** (`7bdfa4b`): checklist mecánica
+  6 puntos sobre logs+DB. PASS/FAIL/WARN. Veredicto final ✓/⚠/✗ para decidir
+  si pasar a real. Lee de `docker logs`, mide errores DB locked,
+  ratio CLOSE/OPEN, sweep activity, reconciler phantom count, PnL paper N
+  horas vs -5% cap.
+- **`live-cleanup`** (`49f09fc`): dispara `cleanup_phantom_positions`
+  on-demand. Compara `live_trades.status=open` contra
+  `data-api/positions` y marca como `closed_external` los que no existen
+  on-chain. Antes solo corría auto cada 30min en LIVE; en paper no corría →
+  fantasmas se acumulaban.
+
+#### Fix #3: filtro `stale_trade` (`f68eefe`)
+Caso real: 2 trades LoL Game 2 entry@0.45 → match terminó minutos después →
+contratos perdedores cayeron a $0.001 → -$10 cada uno.
+Diagnóstico: el wallet entró tarde al match, el polling agregó 5-7s de
+latencia, y el trade ya tenía >60s de antigüedad cuando lo procesamos.
+Copiamos un trade donde el edge ya se evaporó.
+
+Filtro nuevo en `paper.open_position` y `executor._open_position_validate`:
+si `int(time.time()) - timestamp > MAX_TRADE_AGE_SECONDS` (default 60),
+reject `stale_trade`. Override vía `MAX_TRADE_AGE_SECONDS` env.
+
+#### Fix #4: paridad "paper test = LIVE real" + `/pause` Telegram (`14a337b`)
+**Hallazgo**: paper.py tenía MENOS filtros que executor.py. El "test paper"
+era más permisivo que el real → falsa sensación de "esto va a funcionar
+en real" cuando en real esos trades ni se abrían.
+
+4 filtros portados de executor.py a paper.py:
+- `expires_too_soon` — smart expiry (parsea slug por epoch/date+hour ET/YYYY-MM-DD)
+- `diversification_cap` — rechaza si 1 wallet > 50% trades 24h (guard total>=10)
+- `expected_pnl_too_low` — rechaza si PnL esperado < `PAPER_MIN_EXPECTED_PNL_USDC`
+  (default 0.30, override vía env)
+- `wallet_concentration` — rechaza si wallet ya tiene > `PAPER_MAX_PER_WALLET_USDC`
+  open (default 8.0, override vía env)
+
+Refactor: `_parse_slug_expiry` y `_MONTH_MAP` extraídos de executor.py a
+**`src/copybot/_slug_expiry.py`** para evitar import circular (executor
+importa de paper, no al revés).
+
+**Comandos Telegram nuevos**:
+- **`/pause`** — ACTIVA el kill switch (bloquea nuevos opens). Antes no
+  había forma de pausar el bot sin SSH.
+- **`/resume`** — alias claro de `/killswitch` (que era confuso —
+  DESACTIVA, no ACTIVA). `/killswitch` y `/resetkill` siguen como aliases
+  legacy.
+- Nueva función `pause_bot(reason)` en `risk.py` — espejo de
+  `reset_kill_switch()`.
+
+#### Acciones manuales de la sesión (vía SSH a Lenovo)
+1. `git pull && docker compose pull && docker compose up -d` →
+   containers recreados con imagen nueva post-`f68eefe`.
+2. Edit `.env`: `BOT_CAPITAL_USDC=96.0`, `COPY_BASE_USDC=4.0` (matchea el
+   real disponible en polymarket.com). Backup en `.env.bak.precap96`.
+3. `python copybot.py reset-killswitch` → reanudar tras drawdown -$21.
+4. `python copybot.py live-cleanup` → **12 phantom positions limpiadas**.
+5. `python copybot.py paper-reset --yes` → **1162 trades archivados** en
+   `paper_trades_backup_1778086594`. PnL arranca en $0.
+
+#### Estado post-fix
+- Bot operando en **paper mode** (LIVE_MODE forzado a False por guard)
+- Cap $96, base $4 (matchea el balance real disponible)
+- 20 wallets activos, 25 dropped
+- Kill switch desactivado
+- Todos los filtros del LIVE están en paper → "test = real" verdadero
+- Para pasar a real: setear `FORCE_LIVE_OK=true` + `LIVE_MODE=true` en .env
+  + restart. **No tocar real hasta que `validate-real-readiness --hours 24`
+  dé 6 PASS verdes.**
+
+#### Lecciones
+1. **SQLite con WAL + multi-writer no es free**. busy_timeout solo no
+   alcanza con >3 writers concurrentes. Lock Python proceso-wide es
+   obligatorio para serializar.
+2. **Nunca actualizar el cursor antes de confirmar la op**. Es el patrón
+   "optimista" — funciona si la op no falla. Falla en silencio cuando sí.
+3. **Paper ≠ LIVE en filtros**. Los pre-checks tienen que ser idénticos
+   o el "test" no valida nada. Antes de hoy paper era 4 filtros más
+   permisivo que LIVE.
+4. **Comandos Telegram con nombres confusos = bug humano**. `/killswitch`
+   suena a "activar killswitch" pero hace lo opuesto. `/pause` y `/resume`
+   son explícitos.
+
+---
+
+### 2026-05-06 (madrugada) — tuning .env + bug RECONCILED + WS + auto-block n>=10
 
 **Hito**: sesión de optimización tras observar que el bot abría solo 1 trade
 real propio en 24h (de 24 opens totales, 15 eran RECONCILED sin atribución
