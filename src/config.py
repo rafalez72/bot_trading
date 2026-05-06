@@ -47,7 +47,13 @@ MIN_TIME_TO_EXPIRY_SECONDS = int(os.getenv("MIN_TIME_TO_EXPIRY_SECONDS", "600"))
 # ---------- Live trading (Fase 5 - plata real) ----------
 # LIVE_MODE=false → paper trading (default).
 # LIVE_MODE=true  → ejecuta órdenes reales en Polymarket CLOB.
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
+# EMERGENCY_PAPER_LOCK (2026-05-06): forzamos paper mode hasta validar el
+# fix del bug de SQLite locks (SELLs perdidos → posiciones que no cierran).
+# Para reactivar real: setear FORCE_LIVE_OK=true en .env, validar 24h, después
+# remover esta guarda. Default: requiere flag explícito.
+_LIVE_REQUESTED = os.getenv("LIVE_MODE", "false").lower() == "true"
+_FORCE_LIVE_OK = os.getenv("FORCE_LIVE_OK", "false").lower() == "true"
+LIVE_MODE = _LIVE_REQUESTED and _FORCE_LIVE_OK
 
 # LIVE_DRY_RUN=true → loguea las órdenes pero no las manda al CLOB.
 # Útil para validar el flujo sin gastar plata. Funciona solo si LIVE_MODE=true.

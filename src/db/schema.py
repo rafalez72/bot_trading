@@ -10,10 +10,22 @@ Tablas:
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from typing import Iterator
 
 from src.config import DB_PATH
+
+# Lock process-wide para serializar TODAS las escrituras del proceso. Antes,
+# 3 runners (PM/HL/DX) + sweeps + listener + reconciler + funding hacían
+# BEGIN IMMEDIATE en paralelo y busy_timeout (5s) podía no alcanzar →
+# "database is locked" → SELLs en runner._process_wallet caían en except y
+# las posiciones nunca cerraban (incidente 2026-05-06: sólo BUYs, 0 SELLs).
+# Con este Lock, las txns intra-proceso esperan en Python (~ms) en vez de
+# rebotar contra SQLite. busy_timeout queda como red de seguridad para el
+# choque runner↔server (procesos distintos del docker compose).
+# RLock = re-entrante por si algún path llama tx() anidado.
+_TX_LOCK = threading.RLock()
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -142,18 +154,18 @@ CREATE INDEX IF NOT EXISTS idx_learn_time ON learning_events(created_at DESC);
 
 
 def _connect() -> sqlite3.Connection:
-    # timeout=5 + busy_timeout=5000 → SQLite espera hasta 5s antes de tirar
-    # "database is locked". ANTES era 30s pero eso bloquea el event loop
-    # asyncio cuando tx() se llama desde async tasks (HL/DX/PM runners).
-    # Con 30s + retry x5 (153s peor caso) el cycle del runner principal nunca
-    # completaba y disparaba watchdog kill loop. 2026-05-06 multiple hangs.
-    # Para INSERTs criticos (live_trades) hay outbox separado en
-    # _persist_live_trade_with_outbox que maneja sus propios retries.
-    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=5.0)
+    # busy_timeout=15s = red de seguridad para choque INTER-PROCESO
+    # (runner ↔ server FastAPI escriben al mismo .db). Para choque
+    # intra-proceso usamos _TX_LOCK (Python lock) que es ~ms.
+    # Antes 5s + 2 retries no alcanzaba con 3 runners + sweep + listener.
+    # Antes-antes 30s bloqueaba el event loop y disparaba watchdog kill.
+    # 15s es punto medio — y al estar serializadas por _TX_LOCK casi nunca
+    # se llega a esperar SQLite-level.
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=15.0)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA synchronous=NORMAL")
     except sqlite3.OperationalError:
         pass
@@ -430,19 +442,25 @@ def db() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def tx() -> Iterator[sqlite3.Connection]:
-    """Transacción explícita con retry on database is locked."""
-    conn = _connect()
-    try:
-        # Retry el BEGIN si está locked (timeout=30 normalmente lo cubre, pero
-        # con 3 runners paralelos a veces da locked igual)
-        _retry_locked(lambda: conn.execute("BEGIN IMMEDIATE"))
-        yield conn
-        _retry_locked(lambda: conn.execute("COMMIT"))
-    except Exception:
+    """Transacción explícita serializada por process-wide lock.
+
+    El _TX_LOCK garantiza que dentro del proceso nunca haya dos BEGIN
+    IMMEDIATE concurrentes — la espera ocurre en Python (~ms) en vez de
+    rebotar con "database is locked" cuando busy_timeout no alcanza.
+    busy_timeout=15s sigue actuando para choque inter-proceso (runner ↔
+    FastAPI server). _retry_locked queda como red por si acaso.
+    """
+    with _TX_LOCK:
+        conn = _connect()
         try:
-            conn.execute("ROLLBACK")
+            _retry_locked(lambda: conn.execute("BEGIN IMMEDIATE"))
+            yield conn
+            _retry_locked(lambda: conn.execute("COMMIT"))
         except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()

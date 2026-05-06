@@ -129,6 +129,12 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
             last_ts = max(last_ts, ts)
             continue
 
+        # Flag para NO avanzar el cursor si la op falla. Antes (incidente
+        # 2026-05-06) un SELL que fallaba con "database is locked" caía en
+        # except, pero last_ts se actualizaba igual (línea de afuera del
+        # try) → la SELL se perdía para siempre y la posición quedaba
+        # abierta indefinidamente. Solo BUYs se ejecutaban.
+        op_ok = True
         try:
             # open_position y close_position son SYNC (httpx sync al CLOB +
             # tx() con BEGIN IMMEDIATE en SQLite). Si los corremos directo
@@ -176,8 +182,18 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
                     )
         except Exception as e:
             log.exception("error procesando trade %s: %s", tid, e)
+            op_ok = False
 
-        last_ts = max(last_ts, ts)
+        # Solo avanzamos el cursor si la op no tiró excepción. Para SELLs
+        # fallidos esto fuerza al próximo ciclo a reintentar — la posición
+        # NO queda huérfana.
+        if op_ok:
+            last_ts = max(last_ts, ts)
+        else:
+            # Importante: si esta op falla, no procesamos las siguientes
+            # tampoco — porque podrían depender (ej. una SELL después de
+            # un BUY del mismo cid). Volvemos al cycle.
+            break
 
     if last_ts > cursor:
         _set_cursor(wallet, last_ts)
