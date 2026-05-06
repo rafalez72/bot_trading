@@ -709,6 +709,79 @@ PnL acumulado: +$1,470.66 sobre cap $100
 
 ## 16. Bitácora de avances (changelog cronológico)
 
+### 2026-05-06 — tuning .env + bug RECONCILED + WS + auto-block n>=10
+
+**Hito**: sesión de optimización tras observar que el bot abría solo 1 trade
+real propio en 24h (de 24 opens totales, 15 eran RECONCILED sin atribución
+de wallet). Aplicadas mejoras en 3 frentes:
+
+#### Tuning del .env (sin restart de imagen — solo `docker compose restart`)
+| Var | Antes | Ahora | Por qué |
+|---|---|---|---|
+| `LIVE_CAPITAL_USDC` | 100 | 130 | Aprovecha balance USDC ~$144 con buffer |
+| `LIVE_BASE_USDC` | 5 | 7 | Mejor ratio fees/upside |
+| `LIVE_MAX_PER_WALLET_USDC` | 10 | 15 | Cortar 97 wallet_concentration/24h |
+| `LIVE_MAX_SLIPPAGE_PCT` | 0.03 | 0.04 | Cortar 59 order_unmatched/24h |
+| `LIVE_MIN_EXPECTED_PNL_USDC` | 0.50 | 0.40 | Con BASE=7 entra más sin fees-trap |
+| `TRAIL_ACTIVATION_PCT` | 0.50 | 0.30 | Captura wins de +30% que sino reverten |
+| `HL_MAX_FILLS_PER_WALLET_24H` | (default 30) | 60 | Deja swing traders no scalpers |
+| `DX_MAX_FILLS_PER_WALLET_24H` | (default 30) | 60 | Idem DX |
+
+#### Manual category block: sports-mlb
+`category_perf` lo bloqueó manualmente (UPDATE directo, runner stop+start).
+Razón: 0 wins / 13+ losses combinado paper+live, pero n=10 estaba debajo del
+umbral n>=15 (ahora bajado a 10 también, ver código).
+
+#### Cambios de código (commit c4bbc94)
+
+1. **`reconciler.py` — atribución mejorada**
+   Antes: cualquier fill on-chain del proxy sin row en `live_trades` quedaba
+   como `source_wallet='RECONCILED'` → bandit/learning/categories ciegos.
+   Ahora: cruza contra `trades` (mismo cid+outcome+side=BUY, ±60s, sub
+   active/paused) y asigna el wallet más cercano si lo encuentra. Fallback a
+   'RECONCILED' como antes.
+
+2. **`executor.py` — outbox para INSERTs fallidos**
+   Antes: si el INSERT a live_trades fallaba 5 veces por DB locked, el trade
+   real quedaba sin tracking → SL/TP no aplicaba → reconciler lo rescataba
+   como RECONCILED. Ahora: 5 retries exponenciales (0.1→1.6s) sobre 30s de
+   busy_timeout. Si todos fallan, escribe el payload a
+   `data/live_trades_outbox.jsonl` y notifica Telegram. El runner llama
+   `drain_live_outbox()` al startup.
+
+3. **`categories.py` — `MIN_TRADES_FOR_BLOCK` 15→10**
+   Captura categorías malas más temprano. Unblock sigue requiriendo
+   n>=20 (= MIN*2).
+
+4. **`ws_bridge.py` (nuevo) + integración en `runner.py`**
+   El módulo `src/polymarket/websocket.py` (PolymarketTradesWS) estaba
+   standalone. Bridge nuevo conecta el WS con `tradebook.open_position`/
+   `close_position` en paralelo al polling. Reduce latencia de detección de
+   ~5-7s polling a <1s push. Idempotencia por `source_trade_id="ws:<txh>"`.
+   Refresca watched wallets cada 60s. Activable con
+   `WEBSOCKET_TRADES_ENABLED=true` (default false). Polling sigue activo
+   como fallback.
+
+#### Activación pendiente del WS
+Para encender el WS post-deploy:
+```bash
+ssh melina@100.98.174.60
+cd /c/Users/Melina/polymarket_copybot/bot_trading
+echo 'WEBSOCKET_TRADES_ENABLED=true' >> .env
+docker compose restart
+```
+Verificar en logs: `WS bridge: arrancado en paralelo (latencia reducida)`.
+
+#### Hallazgo importante: 15 trades RECONCILED bloqueando $68 del cap
+A 2026-05-06 00:30 UTC, había 15 posiciones live `source_wallet='RECONCILED'`
+sumando ~$68. Son trades del bot ejecutados (proxyWallet del usuario en raw)
+pero con source_wallet perdido por bug INSERT (ver fix #2 arriba). Mayoría
+e-sports (LoL, CS2, Valorant) y MLB NRFI — categorías que NO estaban
+auto-bloqueadas en su momento. Pendiente: settle/redeem manualmente en
+polymarket.com para liberar capital del cap del bot.
+
+---
+
 ### 2026-05-05 — incidente trades fantasma + 9 fixes críticos LIVE
 
 **Hito**: día caótico de debug en producción real. El bot venía operando
