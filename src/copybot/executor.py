@@ -908,3 +908,148 @@ def settle_resolved() -> int:
 
     log.info("settled %d live_trades (recordá hacer Redeem en polymarket.com)", settled)
     return settled
+
+
+def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
+    """Detecta `live_trades` open cuyas posiciones ya no existen on-chain.
+
+    Causa raíz: para markets negRisk (esports/MLB/btc-updown-5m) el bot
+    no indexa la tabla `markets` con `closed=1`/`outcome_prices`, así que
+    `settle_resolved()` nunca los settle. Cuando esos markets resuelven y
+    el usuario redime (o se settle automáticamente para outcomes 0), el bot
+    queda con rows phantom en estado 'open' que ocupan el cap del bot.
+
+    Solución: consulta `data-api/positions` para `POLYMARKET_FUNDER_ADDRESS`
+    (la wallet del bot). Construye un set de `asset` (token_id) on-chain.
+    Para cada live_trade open con `entry_at` >= `min_age_seconds` atrás:
+        si su `token_id` (o `asset`) NO está en ese set → marca como
+        `closed_external` con `pnl_usdc=0`, `exit_reason='phantom_cleanup'`.
+
+    Solo aplica a trades > min_age (default 2h) para evitar race con trades
+    recién abiertos que aún no aparecen en /positions.
+
+    Devuelve cantidad de phantoms limpiados. Si la API falla, devuelve 0
+    (no toca nada — failsafe contra falsos positivos por error de red).
+    """
+    import os as _os
+    funder = _os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+    if not funder:
+        return 0
+
+    cutoff_ts = int(time.time()) - max(min_age_seconds, 0)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, source_wallet, condition_id, token_id, asset, entry_at,
+                   entry_price, entry_size_usdc
+            FROM live_trades
+            WHERE status='open' AND dry_run=0 AND entry_at <= ?
+            """,
+            (cutoff_ts,),
+        ).fetchall()
+    if not rows:
+        return 0
+
+    # Fetch on-chain positions (sync — usamos httpx en sync mode acá porque
+    # esta función la llama el runner sync).
+    try:
+        import httpx as _httpx
+        from src.config import DATA_API
+        r = _httpx.get(
+            f"{DATA_API}/positions",
+            params={"user": funder.lower()},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            log.warning(
+                "cleanup_phantom: data-api /positions %d %s",
+                r.status_code, (r.text or "")[:120],
+            )
+            return 0
+        positions = r.json() or []
+    except Exception as e:
+        log.warning("cleanup_phantom: fetch positions falló: %s", e)
+        return 0
+
+    if not isinstance(positions, list):
+        log.warning("cleanup_phantom: /positions devolvió no-list (%r)", type(positions))
+        return 0
+
+    # Defensa: si la API responde lista vacía Y tenemos muchos rows en DB,
+    # podría ser bug temporal de la API (no querer borrar todo de golpe).
+    # Threshold razonable: si la respuesta es [], procedemos solo si la
+    # cantidad a limpiar es "razonable" (< 50). Más que eso parece error.
+    if not positions and len(rows) > 50:
+        log.warning(
+            "cleanup_phantom: /positions vacío y %d trades open en DB — "
+            "salto cleanup por seguridad",
+            len(rows),
+        )
+        return 0
+
+    onchain_assets: set[str] = set()
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        # /positions del Data API expone el ERC1155 token id en 'asset'
+        a = p.get("asset")
+        if isinstance(a, str) and a:
+            onchain_assets.add(a)
+        # algunos endpoints exponen 'tokenId'
+        t = p.get("tokenId")
+        if isinstance(t, str) and t:
+            onchain_assets.add(t)
+
+    phantom_ids: list[int] = []
+    for r in rows:
+        # Token id en nuestro DB puede estar en token_id o en asset.
+        cand = (r["token_id"], r["asset"])
+        present = any(c and c in onchain_assets for c in cand)
+        if not present:
+            phantom_ids.append(r["id"])
+
+    if not phantom_ids:
+        return 0
+
+    now_ts = int(time.time())
+    with tx() as conn:
+        placeholders = ",".join("?" * len(phantom_ids))
+        conn.execute(
+            f"""
+            UPDATE live_trades
+            SET status='closed_external',
+                exit_at=?,
+                exit_price=entry_price,
+                exit_shares=entry_shares,
+                pnl_usdc=0,
+                exit_reason='phantom_cleanup'
+            WHERE id IN ({placeholders}) AND status='open'
+            """,
+            [now_ts] + phantom_ids,
+        )
+        conn.execute(
+            """
+            INSERT INTO learning_events
+                (wallet, event_type, before_value, after_value, delta, trigger, metric_snapshot)
+            VALUES ('(system)', 'phantom_cleanup', NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                f"Cleanup auto: {len(phantom_ids)} live_trades open ya no existen on-chain",
+                json.dumps({"ids": phantom_ids, "onchain_count": len(onchain_assets)}),
+            ),
+        )
+
+    log.warning(
+        "cleanup_phantom: marcados %d live_trades como closed_external "
+        "(no existen en /positions del proxy). on-chain assets count=%d",
+        len(phantom_ids), len(onchain_assets),
+    )
+    try:
+        from src.copybot.notifier import send
+        send(
+            f"🧹 *Phantom cleanup*: {len(phantom_ids)} live_trades marcados como "
+            f"closed_external (ya no existen on-chain). Cap del bot liberado."
+        )
+    except Exception:
+        pass
+    return len(phantom_ids)

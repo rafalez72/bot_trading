@@ -427,6 +427,22 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("reconciler error: %s", e)
 
+            # Phantom cleanup (cada ~30 min, solo en LIVE). Para markets negRisk
+            # settle_resolved no dispara — se acumulan rows open ocupando cap.
+            # Esta función consulta /positions del proxy y cierra como
+            # closed_external los que ya no existen on-chain. Libera cap.
+            if TRADEBOOK_MODE.startswith("live") and cycle % max(1, 1800 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.executor import cleanup_phantom_positions
+                    n_phantom = cleanup_phantom_positions()
+                    if n_phantom:
+                        console.print(
+                            f"[yellow]phantom cleanup:[/yellow] {n_phantom} "
+                            f"live_trades cerrados (ya no existen on-chain)"
+                        )
+                except Exception as e:
+                    log.exception("cleanup_phantom_positions error: %s", e)
+
             # Auto-drop wallets con reject_clog (cada ~10 min)
             if cycle % max(1, 600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
