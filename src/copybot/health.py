@@ -23,43 +23,43 @@ import os
 import threading
 import time
 
-from src.db.schema import db, tx
+from src.config import DB_PATH
 
 log = logging.getLogger(__name__)
 
-HEARTBEAT_KEY = "watchdog:last_cycle_ts"
+HEARTBEAT_KEY = "watchdog:last_cycle_ts"  # legacy, mantenido por compat
 ALERT_THRESHOLD_S = 300  # 5 min: alerta Telegram
 KILL_THRESHOLD_S = 600   # 10 min: force exit → docker restart
 
-_watchdog_started = False
+# Heartbeat en archivo (no DB) — antes el record_heartbeat usaba tx() que
+# bloqueaba si la DB estaba locked por HL/DX/server-1. Cuando la DB locked
+# era exactamente el bug que el watchdog tenía que detectar, el heartbeat
+# fallaba silenciosamente y el watchdog disparaba KILL acumulando false
+# positives. Filesystem write es atómico (rename) y no compite con SQLite
+# locks. Caso real 2026-05-06 12:34-12:44: 2 KILLs consecutivos con UN
+# solo GET fetch entre cada restart.
+HEARTBEAT_FILE = str(DB_PATH.parent / "heartbeat.ts")
 
 
 def record_heartbeat() -> None:
-    """Llamar al final de cada cycle del runner. Idempotente."""
+    """Llamar al final/inicio de cada cycle. Atomic FS write — NO toca DB."""
     ts = int(time.time())
     try:
-        with tx() as conn:
-            conn.execute(
-                "INSERT INTO bot_state (key, value, updated_at) "
-                "VALUES (?, ?, datetime('now')) "
-                "ON CONFLICT(key) DO UPDATE SET "
-                "  value=excluded.value, updated_at=datetime('now')",
-                (HEARTBEAT_KEY, str(ts)),
-            )
+        tmp = HEARTBEAT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(ts))
+        os.replace(tmp, HEARTBEAT_FILE)  # atomic on POSIX
     except Exception as e:
-        # No queremos que un hiccup de DB tumbe el cycle
         log.warning("heartbeat: no se pudo escribir: %s", e)
 
 
 def get_last_heartbeat() -> int | None:
-    """Devuelve unix ts del último cycle completo del runner, o None."""
+    """Devuelve unix ts del último heartbeat, o None si no existe."""
     try:
-        with db() as conn:
-            r = conn.execute(
-                "SELECT value FROM bot_state WHERE key=?",
-                (HEARTBEAT_KEY,),
-            ).fetchone()
-        return int(r["value"]) if r else None
+        with open(HEARTBEAT_FILE) as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return None
     except Exception as e:
         log.warning("heartbeat read: %s", e)
         return None
