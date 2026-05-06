@@ -129,16 +129,34 @@ class PolymarketTradesWS:
     # ----- internal -----
 
     async def _connect(self) -> None:
-        """Open one WS session: connect, subscribe, run heartbeat+consume."""
-        logger.info("connecting to %s", self._url)
+        """Open one WS session: connect, subscribe, run heartbeat+consume.
+
+        Diagnóstico instrumentado (2026-05-06): el bot quedaba colgado en
+        este método sin log adicional. Si el cuelgue vuelve, los INFO logs
+        ahora indican exactamente la fase: pre-connect → post-connect →
+        post-subscribe → tasks-armed → done. Si vemos "pre-connect" sin
+        "post-connect" en >10s, es handshake (DNS/TLS/CF block). Si vemos
+        "post-connect" sin "post-subscribe", es el frame de subscribe.
+        Si vemos "post-subscribe" sin "tasks-armed", es asyncio.wait.
+
+        `open_timeout=10`: si el handshake tarda >10s, websockets raises
+        TimeoutError → outer loop loggea y reintenta. Antes el default
+        no era explícito y en Lenovo+AR podía quedar colgado indef.
+        """
+        logger.info("ws._connect: pre-connect url=%s", self._url)
         async with websockets.connect(
             self._url,
-            ping_interval=None,  # we manage our own app-level heartbeat
+            ping_interval=None,  # heartbeat manual a nivel app
+            open_timeout=10,
             close_timeout=5,
             max_size=2**20,  # 1 MiB
         ) as ws:
-            logger.info("connected; subscribing to activity:trades")
+            logger.info("ws._connect: post-connect, subscribing")
             await self._subscribe(ws)
+            logger.info(
+                "ws._connect: post-subscribe (watching %d wallets)",
+                len(self._watched),
+            )
 
             heartbeat_task = asyncio.create_task(
                 self._heartbeat(ws), name="rtds-heartbeat"
@@ -146,6 +164,7 @@ class PolymarketTradesWS:
             consume_task = asyncio.create_task(
                 self._consume(ws), name="rtds-consume"
             )
+            logger.info("ws._connect: tasks-armed (heartbeat+consume)")
             try:
                 done, pending = await asyncio.wait(
                     {heartbeat_task, consume_task},
