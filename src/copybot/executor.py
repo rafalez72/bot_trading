@@ -931,8 +931,10 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
     Devuelve cantidad de phantoms limpiados. Si la API falla, devuelve 0
     (no toca nada — failsafe contra falsos positivos por error de red).
     """
-    import os as _os
-    funder = _os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+    # IMPORTANTE: leer del config (que ya hace dotenv-load), NO via os.getenv —
+    # las vars de .env están montadas como archivo, no exportadas al shell del
+    # container. Bug detectado en deploy 2026-05-06.
+    from src.config import POLYMARKET_FUNDER_ADDRESS as funder
     if not funder:
         return 0
 
