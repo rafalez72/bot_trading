@@ -22,7 +22,8 @@ log = logging.getLogger(__name__)
 
 DISCOVER_EVERY_HOURS = 8
 DISCOVER_PAGES = 30
-BACKFILL_LIMIT_PER_RUN = 50  # tope de wallets nuevos a backfillear por ciclo
+BACKFILL_LIMIT_PER_RUN = 10  # bajado de 50 — caso 2026-05-07: 50 wallets serial saturaba el watchdog
+BACKFILL_CONCURRENCY = 5     # gather() en grupos de 5 para no saturar Data API
 
 
 def _last_run_ts() -> int:
@@ -66,6 +67,12 @@ async def run_cycle(*, force: bool = False) -> dict:
     if not force and (time.time() - _last_run_ts()) < DISCOVER_EVERY_HOURS * 3600:
         return {"skipped": True, "reason": "ya corrió hace poco"}
 
+    # Marcar el run como iniciado ANTES de empezar el trabajo pesado. Si el
+    # proceso muere a mitad (caso 2026-05-07: watchdog kill durante backfill),
+    # el siguiente arranque ve "ya corrió hace poco" y hace skip — rompiendo el
+    # bucle de muerte donde cada restart re-disparaba discovery completo.
+    _set_last_run()
+
     from src.analytics.metrics import compute_for_wallet, UPSERT_METRICS, composite_score
     from src.copybot.clusters import recompute_clusters, update_cluster_perf
     from src.copybot.selector import select_traders
@@ -80,14 +87,24 @@ async def run_cycle(*, force: bool = False) -> dict:
     except Exception as e:
         log.exception("discover failed: %s", e)
 
-    # 2) Backfill de los wallets nuevos
+    # 2) Backfill paralelo de los wallets nuevos. Semaphore limita concurrencia
+    # para no saturar la Data API (default 5 conexiones simultáneas). Antes era
+    # loop secuencial que tardaba 5-15min y disparaba el watchdog del runner.
     pending = _wallets_without_backfill(BACKFILL_LIMIT_PER_RUN)
-    for w in pending:
-        try:
-            await backfill_wallet(w)
-            out["backfilled"] += 1
-        except Exception as e:
-            log.warning("backfill %s falló: %s", w[:10], e)
+    if pending:
+        sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+
+        async def _bf(w: str) -> bool:
+            async with sem:
+                try:
+                    await backfill_wallet(w)
+                    return True
+                except Exception as e:
+                    log.warning("backfill %s falló: %s", w[:10], e)
+                    return False
+
+        results = await asyncio.gather(*(_bf(w) for w in pending))
+        out["backfilled"] = sum(1 for ok in results if ok)
 
     # 3) Compute metrics para los recién backfilleados
     for w in pending:
@@ -118,7 +135,6 @@ async def run_cycle(*, force: bool = False) -> dict:
     except Exception as e:
         log.exception("select failed: %s", e)
 
-    _set_last_run()
     return out
 
 

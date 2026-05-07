@@ -603,10 +603,13 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("health_monitor error: %s", e)
 
-            # Auto-discovery (chequea internamente si pasaron 12h)
+            # Auto-discovery (guard interno cada DISCOVER_EVERY_HOURS).
+            # Wrap en wait_for: backfill paralelo de N wallets puede tardar >2min
+            # si la Data API está lenta. Sin timeout, bloqueaba el cycle y
+            # disparaba el watchdog kill (caso 2026-05-07: 8 KILLs en 14h).
             if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
-                    res = await discovery_cycle()
+                    res = await asyncio.wait_for(discovery_cycle(), timeout=120)
                     if res and not res.get("skipped"):
                         console.print(
                             f"[bold cyan]discovery:[/bold cyan] "
@@ -614,6 +617,8 @@ async def run_loop(*, once: bool = False) -> None:
                             f"backfill {res.get('backfilled',0)} · "
                             f"compute {res.get('computed',0)}"
                         )
+                except asyncio.TimeoutError:
+                    log.warning("discovery_cycle timeout (>120s) — saltando")
                 except Exception as e:
                     log.exception("discovery error: %s", e)
 

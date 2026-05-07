@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-06 (incidente LIVE perdiendo + bug SQLite locked + emergency switch a paper + paridad paper=real + comandos /pause)
+> **Última actualización**: 2026-05-07 (fix bucle de muerte del watchdog: discovery_cycle sin timeout + backfill secuencial → wait_for(120s) + paralelo + set_last_run al inicio)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -724,6 +724,61 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-07 — bucle de muerte del watchdog: discovery sin timeout
+
+**Hito**: 8 WATCHDOG KILLs en 14h con cadencia de ~1h11m. Causa raíz: el
+`discovery_cycle()` (auto-discovery cada 1h) hacía backfill secuencial de
+hasta 50 wallets nuevos sin timeout. Cada wallet HTTP-paginated de hasta
+3500 trades → 8-12 minutos bloqueando el cycle async → watchdog mata a
+los 10min → docker restart → repetir el ciclo.
+
+#### Diagnóstico
+- El `_set_last_run()` se ejecutaba al **final** de `run_cycle()`. Cuando
+  el watchdog mataba a mitad del backfill, el guard `discovery_last_run`
+  no se persistía → al restart, el siguiente trigger (1h después) re-disparaba
+  discovery completo desde cero. Bucle infinito.
+- Confirmado mirando los 8 KILLs vs los logs: el output del `Backfill 0x…
+  N trades` aparecía siempre las últimas 8 líneas antes de cada `WATCHDOG
+  ALERT`. Patrón perfecto.
+- Descartado HL/DX funding (HL_MODE/DX_MODE=false en .env), shadow_tracker
+  (corre rápido, ~2-5s), reconciler/cleanup_phantom (ya tienen timeout).
+
+#### Fix (4 cambios, commit pendiente)
+1. **`runner.py:607`**: wrap `discovery_cycle()` en `asyncio.wait_for(timeout=120)`.
+   Mismo patrón ya usado para `reconcile_once` y `cleanup_phantom_positions`.
+   Si el discovery tarda >2min, abortar y reintentar la próxima hora.
+2. **`discovery.py:run_cycle`**: mover `_set_last_run()` al **inicio** del
+   ciclo (después del guard de skip). Si el run muere, el siguiente arranque
+   ve "ya corrió hace poco" y skip — rompe el bucle de muerte.
+3. **`discovery.py:25`**: `BACKFILL_LIMIT_PER_RUN = 50 → 10`. Cada pasada
+   queda en 1-3min en vez de 8-12min, dentro del timeout de #1.
+4. **`discovery.py:run_cycle` paso 2**: backfill paralelo con
+   `asyncio.gather` + `asyncio.Semaphore(BACKFILL_CONCURRENCY=5)`. Antes
+   era loop secuencial. Concurrencia limitada a 5 para no saturar Data API.
+
+#### Impacto operativo
+- **Tradeoff**: con BACKFILL_LIMIT_PER_RUN=10 cada 8h, descubrís ~30 wallets/día
+  vs ~150/día con 50 (3 corridas × 50). Suficiente para no quedarse sin
+  candidatos. Si con el tiempo se ve muy poco, subir a 20 (sigue cómodo
+  dentro del timeout).
+- El watchdog en sí funcionó perfecto: detectó stale, mató, docker recreó,
+  bot revivió en ~6s. Sin watchdog, hubiera quedado zombie 7+ horas como
+  el caso del 2026-05-06.
+
+#### Lecciones
+1. **Todo `await` que llame trabajo IO-bound largo (HTTP loops, file ops,
+   etc.) debe envolverse en `asyncio.wait_for`** o el cycle async se cuelga.
+   Patrón ya usado para reconciler/cleanup_phantom; faltaba en discovery.
+2. **Marcar idempotencia de tasks costosas al INICIO, no al final**. Si la
+   task muere a mitad, no debe repetirse desde cero. Patrón "reservar slot
+   antes de trabajar".
+3. **Watchdogs son la red, no la solución**. El bot estuvo zombie 14h con
+   restart cada 1h11m operativo en términos de uptime, pero perdiendo el
+   trade flow durante los 10min de cuelgue + 6s de restart. Total ~80min/día
+   sin operar. El fix elimina la causa raíz.
+
+---
 
 ### 2026-05-06 (tarde) — incidente LIVE perdiendo + bug SQLite locked + emergency switch a paper + paridad paper=real
 
