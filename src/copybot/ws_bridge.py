@@ -8,10 +8,11 @@ Diseño:
   reemplaza. El polling sigue siendo la fuente de verdad de fallback: si el
   WS pierde un trade (raro), el polling lo recoge en el siguiente ciclo.
 - La idempotencia en ``tradebook.open_position`` (guard por
-  ``source_trade_id``) impide que el mismo evento se duplique cuando el WS
-  re-entrega tras un reconnect. Para evitar colisiones cruzadas con el id
-  generado por el polling (``txh:asset:side:oi``), el WS usa el prefijo
-  ``ws:<transactionHash>``.
+  ``source_trade_id``) impide que el mismo evento se duplique. El WS
+  genera el MISMO id que el polling (``<txh>:<asset>:<side>:<oi>`` vía
+  ``indexer.trades._trade_id``) — si usaran prefijos distintos el guard
+  NO los reconocería como duplicados y abriríamos doble posición ante
+  cualquier race entre polling y WS.
 - Cada 60s refrescamos la lista de wallets activas vía
   ``PolymarketTradesWS.update_watched`` para reflejar selección/drops sin
   reconectar.
@@ -35,6 +36,7 @@ from src.copybot.tradebook import (
     open_position,
 )
 from src.db.schema import db, tx
+from src.indexer.trades import _trade_id as _make_trade_id
 from src.polymarket.websocket import PolymarketTradesWS
 
 log = logging.getLogger(__name__)
@@ -97,8 +99,12 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             if not cid or side not in ("BUY", "SELL") or not txh:
                 return
 
+            raw_price = payload.get("price")
+            if raw_price is None:
+                # Payload corrupto sin precio — no copiar ni avanzar cursor.
+                return
             try:
-                price = float(payload.get("price") or 0)
+                price = float(raw_price)
             except (TypeError, ValueError):
                 return
             try:
@@ -108,11 +114,16 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             if ts <= 0:
                 return
 
-            # source_trade_id determinístico para WS — distinto del polling
-            # (el polling genera ``<txh>:<asset>:<side>:<oi>`` vía _trade_id).
-            # Si el WS re-entrega tras reconnect, el guard duplicate de
-            # tradebook.open_position por source_trade_id corta el segundo.
-            source_trade_id = f"ws:{txh}"
+            # source_trade_id IDÉNTICO al que genera el polling — reusamos
+            # _trade_id(payload) de indexer/trades para garantizar paridad
+            # bit-a-bit. Si los IDs divergen (incluso en casos sutiles como
+            # outcomeIndex=None vs vacío) el guard de duplicate de
+            # open_position no funciona y se abren posiciones dobles.
+            source_trade_id = _make_trade_id(payload)
+            if source_trade_id is None:
+                # Sin transactionHash _trade_id devuelve None; nunca debería
+                # pasar acá porque ya validamos `txh` arriba, pero defensa.
+                return
 
             # CRÍTICO (fix 2026-05-06): `open_position`, `close_position` y
             # `_set_cursor` son SYNC y hacen DB writes + HTTP calls al CLOB

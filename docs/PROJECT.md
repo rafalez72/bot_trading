@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-07 (fix bucle de muerte del watchdog: discovery_cycle sin timeout + backfill secuencial → wait_for(120s) + paralelo + set_last_run al inicio)
+> **Última actualización**: 2026-05-07 (fix bucle de muerte del watchdog discovery + fix idempotencia WS bridge: source_trade_id divergente del polling → DOBLE POSICIÓN. Tests 26 cubriendo el bridge.)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -724,6 +724,79 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-07 (tarde) — fix idempotencia WS bridge + tests 26 + smoke test
+
+**Hito**: revisión del código del WS bridge ANTES de activarlo. Encontrado un
+bug latente que hubiera causado **doble posición** apenas se activara con
+plata real. Arreglado, cubierto con 26 tests, smoke test contra el WS real
+de Polymarket exitoso. WS sigue **apagado** en Lenovo — pendiente decisión.
+
+#### Bug encontrado (NO publicado al usuario, no había llegado a prod)
+- `ws_bridge.py:115` generaba `source_trade_id = f"ws:{txh}"` mientras que
+  el polling genera `f"{txh}:{asset}:{side}:{oi}"` vía
+  `indexer.trades._trade_id`. **Mismo trade → IDs distintos**.
+- El guard de duplicate en `paper.open_position` y `executor.open_position`
+  hace `WHERE source_trade_id=?` (igualdad exacta). Si los IDs son
+  distintos, no detecta el duplicado.
+- Race condition que materializa el bug:
+  1. Polling fetcha el trade pero todavía no procesa
+  2. WS pushea el mismo trade — INSERT con id `"ws:..."`
+  3. WS avanza el cursor del polling
+  4. Polling termina su batch (ya en memoria), llama open_position con id
+     `"<txh>:<asset>:<side>:<oi>"` — **DIFERENTE → guard pasa → segundo INSERT**
+- Con `LIVE_MODE=true` esto sería **2× exposición no autorizada por trade**.
+  Con paper, PnL inflado.
+
+#### Fix
+1. `ws_bridge.py` — reusar directamente `indexer.trades._trade_id(payload)`
+   para garantizar paridad bit-a-bit con el polling. DRY: si el formato del
+   id cambia en el futuro, ambos paths se actualizan juntos.
+2. `ws_bridge.py` — además, rechazo defensivo si `payload.price` es `None`
+   (antes `or 0` lo convertía a `0.0`, abría trade con precio 0 absurdo).
+3. Comentario del módulo actualizado para reflejar el invariante correcto.
+
+#### Tests (`tests/test_ws_bridge.py` — 26 cases, todos pasando)
+- payload sin proxyWallet / proxyWallet no string → no-op
+- wallet no en active set → no-op
+- wallet con casing distinto al set (mayúsculas/minúsculas) → matchea
+- side ∈ {"", "INVALID", "buyy", None} → skip
+- conditionId / transactionHash faltante → skip
+- price ∈ {None, "foo"} → skip (no abrir con precio inválido)
+- timestamp ∈ {None, "foo", 0, -1} → skip
+- BUY válido → llama `open_position` con kwargs correctos + `source_trade_id`
+  bit-idéntico al `_trade_id(payload)` del polling
+- SELL válido → llama `close_position`
+- `outcomeIndex=None` → id matchea polling (`...:None`, no `...:`)
+- excepción en `open_position` → loggea, no propaga
+- excepción en `_set_cursor` → loggea, no propaga
+- reject `duplicate` → no error log
+- `_set_cursor` monotónico (no retrocede; usa `MAX(value, ts)`)
+- **integración cross-source**: WS abre primero, polling después con el
+  mismo trade → polling rechaza con `duplicate`
+- **integración cross-source inversa**: polling abre, WS llega después
+  → WS no abre duplicado
+
+#### Smoke test contra WS real (`/tmp/ws_smoke.py`)
+- Conexión a `wss://ws-live-data.polymarket.com` desde mac (AR, sin proxy)
+  exitosa en ~0.9s. **No hay geo-block en el WS** (a diferencia del CLOB).
+- 200 trades reales recibidos en 9s → ~22 trades/seg de volumen global.
+- Todos los campos críticos al 100%: `proxyWallet`, `asset`, `conditionId`,
+  `side`, `outcomeIndex`, `price`, `transactionHash`, `timestamp`.
+- El formato del payload matchea exactamente lo que parsea el bridge.
+
+#### Plan de activación pendiente (no aplicado)
+1. Push del fix + tests a main.
+2. Cron de Lenovo pullea en ≤5min, restart de Docker. **Sin** `WEBSOCKET_TRADES_ENABLED=true` aún → comportamiento sin cambio (solo el código del bridge actualizado).
+3. SSH a Lenovo, `echo 'WEBSOCKET_TRADES_ENABLED=true' >> .env`, `docker compose restart`.
+4. Verificar log: `WS bridge: arrancado en paralelo (latencia reducida)`.
+5. Observar 1h: tasa de matches del WS vs polling, ausencia de `WS _handle_trade falló`.
+6. **Rollback en 5s**: editar `.env` con `WEBSOCKET_TRADES_ENABLED=false` + restart.
+
+Latencia esperada post-activación: ~5-7s polling → <1s push. Total bot
+~15-25s → ~3-10s.
+
+---
 
 ### 2026-05-07 — bucle de muerte del watchdog: discovery sin timeout
 
