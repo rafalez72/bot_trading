@@ -176,18 +176,32 @@ def api_health() -> dict:
 def api_ws_status() -> dict:
     """Snapshot del WS bridge.
 
-    Si el WS bridge no arrancó (env ``WEBSOCKET_TRADES_ENABLED!=true``) las
-    métricas siguen siendo válidas pero todos los counters están en 0 y
-    ``connected=false``. Eso permite al dashboard distinguir "WS off"
-    (uptime alto + 0 connect_attempts) de "WS dead" (connect_attempts >0
-    pero connected=false hace rato).
+    El WS bridge corre en el contenedor *runner* (otro proceso). Las
+    métricas viven in-memory ahí, así que no podemos leerlas directamente
+    desde el server. El runner las persiste cada 5s a
+    ``data/ws_metrics.json`` (volume compartido) y acá las leemos.
+
+    Si el archivo no existe → el WS no arrancó nunca. ``enabled=false``
+    (env var) lo refleja explícitamente. Si existe pero ``_persisted_at``
+    es viejo, ``stale_s`` lo señala.
     """
     import os
-    from src.copybot.ws_metrics import metrics as ws_metrics
-    snap = ws_metrics.snapshot()
-    snap["enabled"] = (
-        os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
-    )
+    import time
+    from src.copybot.ws_metrics import read_snapshot_from_file
+
+    enabled = os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
+    snap = read_snapshot_from_file()
+    if snap is None:
+        return {
+            "enabled": enabled,
+            "snapshot_present": False,
+            "msg": "snapshot file not found — runner WS bridge not started yet",
+        }
+    persisted_at = snap.pop("_persisted_at", None)
+    if persisted_at:
+        snap["stale_s"] = round(time.time() - float(persisted_at), 1)
+    snap["enabled"] = enabled
+    snap["snapshot_present"] = True
     return snap
 
 

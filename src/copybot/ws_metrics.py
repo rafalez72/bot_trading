@@ -12,22 +12,47 @@ Diseño:
 - Reset solo en arranque del proceso (no exponer reset por API por ahora).
 - El módulo NO loggea — los callers ya loggean con `log.info`. Acá solo
   contamos.
+
+Cross-process snapshot file:
+- Las métricas viven en el proceso del **runner** (donde corre el WS
+  bridge), pero el endpoint ``/api/ws-status`` corre en el **server**
+  (otro contenedor). Para puentearlo, el runner persiste el snapshot a
+  ``DATA_DIR/ws_metrics.json`` cada vez que cambia un counter, y el server
+  lee ese archivo. Ambos contenedores comparten el mismo volume.
+- Atómico vía rename. Si el archivo no existe (server arrancó solo) el
+  endpoint devuelve un snapshot vacío.
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # Lag samples: cuántos guardamos para calcular el promedio
 _LAG_WINDOW = 200
+
+# Throttle de la persistencia: como cada frame WS llama a un mutator,
+# escribir cada vez sería demasiado IO. Mín. 1s entre escrituras.
+_PERSIST_MIN_INTERVAL_S = 1.0
+
+# Path del snapshot. data/ es montada en ambos contenedores.
+_SNAPSHOT_PATH = Path(os.getenv("DB_PATH", "data/copybot.db")).parent / "ws_metrics.json"
 
 
 class _Metrics:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._started_at = time.time()
+        self._last_persist_at = 0.0
+        self._persist_enabled = True
         # Connection lifecycle
         self.connect_attempts = 0
         self.connect_successes = 0
@@ -204,6 +229,79 @@ class _Metrics:
                     "samples": len(lags),
                 },
             }
+
+
+    # ---- persistencia cross-process ----
+
+    def persist_to_file(self) -> None:
+        """Escribe el snapshot al archivo compartido (atómico vía rename).
+
+        Llamado tanto por el runner (en cada mutator vía start_persist_thread)
+        como manualmente. Si el directorio no existe o el rename falla, el
+        error se silencia con un debug log — no queremos que un fallo de
+        observabilidad rompa el bot.
+        """
+        try:
+            snap = self.snapshot()
+            snap["_persisted_at"] = time.time()
+            target = _SNAPSHOT_PATH
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Tempfile en el mismo directorio + os.replace = atómico
+            fd, tmp = tempfile.mkstemp(
+                prefix=".ws_metrics_", suffix=".tmp", dir=str(target.parent)
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(snap, f, default=str)
+                os.replace(tmp, target)
+            except Exception:
+                # Si el escrito falló pero el tmp quedó, lo borramos.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            log.debug("ws_metrics.persist_to_file failed: %s", e)
+
+    def start_persist_thread(self, interval_s: float = 5.0) -> None:
+        """Arranca un daemon thread que persiste el snapshot cada interval_s.
+
+        Idempotente: si ya hay uno corriendo (detectado vía un flag),
+        no arranca otro. Llamado por ``ws_run_loop`` en el runner.
+        """
+        with self._lock:
+            if getattr(self, "_persist_thread_started", False):
+                return
+            self._persist_thread_started = True
+
+        def _loop() -> None:
+            while True:
+                try:
+                    time.sleep(interval_s)
+                    self.persist_to_file()
+                except Exception:
+                    pass  # nunca matar el thread
+
+        t = threading.Thread(target=_loop, name="ws_metrics-persist", daemon=True)
+        t.start()
+
+
+def read_snapshot_from_file() -> dict[str, Any] | None:
+    """Lee el snapshot persistido por el proceso runner.
+
+    Usado por el server (otro container) que no tiene acceso directo a la
+    instancia in-memory del runner. Devuelve ``None`` si el archivo no
+    existe o está corrupto (interpretado como "WS off / nunca arrancó").
+    """
+    try:
+        if not _SNAPSHOT_PATH.exists():
+            return None
+        with _SNAPSHOT_PATH.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        log.debug("ws_metrics.read_snapshot_from_file failed: %s", e)
+        return None
 
 
 # Singleton (módulo-level).

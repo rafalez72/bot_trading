@@ -209,6 +209,11 @@ async def ws_run_loop() -> None:
     active_lc: set[str] = {w.lower() for w in wallets if w}
     log.info("ws_bridge: arrancando con %d wallet(s) activas", len(active_lc))
 
+    # Arranca el thread que persiste el snapshot al archivo compartido.
+    # El server (otro contenedor) lee desde ahí para /api/ws-status.
+    ws_metrics.start_persist_thread(interval_s=5.0)
+    ws_metrics.set_watched(len(active_lc))
+
     handle_trade = _make_handle_trade(active_lc)
     client = PolymarketTradesWS(active_lc, handle_trade)
 
