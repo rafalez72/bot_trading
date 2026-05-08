@@ -554,11 +554,17 @@ async def run_loop(*, once: bool = False) -> None:
                     log.exception("auto_drop_by_inactivity error: %s", e)
 
             # Shadow tracker: pollea wallets dropped y registra su actividad
-            # post-drop para análisis a posteriori (cada ~1h)
+            # post-drop para análisis a posteriori (cada ~1h).
+            # Wrap en wait_for: serial sobre N wallets dropped puede tardar
+            # >10min si la Data API está lenta. Caso 2026-05-08 00:39 UTC:
+            # 27 wallets serial colgaron el cycle → WATCHDOG KILL. Mismo
+            # patrón del fix de discovery (commit 8c5af97).
             if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
                     from src.copybot.shadow_tracker import shadow_poll_dropped
-                    await shadow_poll_dropped()
+                    await asyncio.wait_for(shadow_poll_dropped(), timeout=60)
+                except asyncio.TimeoutError:
+                    log.warning("shadow_tracker timeout (>60s) — saltando")
                 except Exception as e:
                     log.exception("shadow_tracker error: %s", e)
 

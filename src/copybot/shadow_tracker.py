@@ -16,6 +16,7 @@ ver volumen + posibles PnL.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -24,6 +25,54 @@ from src.indexer.trades import _trade_id
 from src.polymarket.client import PolymarketClient
 
 log = logging.getLogger(__name__)
+
+SHADOW_CONCURRENCY = 5  # mismo patrón que discovery.BACKFILL_CONCURRENCY
+
+
+async def _poll_one(
+    client: PolymarketClient,
+    wallet: str,
+    drop_reason: str,
+    sem: asyncio.Semaphore,
+) -> int:
+    async with sem:
+        try:
+            trades = await client.trades(user=wallet, limit=50, offset=0)
+        except Exception as e:
+            log.debug("shadow poll %s falló: %s", wallet[:10], e)
+            return 0
+
+        new_count = 0
+        with tx() as conn:
+            for t in trades:
+                tid = _trade_id(t)
+                if not tid:
+                    continue
+                try:
+                    ts = int(t.get("timestamp") or 0)
+                    if ts <= 0:
+                        continue
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO shadow_trades
+                            (wallet, drop_reason, trade_id, timestamp,
+                             condition_id, slug, side, outcome_index, price, size_usdc)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            wallet, drop_reason, tid, ts,
+                            t.get("conditionId"),
+                            t.get("slug") or t.get("eventSlug"),
+                            (t.get("side") or "").upper(),
+                            t.get("outcomeIndex"),
+                            float(t.get("price") or 0),
+                            float(t.get("size") or t.get("sizeInTokens") or 0),
+                        ),
+                    )
+                    new_count += cur.rowcount or 0
+                except Exception as e:
+                    log.debug("shadow insert err %s: %s", tid, e)
+        return new_count
 
 
 async def shadow_poll_dropped(client: PolymarketClient | None = None) -> int:
@@ -48,46 +97,15 @@ async def shadow_poll_dropped(client: PolymarketClient | None = None) -> int:
         client = PolymarketClient()
         await client.__aenter__()
 
-    inserted = 0
     try:
-        for r in rows:
-            wallet = r["wallet"]
-            drop_reason = r["reason"] or "unknown"
-            try:
-                trades = await client.trades(user=wallet, limit=50, offset=0)
-            except Exception as e:
-                log.debug("shadow poll %s falló: %s", wallet[:10], e)
-                continue
-
-            with tx() as conn:
-                for t in trades:
-                    tid = _trade_id(t)
-                    if not tid:
-                        continue
-                    try:
-                        ts = int(t.get("timestamp") or 0)
-                        if ts <= 0:
-                            continue
-                        conn.execute(
-                            """
-                            INSERT OR IGNORE INTO shadow_trades
-                                (wallet, drop_reason, trade_id, timestamp,
-                                 condition_id, slug, side, outcome_index, price, size_usdc)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)
-                            """,
-                            (
-                                wallet, drop_reason, tid, ts,
-                                t.get("conditionId"),
-                                t.get("slug") or t.get("eventSlug"),
-                                (t.get("side") or "").upper(),
-                                t.get("outcomeIndex"),
-                                float(t.get("price") or 0),
-                                float(t.get("size") or t.get("sizeInTokens") or 0),
-                            ),
-                        )
-                        inserted += conn.total_changes
-                    except Exception as e:
-                        log.debug("shadow insert err %s: %s", tid, e)
+        sem = asyncio.Semaphore(SHADOW_CONCURRENCY)
+        results = await asyncio.gather(
+            *(
+                _poll_one(client, r["wallet"], r["reason"] or "unknown", sem)
+                for r in rows
+            )
+        )
+        inserted = sum(results)
     finally:
         if own_client:
             await client.__aexit__(None, None, None)
