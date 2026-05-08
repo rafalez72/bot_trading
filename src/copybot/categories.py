@@ -56,11 +56,11 @@ def update_for_paper_trade(paper_trade_id: int) -> None:
                 (category, n_trades, wins, losses, pnl_usdc, invested_usdc, status, updated_at)
             VALUES (?, 1, ?, ?, ?, ?, 'allowed', datetime('now'))
             ON CONFLICT(category) DO UPDATE SET
-                n_trades       = n_trades + 1,
-                wins           = wins   + excluded.wins,
-                losses         = losses + excluded.losses,
-                pnl_usdc       = pnl_usdc + excluded.pnl_usdc,
-                invested_usdc  = invested_usdc + excluded.invested_usdc,
+                n_trades       = category_perf.n_trades + 1,
+                wins           = category_perf.wins + excluded.wins,
+                losses         = category_perf.losses + excluded.losses,
+                pnl_usdc       = category_perf.pnl_usdc + excluded.pnl_usdc,
+                invested_usdc  = category_perf.invested_usdc + excluded.invested_usdc,
                 updated_at     = datetime('now')
             """,
             (cat, 1 if is_win else 0, 0 if is_win else 1, pnl, invested),
