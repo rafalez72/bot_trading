@@ -96,10 +96,22 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
         _set_cursor(wallet, cursor)
         return 0, 0
 
-    try:
-        trades = await client.trades(user=wallet, limit=100, offset=0)
-    except Exception as e:
-        log.warning("polling %s falló: %s", wallet[:10], e)
+    # Retry corto ante fallos transientes de Data API (timeouts, 5xx, conn
+    # reset). 2 intentos con 1.5s entre ellos → max ~5s, holgado bajo el
+    # wait_for(30s) externo de _safe_process_wallet. Antes: una falla puntual
+    # → "saltar wallet" → trade perdido hasta el próximo cycle.
+    trades = None
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            trades = await client.trades(user=wallet, limit=100, offset=0)
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+    if trades is None:
+        log.warning("polling %s falló (2 intentos): %s", wallet[:10], last_err)
         return 0, 0
 
     # Filtrar y ordenar ascendente
@@ -601,11 +613,16 @@ async def run_loop(*, once: bool = False) -> None:
 
             # Health check de servicios upstream (CLOB/proxy + Data API).
             # Cada ~3 min. Tras 3 fallas consecutivas (~9 min) → alerta Telegram.
+            # Wrap en wait_for: el httpx interno tiene timeout pero por DNS
+            # lento o conectividad rara la llamada podía tardar más. Defensivo
+            # tras los KILLs del 2026-05-07/08.
             if cycle % max(1, 180 // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
                     from src.copybot.health_monitor import check_outages
                     from src.config import CLOB_API
-                    await check_outages(CLOB_API)
+                    await asyncio.wait_for(check_outages(CLOB_API), timeout=30)
+                except asyncio.TimeoutError:
+                    log.warning("health_monitor timeout (>30s) — saltando")
                 except Exception as e:
                     log.exception("health_monitor error: %s", e)
 
