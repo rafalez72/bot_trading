@@ -206,6 +206,19 @@ def pause_bot(reason: str = "manual pause") -> None:
 
 # ---------------- Stop-loss / take-profit ----------------
 
+# Cache de precios CLOB. Cada sweep_stops() corre cada STOPLOSS_SWEEP_SECONDS
+# (default 15s) y agrupa por asset, así que el TTL de 3s es defensivo: cubre
+# el caso de múltiples llamadas dentro del mismo ciclo (open + sweep + dashboard)
+# sin sumar requests al proxy. El 404-cache (60s) corta el spam para
+# orderbooks stale: si el market cerró, `_last_price` devuelve None inmediato
+# y el log de "no orderbook" solo aparece cada PRICE_404_LOG_INTERVAL_S.
+PRICE_TTL_S = 3.0
+PRICE_404_TTL_S = 60.0
+PRICE_404_LOG_INTERVAL_S = 300.0  # 5 minutos
+_price_cache: dict[str, tuple[float, float | None]] = {}  # asset → (expires_at, price_or_None)
+_price_404_last_log: dict[str, float] = {}  # asset → last_log_at_epoch
+
+
 async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
     """Devuelve el midpoint actual del orderbook para `asset` (token_id ERC1155).
 
@@ -214,20 +227,36 @@ async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
     assets reportaban el mismo precio falso → SL nunca disparaba. Ahora usa el
     endpoint del CLOB que SÍ filtra por token_id.
 
+    OPT 2026-05-08: cache TTL 3s para evitar requests duplicados dentro del
+    mismo ciclo de polling/sweep. 404 (orderbook stale) cacheado 60s + logueado
+    como WARNING una vez cada 5min por asset, no cada llamada (antes spam de
+    1 línea cada 15s por posición abierta con orderbook cerrado).
+
     Fallback chain:
       1. CLOB /midpoint  (preferido — precio justo bid/ask)
       2. CLOB /price?side=SELL  (precio actual de venta)
       3. None  (si el mercado no tiene orderbook)
     """
+    now = time.time()
+    cached = _price_cache.get(asset)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+
     # Usamos el proxy Vercel para el CLOB porque desde Argentina puede haber
     # geo-block. El bot ya usa CLOB_API que apunta al proxy.
     from src.config import CLOB_API
+    saw_404 = False
+
     try:
         r = await client.get(f"{CLOB_API}/midpoint", params={"token_id": asset}, timeout=8.0)
         if r.status_code == 200:
             mid = r.json().get("mid")
             if mid is not None:
-                return float(mid)
+                price = float(mid)
+                _price_cache[asset] = (now + PRICE_TTL_S, price)
+                return price
+        elif r.status_code == 404:
+            saw_404 = True
     except Exception as e:
         log.debug("midpoint fetch failed asset=%s: %s", str(asset)[:14], e)
     # Fallback: precio SELL (lo que recibirías si vendieras ahora)
@@ -237,9 +266,26 @@ async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
         if r.status_code == 200:
             p = r.json().get("price")
             if p is not None:
-                return float(p)
+                price = float(p)
+                _price_cache[asset] = (now + PRICE_TTL_S, price)
+                return price
+        elif r.status_code == 404:
+            saw_404 = True
     except Exception as e:
         log.debug("price fetch failed asset=%s: %s", str(asset)[:14], e)
+
+    # Ningún fallback funcionó. Si fue 404 (orderbook inexistente, market
+    # cerrado), cacheamos `None` por PRICE_404_TTL_S para no martillar.
+    # Loggeamos como WARNING dampened — una vez cada 5 min por asset.
+    if saw_404:
+        _price_cache[asset] = (now + PRICE_404_TTL_S, None)
+        last_log = _price_404_last_log.get(asset, 0.0)
+        if now - last_log > PRICE_404_LOG_INTERVAL_S:
+            _price_404_last_log[asset] = now
+            log.warning(
+                "risk._last_price: orderbook 404 (stale market?) asset=%s",
+                str(asset)[:20],
+            )
     return None
 
 

@@ -35,6 +35,7 @@ from src.copybot.tradebook import (
     close_position,
     open_position,
 )
+from src.copybot.ws_metrics import metrics as ws_metrics
 from src.db.schema import db, tx
 from src.indexer.trades import _trade_id as _make_trade_id
 from src.polymarket.websocket import PolymarketTradesWS
@@ -97,21 +98,26 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             ts_raw = payload.get("timestamp")
 
             if not cid or side not in ("BUY", "SELL") or not txh:
+                ws_metrics.on_bad_payload()
                 return
 
             raw_price = payload.get("price")
             if raw_price is None:
                 # Payload corrupto sin precio — no copiar ni avanzar cursor.
+                ws_metrics.on_bad_payload()
                 return
             try:
                 price = float(raw_price)
             except (TypeError, ValueError):
+                ws_metrics.on_bad_payload()
                 return
             try:
                 ts = int(ts_raw) if ts_raw is not None else 0
             except (TypeError, ValueError):
+                ws_metrics.on_bad_payload()
                 return
             if ts <= 0:
+                ws_metrics.on_bad_payload()
                 return
 
             # source_trade_id IDÉNTICO al que genera el polling — reusamos
@@ -149,16 +155,19 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                     raw=payload,
                 )
                 if pid:
+                    ws_metrics.on_open_buy()
                     log.info(
-                        "WS BUY  %s  cid=%s..  oi=%s  px=%.3f  → %s #%d",
+                        "ws.buy_opened wallet=%s cid=%s.. oi=%s px=%.3f mode=%s pid=%d",
                         wallet_lc[:10], (cid or "")[:10], oi, price,
                         TRADEBOOK_MODE, pid,
                     )
-                elif reason and reason != "duplicate":
-                    log.debug(
-                        "WS skip BUY  %s  cid=%s..  → %s",
-                        wallet_lc[:10], (cid or "")[:10], reason,
-                    )
+                else:
+                    ws_metrics.on_skip(reason)
+                    if reason and reason != "duplicate":
+                        log.info(
+                            "ws.buy_skipped wallet=%s cid=%s.. reason=%s",
+                            wallet_lc[:10], (cid or "")[:10], reason,
+                        )
             else:  # SELL
                 pid = await asyncio.to_thread(
                     close_position,
@@ -169,8 +178,9 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                     timestamp=ts,
                 )
                 if pid:
+                    ws_metrics.on_close_sell()
                     log.info(
-                        "WS SELL %s  cid=%s..  oi=%s  px=%.3f  → %s #%d",
+                        "ws.sell_closed wallet=%s cid=%s.. oi=%s px=%.3f mode=%s pid=%d",
                         wallet_lc[:10], (cid or "")[:10], oi, price,
                         TRADEBOOK_MODE, pid,
                     )

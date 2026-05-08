@@ -172,6 +172,25 @@ def api_health() -> dict:
     return {"ok": True, "markets": n}
 
 
+@app.get("/api/ws-status")
+def api_ws_status() -> dict:
+    """Snapshot del WS bridge.
+
+    Si el WS bridge no arrancó (env ``WEBSOCKET_TRADES_ENABLED!=true``) las
+    métricas siguen siendo válidas pero todos los counters están en 0 y
+    ``connected=false``. Eso permite al dashboard distinguir "WS off"
+    (uptime alto + 0 connect_attempts) de "WS dead" (connect_attempts >0
+    pero connected=false hace rato).
+    """
+    import os
+    from src.copybot.ws_metrics import metrics as ws_metrics
+    snap = ws_metrics.snapshot()
+    snap["enabled"] = (
+        os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
+    )
+    return snap
+
+
 # ---------- LIVE (Fase 5) ----------
 
 @app.get("/api/live/summary")

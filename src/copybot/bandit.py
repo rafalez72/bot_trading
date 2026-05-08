@@ -42,6 +42,15 @@ EXPLORATION_BONUS = 2.0   # constante c en UCB1
 INACTIVITY_HOURS = 24
 INACTIVITY_DECAY = 0.7
 
+# Floor de samples antes de aplicar size_up/size_down vía UCB:
+# con n_pulls < MIN_PULLS_FOR_REBALANCE el rebalance es ruido — un solo trade
+# con PnL -$0.50 puede gatillar size_down de 1.0→0.7. 2026-05-08 vimos 17
+# learning_events en 6h con n=1-4 cada uno. La política nueva preserva el
+# sizing previo (sin tocar la copy_subscription) hasta acumular 5 closes,
+# y solo entonces empieza a rebalancear. Los wallets con n=0 siguen recibiendo
+# el bonus de exploración (mult 1.0× por default — ya lo manejaba el shift).
+MIN_PULLS_FOR_REBALANCE = 5
+
 
 def _refresh_arm(conn, wallet: str) -> None:
     """Recalcula n_pulls y sum_reward para un wallet."""
@@ -165,19 +174,30 @@ def recompute_sizings() -> dict:
                 decay_factor = INACTIVITY_DECAY ** periods
                 new_sizings[w] = max(SIZING_MIN, new_sizings[w] * decay_factor)
 
-        # Persistir y registrar cambios significativos
+        # Persistir y registrar cambios significativos.
+        # Política de "muestra suficiente": con n < MIN_PULLS_FOR_REBALANCE
+        # NO tocamos sizing_mult — preservamos el valor anterior para evitar
+        # rebalances ruidosos de 1-4 trades (alta varianza). Sí actualizamos
+        # ucb_score (es solo telemetry).
         for r in rows:
             w = r["wallet"]
             before = r["sizing_mult"] or 1.0
-            after = new_sizings.get(w, 1.0)
             ucb_score = scores.get(w, 0.0)
-            conn.execute(
-                "UPDATE copy_subscriptions SET sizing_mult=? WHERE wallet=?",
-                (after, w),
-            )
             conn.execute(
                 "UPDATE bandit_state SET ucb_score=? WHERE wallet=?",
                 (ucb_score, w),
+            )
+            n_pulls = r["n"]
+            if n_pulls < MIN_PULLS_FOR_REBALANCE:
+                # Mantener sizing existente, no emitir learning_event.
+                # Usamos el valor anterior como `after` en la dict de retorno
+                # para que el caller no piense que hubo cambio.
+                new_sizings[w] = before
+                continue
+            after = new_sizings.get(w, 1.0)
+            conn.execute(
+                "UPDATE copy_subscriptions SET sizing_mult=? WHERE wallet=?",
+                (after, w),
             )
             if abs(after - before) >= 0.05:
                 event = "size_up" if after > before else "size_down"
@@ -189,8 +209,8 @@ def recompute_sizings() -> dict:
                     """,
                     (
                         w, event, before, after, after - before,
-                        f"UCB rebalance · n={r['n']} mean_r={(r['sum_r']/r['n'] if r['n']>0 else 0):.2f}",
-                        f'{{"ucb": {ucb_score:.3f}, "n_pulls": {r["n"]}}}',
+                        f"UCB rebalance · n={n_pulls} mean_r={(r['sum_r']/n_pulls):.2f}",
+                        f'{{"ucb": {ucb_score:.3f}, "n_pulls": {n_pulls}}}',
                     ),
                 )
 

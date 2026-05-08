@@ -55,8 +55,7 @@ Bot que **copia trades** de los mejores wallets de Polymarket (prediction market
 
 | Máquina | Path | Notas |
 |---------|------|-------|
-| Mac (dev actual) | `/tmp/bt` | Clone temporal. **Usar este para editar** |
-| Mac (original, NO usar) | `~/Documents/dev/crondata/polymarket_copybot` | macOS TCC bloquea acceso a Claude desde aquí. Si Full Disk Access se habilita y Claude se reinicia, podríamos volver — pero `/tmp/bt` funciona y se mantiene |
+| Mac (dev actual) | `~/polymarket_copybot` | **Usar este para editar.** Movido el 2026-05-08 desde `~/Documents/dev/crondata/polymarket_copybot` para esquivar el bloqueo de macOS TCC sobre `~/Documents`. `.venv/` se borró en el move; recrear con `python -m venv .venv && source .venv/bin/activate && pip install -e .` |
 | Lenovo (prod) | `~/polymarket_copybot` (Git Bash) | Clone permanente. Cron `update_and_restart.bat` cada 5 min pullea + redeploy Docker |
 | Repo remoto | `https://github.com/rafalez72/bot_trading` | Único hub de sync Mac↔Lenovo |
 | Imagen Docker | `ghcr.io/rafalez72/bot_trading:latest` | GitHub Actions buildea + pushea |

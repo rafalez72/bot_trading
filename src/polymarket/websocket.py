@@ -46,6 +46,8 @@ from typing import Awaitable, Callable, Iterable
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from src.copybot.ws_metrics import metrics as ws_metrics
+
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-live-data.polymarket.com"
@@ -90,7 +92,8 @@ class PolymarketTradesWS:
     def update_watched(self, wallets: Iterable[str]) -> None:
         """Hot-update the watched wallet set (case-insensitive)."""
         self._watched = {w.lower() for w in wallets if w}
-        logger.info("watched wallets updated (count=%d)", len(self._watched))
+        ws_metrics.set_watched(len(self._watched))
+        logger.info("ws.watched_updated count=%d", len(self._watched))
 
     async def run(self) -> None:
         """Main loop: connect, subscribe, consume; reconnect on failure.
@@ -105,11 +108,12 @@ class PolymarketTradesWS:
                 # successful clean session -> reset backoff
                 backoff = RECONNECT_MIN_S
             except asyncio.CancelledError:
-                logger.info("websocket loop cancelled, exiting")
+                logger.info("ws.loop_cancelled exiting")
                 raise
             except Exception as exc:  # noqa: BLE001 - we log and retry
+                ws_metrics.on_disconnect(reason=str(exc))
                 logger.warning(
-                    "websocket session ended: %s; reconnecting in %.1fs",
+                    "ws.session_ended reason=%s reconnect_in=%.1fs",
                     exc,
                     backoff,
                 )
@@ -143,7 +147,9 @@ class PolymarketTradesWS:
         TimeoutError → outer loop loggea y reintenta. Antes el default
         no era explícito y en Lenovo+AR podía quedar colgado indef.
         """
-        logger.info("ws._connect: pre-connect url=%s", self._url)
+        ws_metrics.on_connect_attempt()
+        logger.info("ws.connect_attempt url=%s watched=%d",
+                    self._url, len(self._watched))
         async with websockets.connect(
             self._url,
             ping_interval=None,  # heartbeat manual a nivel app
@@ -151,12 +157,11 @@ class PolymarketTradesWS:
             close_timeout=5,
             max_size=2**20,  # 1 MiB
         ) as ws:
-            logger.info("ws._connect: post-connect, subscribing")
+            ws_metrics.on_connect_success()
+            ws_metrics.set_watched(len(self._watched))
+            logger.info("ws.connected subscribing watched=%d", len(self._watched))
             await self._subscribe(ws)
-            logger.info(
-                "ws._connect: post-subscribe (watching %d wallets)",
-                len(self._watched),
-            )
+            logger.info("ws.subscribed topic=activity:trades")
 
             heartbeat_task = asyncio.create_task(
                 self._heartbeat(ws), name="rtds-heartbeat"
@@ -164,7 +169,7 @@ class PolymarketTradesWS:
             consume_task = asyncio.create_task(
                 self._consume(ws), name="rtds-consume"
             )
-            logger.info("ws._connect: tasks-armed (heartbeat+consume)")
+            logger.info("ws.tasks_armed heartbeat+consume")
             try:
                 done, pending = await asyncio.wait(
                     {heartbeat_task, consume_task},
@@ -185,7 +190,8 @@ class PolymarketTradesWS:
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
-                logger.info("disconnected from %s", self._url)
+                ws_metrics.on_disconnect(reason="session_ended")
+                logger.info("ws.disconnected url=%s", self._url)
 
     async def _subscribe(self, ws) -> None:
         await ws.send(json.dumps(SUBSCRIPTION))
@@ -215,20 +221,26 @@ class PolymarketTradesWS:
                 try:
                     raw = raw.decode("utf-8")
                 except UnicodeDecodeError:
-                    logger.error("received non-utf8 binary frame; skipping")
+                    logger.error("ws.binary_non_utf8 skipping")
                     continue
 
-            if not raw or raw == "pong":
+            if not raw:
+                continue
+            if raw == "pong":
+                ws_metrics.on_pong()
                 continue
 
             try:
                 msg = json.loads(raw)
+                ws_metrics.on_frame(json_ok=True)
             except json.JSONDecodeError:
                 # heartbeat acks or other plain-text frames — ok to skip quietly
-                logger.debug("non-json frame: %r", raw[:120])
+                ws_metrics.on_frame(json_ok=False)
+                logger.debug("ws.non_json_frame %r", raw[:120])
                 continue
             except Exception as exc:  # noqa: BLE001
-                logger.error("failed to parse frame: %s; raw=%r", exc, raw[:200])
+                ws_metrics.on_frame(json_ok=False)
+                logger.error("ws.parse_failed err=%s raw=%r", exc, raw[:200])
                 continue
 
             await self._handle_message(msg)
@@ -246,6 +258,8 @@ class PolymarketTradesWS:
         if topic != "activity" or mtype != "trades" or not isinstance(payload, dict):
             return
 
+        ws_metrics.on_activity_frame()
+
         wallet = payload.get("proxyWallet")
         if not isinstance(wallet, str):
             return
@@ -253,19 +267,28 @@ class PolymarketTradesWS:
         if wallet.lower() not in self._watched:
             return
 
-        logger.debug(
-            "matched trade: wallet=%s side=%s size=%s price=%s tx=%s",
-            wallet,
+        ts_payload = payload.get("timestamp")
+        try:
+            ts_int = int(ts_payload) if ts_payload is not None else None
+        except (TypeError, ValueError):
+            ts_int = None
+        ws_metrics.on_match(ts_payload=ts_int)
+
+        logger.info(
+            "ws.match wallet=%s side=%s size=%s price=%s tx=%s",
+            wallet[:10],
             payload.get("side"),
             payload.get("size"),
             payload.get("price"),
-            payload.get("transactionHash"),
+            (payload.get("transactionHash") or "")[:10],
         )
 
         try:
             await self._on_trade(payload)
+            ws_metrics.on_callback_ok()
         except Exception:  # noqa: BLE001 - never let a callback kill the loop
-            logger.exception("on_trade callback raised; continuing")
+            ws_metrics.on_callback_error()
+            logger.exception("ws.callback_error continuing")
 
 
 # --------------------------------------------------------------------------- #
