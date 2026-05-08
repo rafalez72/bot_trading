@@ -90,6 +90,15 @@ def _row_count_pg(pg_cur, table: str) -> int:
     return pg_cur.fetchone()[0]
 
 
+def _pg_columns(pg_cur, table: str) -> list[str]:
+    pg_cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema='public' AND table_name=%s",
+        (table,),
+    )
+    return [r[0] for r in pg_cur.fetchall()]
+
+
 def _chunked(it: Iterable, n: int) -> Iterable[list]:
     buf: list = []
     for x in it:
@@ -108,12 +117,23 @@ def migrate_table(
     *,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    cols = _columns(sqlite_conn, table)
-    if not cols:
+    sqlite_cols = _columns(sqlite_conn, table)
+    if not sqlite_cols:
         log.warning("table %s no existe en SQLite — skip", table)
         return {"skipped": "missing"}
 
     with pg_conn.cursor() as pg_cur:
+        pg_cols = _pg_columns(pg_cur, table)
+        if not pg_cols:
+            log.warning("table %s no existe en PG — skip", table)
+            return {"skipped": "pg_missing"}
+        # Solo migramos columnas que existen en AMBOS lados
+        cols = [c for c in sqlite_cols if c in pg_cols]
+        if len(cols) < len(sqlite_cols):
+            missing = set(sqlite_cols) - set(cols)
+            log.info("table %s: %d cols en SQLite no existen en PG (%s) — ignoradas",
+                     table, len(missing), sorted(missing))
+
         if not overwrite:
             n_existing = _row_count_pg(pg_cur, table)
             if n_existing > 0:

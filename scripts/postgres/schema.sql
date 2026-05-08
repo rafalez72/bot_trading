@@ -4,7 +4,7 @@
 --   INTEGER PRIMARY KEY AUTOINCREMENT  → BIGSERIAL PRIMARY KEY
 --   REAL                               → DOUBLE PRECISION
 --   timestamps de epoch (entry_at, ts) → BIGINT
---   TEXT DEFAULT (datetime('now'))     → TIMESTAMPTZ DEFAULT NOW()
+--   TEXT DEFAULT (datetime('now'))     → TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 --   PRAGMA *                           → (no aplica)
 --   raw JSON                           → TEXT (compat con json.loads del code path actual)
 --                                        TODO: migrar a JSONB tras switchear el driver.
@@ -24,15 +24,15 @@ CREATE TABLE IF NOT EXISTS markets (
     liquidity         DOUBLE PRECISION,
     outcomes          TEXT,
     outcome_prices    TEXT,
-    last_seen_at      TIMESTAMPTZ DEFAULT NOW()
+    last_seen_at      TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(active, closed);
 CREATE INDEX IF NOT EXISTS idx_markets_slug ON markets(slug);
 
 CREATE TABLE IF NOT EXISTS traders (
     wallet            TEXT PRIMARY KEY,
-    first_seen_at     TIMESTAMPTZ DEFAULT NOW(),
-    last_indexed_at   TIMESTAMPTZ,
+    first_seen_at     TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+    last_indexed_at   TEXT,
     total_trades      INTEGER DEFAULT 0,
     flagged           INTEGER DEFAULT 0
 );
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS trader_metrics (
     first_trade_ts          BIGINT,
     last_trade_ts           BIGINT,
     score                   DOUBLE PRECISION,
-    computed_at             TIMESTAMPTZ DEFAULT NOW()
+    computed_at             TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_score ON trader_metrics(score DESC);
 CREATE INDEX IF NOT EXISTS idx_metrics_roi ON trader_metrics(roi_pct DESC);
@@ -77,13 +77,13 @@ CREATE INDEX IF NOT EXISTS idx_metrics_roi ON trader_metrics(roi_pct DESC);
 CREATE TABLE IF NOT EXISTS index_state (
     key               TEXT PRIMARY KEY,
     value             TEXT,
-    updated_at        TIMESTAMPTZ DEFAULT NOW()
+    updated_at        TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS copy_subscriptions (
     wallet            TEXT PRIMARY KEY,
-    started_at        TIMESTAMPTZ DEFAULT NOW(),
-    stopped_at        TIMESTAMPTZ,
+    started_at        TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+    stopped_at        TEXT,
     status            TEXT DEFAULT 'active',
     reason            TEXT,
     score_at_start    DOUBLE PRECISION,
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS learning_events (
     delta             DOUBLE PRECISION,
     trigger           TEXT,
     metric_snapshot   TEXT,
-    created_at        TIMESTAMPTZ DEFAULT NOW()
+    created_at        TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_learn_wallet ON learning_events(wallet, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_learn_time ON learning_events(created_at DESC);
@@ -133,7 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_learn_time ON learning_events(created_at DESC);
 CREATE TABLE IF NOT EXISTS bot_state (
     key TEXT PRIMARY KEY,
     value TEXT,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS category_perf (
@@ -144,15 +144,15 @@ CREATE TABLE IF NOT EXISTS category_perf (
     pnl_usdc        DOUBLE PRECISION DEFAULT 0,
     invested_usdc   DOUBLE PRECISION DEFAULT 0,
     status          TEXT DEFAULT 'allowed',
-    blocked_at      TIMESTAMPTZ,
+    blocked_at      TEXT,
     blocked_reason  TEXT,
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS filter_thresholds (
     key             TEXT PRIMARY KEY,
     value           DOUBLE PRECISION,
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS bandit_state (
@@ -160,14 +160,14 @@ CREATE TABLE IF NOT EXISTS bandit_state (
     n_pulls             INTEGER DEFAULT 0,
     sum_reward          DOUBLE PRECISION DEFAULT 0,
     ucb_score           DOUBLE PRECISION DEFAULT 0,
-    updated_at          TIMESTAMPTZ DEFAULT NOW()
+    updated_at          TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS wallet_clusters (
     wallet              TEXT PRIMARY KEY,
     cluster_id          INTEGER NOT NULL,
     features            TEXT,
-    updated_at          TIMESTAMPTZ DEFAULT NOW()
+    updated_at          TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_wcluster_id ON wallet_clusters(cluster_id);
 
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS cluster_perf (
     pnl_usdc            DOUBLE PRECISION DEFAULT 0,
     avg_win_rate        DOUBLE PRECISION,
     status              TEXT DEFAULT 'allowed',
-    updated_at          TIMESTAMPTZ DEFAULT NOW()
+    updated_at          TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 
 CREATE TABLE IF NOT EXISTS live_trades (
@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS hl_trades (
     exit_reason     TEXT,
     dry_run         INTEGER DEFAULT 1,
     gas_paid        DOUBLE PRECISION DEFAULT 0,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    created_at      TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_hl_trades_wallet ON hl_trades(source_wallet, entry_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hl_trades_status ON hl_trades(status);
@@ -261,8 +261,8 @@ CREATE TABLE IF NOT EXISTS hl_subscriptions (
     wallet      TEXT PRIMARY KEY,
     status      TEXT NOT NULL DEFAULT 'active',
     sizing_mult DOUBLE PRECISION DEFAULT 1.0,
-    started_at  TIMESTAMPTZ DEFAULT NOW(),
-    stopped_at  TIMESTAMPTZ,
+    started_at  TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+    stopped_at  TEXT,
     notes       TEXT
 );
 
@@ -316,7 +316,7 @@ CREATE TABLE IF NOT EXISTS dx_trades (
     dry_run         INTEGER DEFAULT 1,
     funding_paid    DOUBLE PRECISION DEFAULT 0,
     gas_paid        DOUBLE PRECISION DEFAULT 0,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    created_at      TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 );
 CREATE INDEX IF NOT EXISTS idx_dx_trades_wallet ON dx_trades(source_wallet, entry_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dx_trades_status ON dx_trades(status);
@@ -325,8 +325,8 @@ CREATE TABLE IF NOT EXISTS dx_subscriptions (
     wallet      TEXT PRIMARY KEY,
     status      TEXT NOT NULL DEFAULT 'active',
     sizing_mult DOUBLE PRECISION DEFAULT 1.0,
-    started_at  TIMESTAMPTZ DEFAULT NOW(),
-    stopped_at  TIMESTAMPTZ,
+    started_at  TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+    stopped_at  TEXT,
     notes       TEXT
 );
 

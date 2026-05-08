@@ -12,6 +12,6 @@ COPY copybot.py .
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 
-RUN pip install --no-cache-dir -e ".[dashboard,analytics,live]"
+RUN pip install --no-cache-dir -e ".[dashboard,analytics,live,postgres]"
 
 RUN mkdir -p data logs
