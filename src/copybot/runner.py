@@ -626,11 +626,17 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("health_monitor error: %s", e)
 
-            # Auto-discovery (guard interno cada DISCOVER_EVERY_HOURS).
+            # Auto-discovery (guard interno cada DISCOVER_EVERY_MINUTES).
+            # Llamamos al cycle cada DISCOVER_EVERY_MINUTES — el guard
+            # interno hace short-circuit si todavía no toca, así que llamar
+            # más seguido es barato. Antes esto era cada 1h aunque el guard
+            # interno fuera 8h, lo cual era inconsistente.
             # Wrap en wait_for: backfill paralelo de N wallets puede tardar >2min
             # si la Data API está lenta. Sin timeout, bloqueaba el cycle y
             # disparaba el watchdog kill (caso 2026-05-07: 8 KILLs en 14h).
-            if cycle % max(1, 3600 // max(COPY_POLL_SECONDS, 1)) == 0:
+            from src.copybot.discovery import DISCOVER_EVERY_MINUTES
+            discover_every_seconds = DISCOVER_EVERY_MINUTES * 60
+            if cycle % max(1, discover_every_seconds // max(COPY_POLL_SECONDS, 1)) == 0:
                 try:
                     res = await asyncio.wait_for(discovery_cycle(), timeout=120)
                     if res and not res.get("skipped"):

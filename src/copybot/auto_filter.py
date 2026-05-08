@@ -173,8 +173,13 @@ def maybe_tune(*, force: bool = False) -> dict[str, Any] | None:
     changes: dict[str, tuple[float, float]] = {}
 
     if wr < 0.40:
-        # Endurecer
-        new_wr = min(0.70, _get_threshold("MIN_WIN_RATE") + 0.05)
+        # Endurecer.
+        # 2026-05-08: techo MIN_WIN_RATE bajado de 0.70 → 0.65. Win-rate >0.65
+        # es contraintuitivo en Polymarket (los mejores wallets están en
+        # 55-65%); subirlo hasta 0.70 cerraba demasiado el grifo en mala
+        # racha. Mantenemos el endurecimiento pero con un techo defensivo
+        # más realista.
+        new_wr = min(0.65, _get_threshold("MIN_WIN_RATE") + 0.05)
         new_vol = _get_threshold("MIN_VOLUME") * 1.2
         new_trades = _get_threshold("MIN_TOTAL_TRADES") * 1.15
         new_score = min(0.85, _get_threshold("MIN_SCORE") + 0.05)

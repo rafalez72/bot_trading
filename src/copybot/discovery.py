@@ -1,6 +1,6 @@
 """Auto-discovery de nuevos traders (Fase 6a).
 
-Workflow del ciclo (cada DISCOVER_EVERY_HOURS):
+Workflow del ciclo (cada DISCOVER_EVERY_MINUTES):
 1. discover_traders → barre el feed global y descubre wallets nuevos.
 2. Para wallets que aún NO están en `traders` con backfill:
    - backfill_wallet (descarga su historial — cap 3500)
@@ -20,7 +20,12 @@ from src.db.schema import db, tx
 
 log = logging.getLogger(__name__)
 
-DISCOVER_EVERY_HOURS = 8
+# 2026-05-08: bajamos de 8h → 25min para capturar wallets calientes más
+# rápido. Cada ciclo cuesta ~80-230 reqs HTTP + 10-30s de DB-lock; con 25min
+# eso es ~1-2% del tiempo lockeado y ~250 req/min sostenido (margen
+# saludable vs el rate-limit implícito del data-api). Si bajás más allá,
+# revisá clusters.py — recompute_clusters es la transacción gigante.
+DISCOVER_EVERY_MINUTES = 25
 DISCOVER_PAGES = 30
 BACKFILL_LIMIT_PER_RUN = 10  # bajado de 50 — caso 2026-05-07: 50 wallets serial saturaba el watchdog
 BACKFILL_CONCURRENCY = 5     # gather() en grupos de 5 para no saturar Data API
@@ -64,7 +69,7 @@ def _wallets_without_backfill(limit: int) -> list[str]:
 
 async def run_cycle(*, force: bool = False) -> dict:
     """Ejecuta un ciclo completo de auto-discovery."""
-    if not force and (time.time() - _last_run_ts()) < DISCOVER_EVERY_HOURS * 3600:
+    if not force and (time.time() - _last_run_ts()) < DISCOVER_EVERY_MINUTES * 60:
         return {"skipped": True, "reason": "ya corrió hace poco"}
 
     # Marcar el run como iniciado ANTES de empezar el trabajo pesado. Si el
@@ -130,7 +135,8 @@ async def run_cycle(*, force: bool = False) -> dict:
     # 5) Re-select top
     try:
         import os
-        top_n = int(os.getenv("DISCOVERY_TOP_N", "20"))
+        from src.copybot.selector import DEFAULT_TOP_N
+        top_n = int(os.getenv("DISCOVERY_TOP_N", str(DEFAULT_TOP_N)))
         out["select"] = select_traders(top_n=top_n)
     except Exception as e:
         log.exception("select failed: %s", e)

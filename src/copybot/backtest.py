@@ -124,7 +124,8 @@ def run_backtest(*, hours: int = 96, sample_period_hours: int = 6) -> dict:
     console.print(f"[bold cyan]→[/bold cyan] Backtest de {hours} horas")
 
     _reset_state()
-    sel = select_traders(top_n=20)
+    from src.copybot.selector import DEFAULT_TOP_N
+    sel = select_traders(top_n=DEFAULT_TOP_N)
     console.print(
         f"[green]✓[/green] Selección inicial: "
         f"{len(sel['added'])} nuevos · {len(sel['kept'])} mantenidos · "

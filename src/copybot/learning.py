@@ -167,8 +167,8 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
         # Auto-reemplazo: re-corre select_traders para llenar la vacante
         # con el siguiente mejor candidato del ranking
         try:
-            from src.copybot.selector import select_traders
-            res = select_traders(top_n=20)
+            from src.copybot.selector import DEFAULT_TOP_N, select_traders
+            res = select_traders(top_n=DEFAULT_TOP_N)
             if res.get("added"):
                 log.info(
                     "auto-replace: +%d nuevos traders activos para reemplazar al dropped",
@@ -369,8 +369,8 @@ def auto_drop_by_inactivity(window_hours: int | None = None) -> int:
             log.info("  drop inactivity: %s.. (%dh)", w[:10], h)
         # Auto-replace tras drops
         try:
-            from src.copybot.selector import select_traders
-            select_traders(top_n=20)
+            from src.copybot.selector import DEFAULT_TOP_N, select_traders
+            select_traders(top_n=DEFAULT_TOP_N)
         except Exception as e:
             log.warning("auto-replace post-inactivity failed: %s", e)
 

@@ -381,7 +381,9 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
                         detail=json.dumps({"volume": vol, "min": MIN_MARKET_VOLUME_USDC}))
             return None, "low_volume"
         cat = m["category"]
-        if cat:
+        # 2026-05-08: paridad con paper.py — "(sin categoría)" es un default
+        # del matcher, no una categoría real. No bloquear por ese bucket.
+        if cat and cat != "(sin categoría)":
             cat_row = conn.execute(
                 "SELECT status FROM category_perf WHERE category=?", (cat,)
             ).fetchone()

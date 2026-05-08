@@ -227,7 +227,13 @@ def open_position(
             if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
                 return None, "low_volume"
             cat = m["category"]
-            if cat:
+            # 2026-05-08: el bucket "(sin categoría)" agrupa slugs que el
+            # matcher de categorize.py no clasifica — eso son ~30-40% del
+            # flujo y el bloqueo histórico (615 trades, 27% wr) era un
+            # promedio de cosas heterogéneas, no una mala categoría real.
+            # Tratamos al default como "no bucket" y dejamos pasar; el
+            # filtrado real lo hace el filtro por wallet/score/policy.
+            if cat and cat != "(sin categoría)":
                 cat_row = conn.execute(
                     "SELECT status FROM category_perf WHERE category=?", (cat,)
                 ).fetchone()

@@ -16,7 +16,7 @@ from src.db.schema import db, init_db, tx
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TOP_N = 20
+DEFAULT_TOP_N = 40  # 2026-05-08: 20 → 40 para diversificar capital y activar más wallets paused
 # Filtros estrictos — diseñados para minimizar pérdidas en producción.
 # Todo wallet candidato debe cumplir TODOS estos requisitos.
 MIN_SCORE = 0.55
