@@ -6,8 +6,9 @@
 --   timestamps de epoch (entry_at, ts) → BIGINT
 --   TEXT DEFAULT (datetime('now'))     → TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
 --   PRAGMA *                           → (no aplica)
---   raw JSON                           → TEXT (compat con json.loads del code path actual)
---                                        TODO: migrar a JSONB tras switchear el driver.
+--   raw JSON                           → JSONB (storage compacto + indexable)
+--                                        Wrapper en src/db/schema.py serializa
+--                                        dict→string en read para compat con json.loads.
 --
 -- Migraciones (los ALTER TABLE de schema.py) están INLINEADAS acá. Una vez
 -- que arrancás Postgres limpio, este archivo crea TODO en el estado final.
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS trades (
     size              DOUBLE PRECISION NOT NULL,
     usdc_value        DOUBLE PRECISION,
     timestamp         BIGINT NOT NULL,
-    raw               TEXT
+    raw               JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(condition_id, timestamp DESC);
@@ -107,7 +108,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     exit_at           BIGINT,
     pnl_usdc          DOUBLE PRECISION,
     status            TEXT DEFAULT 'open',
-    raw               TEXT,
+    raw               JSONB,
     asset             TEXT,
     exit_reason       TEXT,
     peak_price        DOUBLE PRECISION
@@ -208,7 +209,7 @@ CREATE TABLE IF NOT EXISTS live_trades (
     status            TEXT DEFAULT 'open',
     exit_reason       TEXT,
     asset             TEXT,
-    raw               TEXT,
+    raw               JSONB,
     dry_run           INTEGER DEFAULT 0,
     peak_price        DOUBLE PRECISION
 );

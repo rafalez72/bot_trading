@@ -29,6 +29,26 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres-backup:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-copybot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_set_in_env}
+      POSTGRES_DB: ${POSTGRES_DB:-copybot}
+      BACKUP_INTERVAL_S: 86400        # 24h
+      BACKUP_RETENTION_DAYS: 7
+    volumes:
+      - pgbackups:/backups
+      - ./scripts/pg-backup:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/backup_loop.sh"]
+
   server:
     image: ghcr.io/rafalez72/bot_trading:latest
     pull_policy: always
@@ -66,3 +86,4 @@ services:
 
 volumes:
   pgdata:
+  pgbackups:

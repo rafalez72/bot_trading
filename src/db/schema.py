@@ -123,13 +123,30 @@ def _translate_sql_to_pg(sql: str) -> str:
     return sql
 
 
+def _normalize_value(v):
+    """Convierte dict/list (de JSONB/JSON columns) a JSON string.
+
+    El código del bot lee columnas como `raw` y hace ``json.loads(row['raw'])``.
+    Cuando ALTER TABLE convierte raw TEXT → JSONB, psycopg3 devuelve un dict
+    nativo. Para no tocar los call-sites de json.loads, serializamos de vuelta
+    a string acá. Beneficio neto: storage compacto + indexable nativamente
+    (CREATE INDEX ... USING GIN (raw)) sin cambios en el código.
+    """
+    import json as _json
+    if isinstance(v, (dict, list)):
+        return _json.dumps(v)
+    return v
+
+
 class _PgRow(dict):
     """Mimic de sqlite3.Row: acceso por key + posicional + iteración."""
 
     def __init__(self, columns: list[str], values: tuple) -> None:
-        super().__init__(zip(columns, values))
+        # Normalizamos cada valor para que JSONB → string transparente.
+        normalized = tuple(_normalize_value(v) for v in values)
+        super().__init__(zip(columns, normalized))
         self._cols = columns
-        self._vals = values
+        self._vals = normalized
 
     def __getitem__(self, key):  # type: ignore[override]
         if isinstance(key, int):
