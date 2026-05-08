@@ -72,11 +72,14 @@ def _to_row(m: dict) -> tuple | None:
     )
 
 
-async def index_markets(*, only_active: bool = False) -> int:
+async def index_markets(*, only_active: bool = False, quiet: bool = False) -> int:
     """Indexa mercados.
 
     La Gamma API por default devuelve sólo `closed=false`, así que hacemos
-    dos pasadas: activos + cerrados. `only_active=True` salta la segunda.
+    dos pasadas: activos + cerrados. `only_active=True` salta la segunda
+    (más rápido, suficiente para el loop automático del runner).
+    `quiet=True` evita la barra de progreso de rich (logs limpios cuando
+    se llama desde el runner en background).
     """
     init_db()
     total = 0
@@ -97,14 +100,8 @@ async def index_markets(*, only_active: bool = False) -> int:
         passes.append(("cerrados", True))
 
     async with PolymarketClient() as client:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as prog:
+        if quiet:
             for label, closed_flag in passes:
-                t = prog.add_task(f"Indexando mercados {label}…", total=None)
                 async for m in client.iter_markets(page_size=500, closed=closed_flag):
                     row = _to_row(m)
                     if not row:
@@ -112,15 +109,93 @@ async def index_markets(*, only_active: bool = False) -> int:
                     batch.append(row)
                     if len(batch) >= BATCH:
                         await _flush()
-                        prog.update(
-                            t,
-                            description=f"Indexando {label}… {total} guardados",
-                        )
                 await _flush()
-                prog.update(t, description=f"✓ {label}: {total} guardados")
-
-    console.print(f"[green]✓[/green] {total} mercados indexados (activos + cerrados)")
+                log.info("markets_refresh: %s pass done — %d totales", label, total)
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+                console=console,
+            ) as prog:
+                for label, closed_flag in passes:
+                    t = prog.add_task(f"Indexando mercados {label}…", total=None)
+                    async for m in client.iter_markets(page_size=500, closed=closed_flag):
+                        row = _to_row(m)
+                        if not row:
+                            continue
+                        batch.append(row)
+                        if len(batch) >= BATCH:
+                            await _flush()
+                            prog.update(
+                                t,
+                                description=f"Indexando {label}… {total} guardados",
+                            )
+                    await _flush()
+                    prog.update(t, description=f"✓ {label}: {total} guardados")
+            console.print(
+                f"[green]✓[/green] {total} mercados indexados (activos + cerrados)"
+            )
     return total
+
+
+# --------------------------------------------------------------------------- #
+# Loop automático invocable desde el runner.
+# --------------------------------------------------------------------------- #
+
+# Cada cuánto refrescamos mercados activos en background. Sólo activos:
+# los cerrados no cambian liquidity/volume relevantes y son ~300k filas
+# (caro re-indexarlos seguido). Si necesitás cerrados frescos, corré
+# `python copybot.py markets` manual.
+MARKETS_REFRESH_HOURS = 4
+
+
+def _last_run_ts() -> int:
+    from src.db.schema import db
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM bot_state WHERE key='markets_last_run'"
+        ).fetchone()
+    return int(r["value"]) if r else 0
+
+
+def _set_last_run() -> None:
+    import time as _t
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES ('markets_last_run', ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = datetime('now')
+            """,
+            (str(int(_t.time())),),
+        )
+
+
+async def maybe_refresh(*, force: bool = False) -> dict:
+    """Refresca mercados activos si pasaron MARKETS_REFRESH_HOURS.
+
+    Devuelve {"skipped": True} o {"refreshed": N}. Idempotente.
+    Pensado para llamarse desde el runner main loop, similar al
+    discovery loop. NO levanta excepciones — el caller wrapeará con
+    asyncio.wait_for para evitar que un cuelgue de la Gamma API
+    bloquee el runner.
+    """
+    import time as _t
+    if not force and (_t.time() - _last_run_ts()) < MARKETS_REFRESH_HOURS * 3600:
+        return {"skipped": True}
+
+    # Marcar el run ANTES de empezar — si el indexer cuelga y el watchdog
+    # mata el proceso, el siguiente arranque ve "ya corrió hace poco" y
+    # no reintenta inmediatamente (mismo patrón que discovery.py).
+    _set_last_run()
+
+    log.info("markets_refresh: arrancando refresh de mercados activos…")
+    n = await index_markets(only_active=True, quiet=True)
+    log.info("markets_refresh: %d mercados activos refrescados", n)
+    return {"refreshed": n}
 
 
 if __name__ == "__main__":

@@ -651,6 +651,34 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("discovery error: %s", e)
 
+            # Markets refresh (guard interno cada MARKETS_REFRESH_HOURS).
+            # Llamamos al cycle cada MARKETS_REFRESH_HOURS pero el guard
+            # interno hace short-circuit. Refresca SOLO activos (~5-10k
+            # mercados) para que liquidity/volume estén frescos en DB y
+            # el filtro low_liquidity funcione bien. Cerrados se siguen
+            # indexando solo on-demand vía `python copybot.py markets`.
+            # Timeout de 600s: la Gamma API páginas de 500, ~5-15min para
+            # ~10k mercados activos en mala red.
+            from src.indexer.markets import (
+                MARKETS_REFRESH_HOURS,
+                maybe_refresh as markets_maybe_refresh,
+            )
+            markets_every_seconds = MARKETS_REFRESH_HOURS * 3600
+            if cycle % max(1, markets_every_seconds // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    mres = await asyncio.wait_for(
+                        markets_maybe_refresh(), timeout=600
+                    )
+                    if mres and not mres.get("skipped"):
+                        console.print(
+                            f"[bold cyan]markets_refresh:[/bold cyan] "
+                            f"{mres.get('refreshed',0)} activos refrescados"
+                        )
+                except asyncio.TimeoutError:
+                    log.warning("markets_refresh timeout (>600s) — saltando")
+                except Exception as e:
+                    log.exception("markets_refresh error: %s", e)
+
             # Daily summary (cada ciclo barato — el helper internamente verifica 24h)
             try:
                 _maybe_send_daily_summary()
