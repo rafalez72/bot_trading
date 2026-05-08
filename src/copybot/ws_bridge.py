@@ -58,8 +58,10 @@ def _active_wallets() -> list[str]:
 def _set_cursor(wallet: str, ts: int) -> None:
     """Avanza ``paper_cursor:<wallet>`` al timestamp dado (idempotente).
 
-    Uso ``MAX(value, ts)`` para no retroceder el cursor si el polling ya lo
-    avanzó más adelante (orden de mensajes WS no garantizado en absoluto).
+    Comparamos via CASE WHEN — funciona en SQLite y Postgres. Antes usábamos
+    ``MAX(a, b)`` que es 2-arg scalar function en SQLite pero NO existe en
+    PG (PG usa GREATEST). El CASE evita el problema sin necesidad de
+    traducción runtime.
     """
     with tx() as conn:
         conn.execute(
@@ -67,7 +69,11 @@ def _set_cursor(wallet: str, ts: int) -> None:
             INSERT INTO index_state (key, value, updated_at)
             VALUES (?, ?, datetime('now'))
             ON CONFLICT(key) DO UPDATE SET
-                value = CAST(MAX(CAST(index_state.value AS INTEGER), CAST(excluded.value AS INTEGER)) AS TEXT),
+                value = CASE
+                    WHEN CAST(excluded.value AS INTEGER) > CAST(index_state.value AS INTEGER)
+                    THEN excluded.value
+                    ELSE index_state.value
+                END,
                 updated_at = datetime('now')
             """,
             (f"paper_cursor:{wallet}", str(ts)),
