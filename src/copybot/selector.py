@@ -17,7 +17,13 @@ from src.db.schema import db, init_db, tx
 log = logging.getLogger(__name__)
 
 DEFAULT_TOP_N = 40  # 2026-05-08: 20 → 40 para diversificar capital y activar más wallets paused
-# Filtros estrictos — diseñados para minimizar pérdidas en producción.
+
+# Cap del bucket HFT/scalpers (Nivel 1, 2026-05-08): wallets con muchísima
+# actividad pero posiblemente menor PnL por trade. Complementan al bucket
+# clásico (top by score). Default 20 = 50% del top_n principal.
+DEFAULT_HFT_TOP_N = 20
+
+# --- Filtros del bucket CLÁSICO (top by score) ---
 # Todo wallet candidato debe cumplir TODOS estos requisitos.
 MIN_SCORE = 0.55
 MIN_PNL = 500.0              # ganancia realizada mínima
@@ -27,6 +33,21 @@ MIN_VOLUME = 25_000.0        # liquidez del trader
 MAX_DRAWDOWN_PCT = 50.0      # nunca tuvo caída > 50%
 MIN_SHARPE = 0.4             # algo de consistencia
 
+# --- Filtros del bucket HFT/scalper (top by trades_per_day) ---
+# El selector clásico privilegia rentabilidad histórica y consistencia, lo que
+# excluye scalpers que hacen 100s de ops/día con bajo PnL/trade pero
+# acumulado positivo. Esos wallets son un pattern legítimo en Polymarket
+# (especialmente en sports y crypto markets de 15min) y son la mayor fuente
+# de volumen continuo. Los aceptamos con criterios más permisivos pero
+# controlando el riesgo via MAX_DRAWDOWN, win_rate >= 50% y PnL acumulado >0.
+HFT_MIN_PNL = 50.0           # acumulado mínimo (validación de no-perdedor neto)
+HFT_MIN_WIN_RATE = 0.50      # 50% es el piso de "no random"
+HFT_MIN_TOTAL_TRADES = 300   # historial robusto (3x el clásico)
+HFT_MIN_VOLUME = 5_000.0     # vol total relajado (scalpers operan chico)
+HFT_MAX_DRAWDOWN_PCT = 60.0  # tolerancia mayor pero acotada
+HFT_MIN_TRADES_PER_DAY = 5.0 # >=5 ops/día sostenido = clasificación HFT
+HFT_MIN_DAYS_ACTIVE = 7      # historial mínimo de 7 días para ser estadísticamente válido
+
 
 def _build_reason(m: dict) -> str:
     parts: list[str] = []
@@ -35,6 +56,7 @@ def _build_reason(m: dict) -> str:
     win = (m.get("win_rate") or 0) * 100
     sharpe = m.get("sharpe_proxy") or 0
     vol = m.get("total_volume_usdc") or 0
+    tpd = m.get("trades_per_day") or 0
     parts.append(f"PnL +${pnl:,.0f}")
     if 0 < roi <= 500:
         parts.append(f"ROI {roi:.0f}%")
@@ -43,26 +65,94 @@ def _build_reason(m: dict) -> str:
         parts.append(f"sharpe {sharpe:.1f}")
     if vol > 10_000:
         parts.append(f"vol ${vol/1000:.0f}k")
+    if tpd >= HFT_MIN_TRADES_PER_DAY:
+        parts.append(f"HFT {tpd:.0f}/d")
     return " · ".join(parts)
 
 
-def select_traders(top_n: int = DEFAULT_TOP_N) -> dict:
+def select_hft_traders(top_n: int = DEFAULT_HFT_TOP_N) -> list[dict]:
+    """Devuelve los wallets HFT/scalper que cumplen los filtros HFT_*.
+
+    A diferencia de ``select_traders``, este NO toca ``copy_subscriptions`` —
+    solo devuelve la lista de candidatos. ``select_traders`` los une a su
+    pool y aplica la sincronización (added/kept/paused) global.
+
+    Calcula ``trades_per_day = total_trades / days_active`` en Python
+    (evita aritmética entre BIGINT con división — más portable PG/SQLite).
+    """
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT tm.* FROM trader_metrics tm
+            WHERE tm.realized_pnl_usdc  >= ?
+              AND tm.win_rate           >= ?
+              AND tm.total_trades       >= ?
+              AND tm.total_volume_usdc  >= ?
+              AND tm.max_drawdown_pct   <= ?
+              AND tm.first_trade_ts IS NOT NULL
+              AND tm.last_trade_ts  IS NOT NULL
+              AND tm.last_trade_ts > tm.first_trade_ts
+              AND tm.wallet NOT IN (
+                  SELECT wallet FROM copy_subscriptions WHERE status='dropped'
+              )
+            """,
+            (
+                HFT_MIN_PNL, HFT_MIN_WIN_RATE, HFT_MIN_TOTAL_TRADES,
+                HFT_MIN_VOLUME, HFT_MAX_DRAWDOWN_PCT,
+            ),
+        ).fetchall()
+
+    qualifying: list[dict] = []
+    for r in rows:
+        days_active = (r["last_trade_ts"] - r["first_trade_ts"]) / 86400.0
+        if days_active < HFT_MIN_DAYS_ACTIVE:
+            continue
+        tpd = (r["total_trades"] or 0) / max(1.0, days_active)
+        if tpd < HFT_MIN_TRADES_PER_DAY:
+            continue
+        d = dict(r)
+        d["trades_per_day"] = tpd
+        d["days_active"] = days_active
+        qualifying.append(d)
+
+    # Ordenamos por trades_per_day DESC (prioriza actividad). Empate
+    # rompe por score DESC para preferir HFT con mejor track histórico.
+    qualifying.sort(
+        key=lambda x: ((x.get("trades_per_day") or 0), (x.get("score") or 0)),
+        reverse=True,
+    )
+    return qualifying[:top_n]
+
+
+def select_traders(
+    top_n: int = DEFAULT_TOP_N,
+    *,
+    hft_top_n: int = DEFAULT_HFT_TOP_N,
+    include_hft: bool = True,
+) -> dict:
     """Sincroniza copy_subscriptions con el top actual.
 
-    Devuelve un resumen: { added, kept, paused, dropped }.
+    Combina dos buckets:
+      1) Top by score (clásico) — prioriza rentabilidad y consistencia.
+      2) Top by trades_per_day (HFT/scalper) — prioriza actividad continua.
+    Los dos sets se unen y aplica la sincronización conjunta. Pueden
+    overlappear; el wallet entra al pool una sola vez.
+
+    Devuelve un resumen: { added, kept, paused, hft_added, total_active }.
     """
     init_db()
-    summary = {"added": [], "kept": [], "paused": [], "total_active": 0}
+    summary: dict = {
+        "added": [], "kept": [], "paused": [],
+        "hft_added": [],
+        "total_active": 0,
+    }
 
     # Thresholds dinámicos (auto_filter puede haberlos modificado)
     from src.copybot.auto_filter import get_all as get_thresholds
     th = get_thresholds()
 
     with db() as conn:
-        # Excluir wallets ya dropeados — drop es permanente. Si no excluimos
-        # acá, el LIMIT puede quedarse corto: top_n=20 con 5 dropped en el
-        # top → solo 15 candidatos disponibles. Con el WHERE NOT IN garantizamos
-        # que siempre tomamos top_n DISPONIBLES.
+        # Bucket clásico (top by score)
         candidates = conn.execute(
             """
             SELECT tm.* FROM trader_metrics tm
@@ -96,12 +186,26 @@ def select_traders(top_n: int = DEFAULT_TOP_N) -> dict:
     cand_wallets = {r["wallet"] for r in candidates}
     cand_by_wallet = {r["wallet"]: dict(r) for r in candidates}
 
+    # Bucket HFT (top by trades_per_day) — agregamos al pool. El wallet
+    # puede aparecer ya en el bucket clásico (overlap es OK, el dict no
+    # duplica). Marcamos los nuevos HFT-only para auditoría.
+    hft_only_wallets: set[str] = set()
+    if include_hft:
+        hft_candidates = select_hft_traders(top_n=hft_top_n)
+        for hft in hft_candidates:
+            w = hft["wallet"]
+            if w not in cand_by_wallet:
+                cand_wallets.add(w)
+                cand_by_wallet[w] = hft
+                hft_only_wallets.add(w)
+
     with tx() as conn:
         # 1) Activar / promover candidatos
         for w in cand_wallets:
             metric = cand_by_wallet[w]
             reason = _build_reason(metric)
-            score = metric["score"]
+            # HFT-only puede tener score chico/None — usar el que haya, default 0.
+            score = metric.get("score") or 0.0
             if w not in existing:
                 conn.execute(
                     """
@@ -111,7 +215,10 @@ def select_traders(top_n: int = DEFAULT_TOP_N) -> dict:
                     """,
                     (w, reason, score),
                 )
-                summary["added"].append({"wallet": w, "reason": reason, "score": score})
+                entry = {"wallet": w, "reason": reason, "score": score}
+                summary["added"].append(entry)
+                if w in hft_only_wallets:
+                    summary["hft_added"].append(entry)
             else:
                 row = existing[w]
                 # IMPORTANTE: NO reactivar wallets `dropped`. Drop es permanente.
