@@ -330,15 +330,25 @@ def auto_drop_by_inactivity(window_hours: int | None = None) -> int:
 
     dropped: list[tuple[str, int]] = []
     with tx() as conn:
+        # CAST a BIGINT (no INTEGER) — algunos cursors viejos quedaron en
+        # milisegundos por bug histórico del WS bridge (~1.7e12, no cabe en
+        # INT32). Normalizamos a segundos en SQL: si valor > 9.99e9 → /1000.
         rows = conn.execute(
             """
             SELECT cs.wallet AS wallet,
-                   COALESCE(CAST(ist.value AS INTEGER), 0) AS cursor_ts
+                   COALESCE(
+                       CASE WHEN CAST(ist.value AS BIGINT) > 9999999999
+                            THEN CAST(ist.value AS BIGINT) / 1000
+                            ELSE CAST(ist.value AS BIGINT) END,
+                       0
+                   ) AS cursor_ts
             FROM copy_subscriptions cs
             LEFT JOIN index_state ist ON ist.key = 'paper_cursor:' || cs.wallet
             WHERE cs.status = 'active'
-              AND COALESCE(CAST(ist.value AS INTEGER), 0) > 0
-              AND CAST(ist.value AS INTEGER) < ?
+              AND ist.value IS NOT NULL
+              AND CASE WHEN CAST(ist.value AS BIGINT) > 9999999999
+                       THEN CAST(ist.value AS BIGINT) / 1000
+                       ELSE CAST(ist.value AS BIGINT) END < ?
             """,
             (cutoff,),
         ).fetchall()

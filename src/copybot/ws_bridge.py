@@ -70,7 +70,7 @@ def _set_cursor(wallet: str, ts: int) -> None:
             VALUES (?, ?, datetime('now'))
             ON CONFLICT(key) DO UPDATE SET
                 value = CASE
-                    WHEN CAST(excluded.value AS INTEGER) > CAST(index_state.value AS INTEGER)
+                    WHEN CAST(excluded.value AS BIGINT) > CAST(index_state.value AS BIGINT)
                     THEN excluded.value
                     ELSE index_state.value
                 END,
@@ -125,6 +125,12 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             if ts <= 0:
                 ws_metrics.on_bad_payload()
                 return
+            # RTDS a veces manda timestamp en ms (13 dígitos) y a veces en s.
+            # Normalizamos a segundos. Sin esto, _set_cursor escribe ms en
+            # index_state y CAST(value AS INTEGER) en learning.py overflow
+            # (INTEGER de PG es 32-bit, max ~2.1B; ms son ~1.7e12).
+            if ts > 9_999_999_999:
+                ts //= 1000
 
             # source_trade_id IDÉNTICO al que genera el polling — reusamos
             # _trade_id(payload) de indexer/trades para garantizar paridad
