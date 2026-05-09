@@ -135,6 +135,54 @@ RULES: list[tuple[str, list[str]]] = [
 ]
 
 
+# Patrones de slugs ultra-cortos: ruido natural del mid > edge esperable.
+# - Crypto updown 5m/15m/1h/4h: el mid se mueve 1-3% por ticks aleatorios.
+#   Con SL 20% disparamos en falso. Slugs: btc-updown-5m-..., eth-updown-15m-...
+# - Esports live (CS2/LoL/Valorant/Dota/CSGO): match in-play, mid vola fuerte.
+# - Sports daily (NFL/NBA/MLB/NHL/UFC) DENTRO de 6h: assumed live game.
+_ULTRASHORT_CRYPTO_RX = re.compile(
+    r"^(btc|eth|sol|xrp|bnb|hype|doge)-updown-(5m|15m|1h|4h)-"
+)
+_ULTRASHORT_ESPORTS_RX = re.compile(r"(?:^|-)(cs2|lol|valorant|dota|csgo)-")
+_ULTRASHORT_SPORTS_RX = re.compile(
+    r"^(?:ufc-sea\d|nfl|nba|mlb|nhl)-.+-2026-"
+)
+# Si el match cae dentro de las próximas N segundos se considera "live game".
+_ULTRASHORT_SPORTS_LIVE_HORIZON_S = 6 * 3600
+
+
+def is_ultrashort_market(slug: str | None, end_date_ts: int | None = None) -> bool:
+    """True si el slug pertenece a una categoría ultra-corta donde el ruido del
+    mid supera el edge medible.
+
+    Reglas:
+    - Crypto updown 5m/15m/1h/4h → siempre True
+    - Esports CS2/LoL/Valorant/Dota/CSGO → siempre True
+    - Sport daily (NFL/NBA/MLB/NHL/UFC sea) AND end_date dentro de 6h → True
+      (asume game en curso o por arrancar; los closing futuros lejanos sí
+       valen — son markets sobre temporada/torneo).
+    - end_date_ts None / desconocido → no se aplica el filtro de sports
+      (pero crypto/esports igual disparan por slug).
+    """
+    if not slug:
+        return False
+    s = slug.lower()
+    if _ULTRASHORT_CRYPTO_RX.search(s):
+        return True
+    if _ULTRASHORT_ESPORTS_RX.search(s):
+        return True
+    if _ULTRASHORT_SPORTS_RX.search(s):
+        # Sports markets necesitan el horizon check para no bloquear apuestas
+        # sobre torneo entero (que pueden cerrar en semanas).
+        if end_date_ts is None:
+            return False
+        import time as _time
+        dt = end_date_ts - int(_time.time())
+        if 0 < dt <= _ULTRASHORT_SPORTS_LIVE_HORIZON_S:
+            return True
+    return False
+
+
 def infer(slug: str | None, question: str | None = None) -> str | None:
     """Devuelve la categoría inferida o None si no hay match."""
     haystack_parts: list[str] = []
