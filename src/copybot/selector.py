@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from src.db.schema import db, init_db, tx
 
@@ -47,6 +48,17 @@ HFT_MIN_VOLUME = 5_000.0     # vol total relajado (scalpers operan chico)
 HFT_MAX_DRAWDOWN_PCT = 60.0  # tolerancia mayor pero acotada
 HFT_MIN_TRADES_PER_DAY = 5.0 # >=5 ops/día sostenido = clasificación HFT
 HFT_MIN_DAYS_ACTIVE = 7      # historial mínimo de 7 días para ser estadísticamente válido
+
+# Post-fetch sanity filters (Feature C, 2026-05-09).
+# Tras 13h con el bucket HFT activo (cf9c812) detectamos dos patrones tóxicos:
+#   1) sharpe absurdamente alto (e.g. 200+) sobre muestras chicas → ruido,
+#      no edge real. Lo aceptamos solo si total_trades >= 200 (sample grande
+#      hace al sharpe alto creíble).
+#   2) ratio volume/PnL altísimo (>>100x) → spread-scalper de microspreads
+#      que NO podemos capturar con copy lag. Su edge vive en microsegundos.
+HFT_MAX_SHARPE = float(os.getenv("HFT_MAX_SHARPE", "5.0"))
+HFT_SHARPE_LARGE_SAMPLE = 200       # umbral de muestra para tolerar sharpe alto
+HFT_MAX_VOL_PNL_RATIO = float(os.getenv("HFT_MAX_VOL_PNL_RATIO", "100.0"))
 
 
 def _build_reason(m: dict) -> str:
@@ -110,6 +122,32 @@ def select_hft_traders(top_n: int = DEFAULT_HFT_TOP_N) -> list[dict]:
         tpd = (r["total_trades"] or 0) / max(1.0, days_active)
         if tpd < HFT_MIN_TRADES_PER_DAY:
             continue
+
+        # Feature C: filtros post-fetch para descartar HFT no copiables.
+        sharpe = float(r["sharpe_proxy"] or 0.0)
+        total_trades = int(r["total_trades"] or 0)
+        pnl = float(r["realized_pnl_usdc"] or 0.0)
+        vol = float(r["total_volume_usdc"] or 0.0)
+        vol_pnl_ratio = vol / max(pnl, 1.0)
+
+        # 1) Sharpe absurdo sobre muestra chica → ruido estadístico, no edge.
+        if sharpe > HFT_MAX_SHARPE and total_trades < HFT_SHARPE_LARGE_SAMPLE:
+            log.debug(
+                "hft filter: %s rejected sharpe=%.1f vol/pnl=%.0f (sharpe>%.1f, n=%d<%d)",
+                r["wallet"], sharpe, vol_pnl_ratio,
+                HFT_MAX_SHARPE, total_trades, HFT_SHARPE_LARGE_SAMPLE,
+            )
+            continue
+
+        # 2) Spread-scalper: vol/PnL >>100x → su edge es microspread que el
+        # copy lag no puede capturar. Drop independiente del sharpe.
+        if vol_pnl_ratio > HFT_MAX_VOL_PNL_RATIO:
+            log.debug(
+                "hft filter: %s rejected sharpe=%.1f vol/pnl=%.0f (>%.0fx scalper)",
+                r["wallet"], sharpe, vol_pnl_ratio, HFT_MAX_VOL_PNL_RATIO,
+            )
+            continue
+
         d = dict(r)
         d["trades_per_day"] = tpd
         d["days_active"] = days_active
