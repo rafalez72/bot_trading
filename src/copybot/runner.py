@@ -416,6 +416,19 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar WS bridge: %s", e)
 
+    # Crypto temporal arbitrage (Nivel 2 — 2026-05-08): explota el lag
+    # Polymarket vs Binance en mercados btc/eth/sol-updown-5m. Se enciende
+    # con CRYPTO_ARB_ENABLED=true. Bet conservador (default $5/trade) en
+    # paper. Ver src/copybot/crypto_arb.py para parámetros.
+    crypto_arb_task: asyncio.Task | None = None
+    if os.getenv("CRYPTO_ARB_ENABLED", "false").lower() == "true" and not once:
+        try:
+            from src.copybot.crypto_arb import crypto_arb_loop
+            crypto_arb_task = asyncio.create_task(crypto_arb_loop())
+            log.info("crypto_arb: arrancado en paralelo (BTC/ETH/SOL updown-5m)")
+        except Exception as e:
+            log.warning("no se pudo arrancar crypto_arb: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

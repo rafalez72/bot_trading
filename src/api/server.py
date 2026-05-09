@@ -172,6 +172,31 @@ def api_health() -> dict:
     return {"ok": True, "markets": n}
 
 
+@app.get("/api/crypto-arb-status")
+def api_crypto_arb_status() -> dict:
+    """Snapshot del bot crypto_arb (Nivel 2).
+
+    Las métricas viven in-memory en el proceso runner. Por simetría con
+    /api/ws-status, idealmente persistirían a archivo. Por ahora el
+    server lee su propio _Metrics (vacío). El runner podría extenderse
+    para persistir similarmente; por ahora dejamos la lectura desde el
+    server como informativo del enabled flag.
+    """
+    import os
+    from src.copybot.crypto_arb import metrics as ca_metrics, CryptoArbConfig
+    cfg = CryptoArbConfig.from_env()
+    snap = ca_metrics.snapshot()
+    snap["enabled"] = cfg.enabled
+    snap["config"] = {
+        "check_interval_s": cfg.check_interval_s,
+        "momentum_threshold_pct": cfg.momentum_threshold_pct,
+        "max_mid_target": cfg.max_mid_target,
+        "bet_size_usdc": cfg.bet_size_usdc,
+        "symbols": list(cfg.symbols),
+    }
+    return snap
+
+
 @app.get("/api/ws-status")
 def api_ws_status() -> dict:
     """Snapshot del WS bridge.
