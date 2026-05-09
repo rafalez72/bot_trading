@@ -161,10 +161,16 @@ def open_position(
     price: float,
     timestamp: int,
     raw: dict | None = None,
+    our_entry_at: int | None = None,
+    our_entry_price: float | None = None,
 ) -> tuple[int | None, str | None]:
     """Abre un paper_trade copiando el BUY del source.
 
     Devuelve (paper_trade_id, reject_reason). Si rechaza, paper_trade_id=None.
+
+    `our_entry_at` y `our_entry_price` son telemetry de copy-lag: ts y mid
+    locales en el momento que procesamos. Si se omiten, defaultean a los del
+    source (compatibilidad pre-feature-G; rows viejas tienen NULL).
     """
     with tx() as conn:
         if _check_kill_switch(conn):
@@ -376,13 +382,20 @@ def open_position(
             return None, "capital_full"
 
         asset = (raw or {}).get("asset")
+        # Feature G: telemetry de copy lag. Si el caller no pasó our_entry_at/
+        # our_entry_price, defaulteamos our_entry_at a time.time() (procesamos
+        # ahora). our_entry_price puede quedar None si el caller no pudo cotizar
+        # mid (CLOB caído o asset no listado) — el análisis lo trata como
+        # "lag price unknown".
+        if our_entry_at is None:
+            our_entry_at = int(time.time())
         cur = conn.execute(
             """
             INSERT INTO paper_trades
                 (source_wallet, source_trade_id, condition_id, outcome, outcome_index,
                  side, entry_price, entry_size_usdc, entry_at, status, raw, asset,
-                 peak_price)
-            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, 'open', ?, ?, ?)
+                 peak_price, our_entry_at, our_entry_price)
+            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, 'open', ?, ?, ?, ?, ?)
             """,
             (
                 source_wallet, source_trade_id, condition_id, outcome, outcome_index,
@@ -390,6 +403,8 @@ def open_position(
                 json.dumps(raw, separators=(",", ":")) if raw else None,
                 asset,
                 price,  # peak_price arranca == entry_price
+                int(our_entry_at),
+                float(our_entry_price) if our_entry_price is not None else None,
             ),
         )
         return cur.lastrowid, None

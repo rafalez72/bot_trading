@@ -709,6 +709,13 @@ _MIGRATIONS = [
     "ALTER TABLE dx_trades ADD COLUMN funding_paid REAL DEFAULT 0",
     "ALTER TABLE dx_trades ADD COLUMN gas_paid REAL DEFAULT 0",
     "ALTER TABLE hl_trades ADD COLUMN gas_paid REAL DEFAULT 0",
+    # Feature G: telemetry de copy-lag. `entry_at` / `entry_price` se quedan
+    # con los valores DEL SOURCE (ts del trade original on-chain + price al que
+    # ejecutó el copied wallet). Estos dos extras almacenan el ts y mid LOCALES
+    # en el momento que nuestro bot procesó el evento. El delta entre los pares
+    # mide copy lag (segundos) y price gap (slippage de copia).
+    "ALTER TABLE paper_trades ADD COLUMN our_entry_at INTEGER",
+    "ALTER TABLE paper_trades ADD COLUMN our_entry_price REAL",
 ]
 
 

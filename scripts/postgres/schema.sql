@@ -111,8 +111,14 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     raw               JSONB,
     asset             TEXT,
     exit_reason       TEXT,
-    peak_price        DOUBLE PRECISION
+    peak_price        DOUBLE PRECISION,
+    -- Feature G: copy-lag telemetry. NULL para rows pre-migration.
+    our_entry_at      BIGINT,
+    our_entry_price   DOUBLE PRECISION
 );
+-- Idempotente para PG existentes que ya tenían paper_trades sin estos campos:
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS our_entry_at BIGINT;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS our_entry_price DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_source ON paper_trades(source_wallet);
 CREATE INDEX IF NOT EXISTS idx_paper_entry ON paper_trades(entry_at DESC);

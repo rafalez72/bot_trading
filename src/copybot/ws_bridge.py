@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from src.copybot.tradebook import (
@@ -44,6 +45,33 @@ log = logging.getLogger(__name__)
 
 # Cada cuánto refrescamos la lista de wallets activas (sin reconectar el WS).
 WALLET_REFRESH_S = 60.0
+
+
+def _fetch_clob_mid(asset: str | None) -> float | None:
+    """Lookup best-effort del midpoint actual del CLOB por token_id.
+
+    Devuelve None si no hay asset, falla la red, o el endpoint dice 404.
+    Timeout corto (1s) para NO bloquear burst de trades — el call-site corre
+    en `asyncio.to_thread` así que el event loop no se bloquea, pero igual
+    queremos cortar rápido cuando el CLOB está caído. Si no se puede cotizar,
+    `our_entry_price` queda None y el análisis lo ignora.
+    """
+    if not asset:
+        return None
+    try:
+        import httpx
+        from src.config import CLOB_API
+        r = httpx.get(
+            f"{CLOB_API}/midpoint",
+            params={"token_id": asset},
+            timeout=1.0,
+        )
+        if r.status_code != 200:
+            return None
+        mid = r.json().get("mid")
+        return float(mid) if mid is not None else None
+    except Exception:
+        return None
 
 
 def _active_wallets() -> list[str]:
@@ -155,6 +183,14 @@ def _make_handle_trade(active_wallets_lc: set[str]):
             # pool. El event loop queda libre. El thread pool default de
             # asyncio (~32 workers) maneja bursts sin problema.
             if side == "BUY":
+                # Feature G: copy-lag telemetry. Capturamos OUR ts y mid en
+                # el momento de procesar, no los del source. Mid via CLOB
+                # /midpoint con timeout 1s; si falla, our_entry_price queda
+                # None y solo registramos el lag temporal.
+                our_at = int(time.time())
+                our_mid = await asyncio.to_thread(
+                    _fetch_clob_mid, payload.get("asset")
+                )
                 pid, reason = await asyncio.to_thread(
                     open_position,
                     source_wallet=wallet_lc,
@@ -165,6 +201,8 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                     price=price,
                     timestamp=ts,
                     raw=payload,
+                    our_entry_at=our_at,
+                    our_entry_price=our_mid,
                 )
                 if pid:
                     ws_metrics.on_open_buy()
