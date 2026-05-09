@@ -186,6 +186,9 @@ def _hft_bucket_recent_pnl(window_hours: int = 24) -> tuple[float, int]:
     """
     import time as _t
     cutoff = int(_t.time()) - window_hours * 3600
+    # psycopg interpreta '%H' como format placeholder inválido. Parametrizar
+    # el LIKE pattern para evitar el conflict (también más seguro contra
+    # injection si alguna vez el filtro fuera dinámico).
     with db() as conn:
         r = conn.execute(
             """
@@ -194,10 +197,10 @@ def _hft_bucket_recent_pnl(window_hours: int = 24) -> tuple[float, int]:
             FROM paper_trades pt
             JOIN copy_subscriptions cs ON cs.wallet = pt.source_wallet
             WHERE pt.entry_at >= ?
-              AND cs.reason LIKE '%HFT%'
+              AND cs.reason LIKE ?
               AND pt.status IN ('closed_win','closed_loss','settled_win','settled_loss')
             """,
-            (cutoff,),
+            (cutoff, "%HFT%"),
         ).fetchone()
     if not r:
         return 0.0, 0
