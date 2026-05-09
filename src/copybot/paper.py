@@ -20,8 +20,10 @@ from typing import Iterable
 import time
 
 from src.config import (
+    BLOCK_ULTRASHORT_MARKETS,
     BOT_CAPITAL_USDC,
     COPY_BASE_USDC,
+    MARKET_HORIZON_MIN_SECS,
     MAX_PER_MARKET_PCT,
     MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
@@ -42,6 +44,26 @@ log = logging.getLogger(__name__)
 EPSILON = 1e-6
 
 
+def _parse_end_date_to_epoch(end_date: str | int | float | None) -> int | None:
+    """Convierte el `end_date` de la tabla markets a epoch seconds.
+
+    El indexer guarda el campo tal cual lo devuelve Gamma (ISO-8601 con `Z`).
+    Tolera también valores numéricos (epoch directo).
+    """
+    if end_date is None or end_date == "":
+        return None
+    if isinstance(end_date, (int, float)):
+        v = int(end_date)
+        # Si vino en ms (>1e11), normalizamos a s.
+        return v // 1000 if v > 9_999_999_999 else v
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 def _resolved_payout(outcome_prices_json: str | None, outcome_index: int | None) -> float | None:
     if not outcome_prices_json or outcome_index is None:
         return None
@@ -60,7 +82,7 @@ REJECT_REASONS = {
     "market_concentration", "low_liquidity", "low_volume", "extreme_price",
     "category_blocked", "policy_blocked", "cluster_blocked", "stale_trade",
     "expires_too_soon", "diversification_cap", "expected_pnl_too_low",
-    "wallet_concentration",
+    "wallet_concentration", "market_too_short", "ultrashort_market",
 }
 
 # Trades del wallet original más viejos que esto cuando los procesamos = no
@@ -90,7 +112,7 @@ def _ensure_market_stub(conn, condition_id: str, raw: dict | None) -> dict | Non
     Devuelve la fila resultante (existente o stub).
     """
     m = conn.execute(
-        "SELECT volume, liquidity, category, slug FROM markets WHERE condition_id=?",
+        "SELECT volume, liquidity, category, slug, end_date FROM markets WHERE condition_id=?",
         (condition_id,),
     ).fetchone()
     if m and (m["category"] or m["slug"]):
@@ -201,15 +223,55 @@ def open_position(
         # (cubre los mercados negRisk que la Gamma API no devuelve por conditionId)
         m = _ensure_market_stub(conn, condition_id, raw)
 
+        # Resolvemos el slug temprano: lo necesitan tanto el market_horizon
+        # check (Feature E) como el slug-epoch check más abajo.
+        slug_for_filters = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
+        if not slug_for_filters and m:
+            try:
+                slug_for_filters = m["slug"]
+            except (KeyError, IndexError):
+                slug_for_filters = None
+
+        # Feature A: short-horizon market filter.
+        # Markets cuyo `end_date` está a <MARKET_HORIZON_MIN_SECS (default 30min)
+        # son ruido para SL=20%: el mid se mueve por noise pre-resolución.
+        # Excluimos `crypto_arb` que está diseñado para markets de 5min.
+        # Si end_date es desconocido/None → fail-open (no rechazar).
+        if source_wallet != "crypto_arb" and m is not None:
+            try:
+                end_date_raw = m["end_date"]
+            except (KeyError, IndexError):
+                end_date_raw = None
+            end_ts = _parse_end_date_to_epoch(end_date_raw)
+            if end_ts is None:
+                log.debug(
+                    "market_horizon: end_date desconocido cid=%s — allow",
+                    (condition_id or "")[:10],
+                )
+            else:
+                horizon_left = end_ts - int(time.time())
+                if horizon_left < MARKET_HORIZON_MIN_SECS:
+                    return None, "market_too_short"
+
+        # Feature E: bloqueo por categoría ultra-corta (esports live,
+        # crypto-updown 5/15min, sport in-play). Independiente del check de
+        # horizon: aplica aunque end_date no esté disponible para crypto/esports
+        # (que se detectan por slug pattern).
+        if BLOCK_ULTRASHORT_MARKETS and source_wallet != "crypto_arb":
+            from src.copybot.categorize import is_ultrashort_market
+            end_ts_for_cat = None
+            if m is not None:
+                try:
+                    end_ts_for_cat = _parse_end_date_to_epoch(m["end_date"])
+                except (KeyError, IndexError):
+                    end_ts_for_cat = None
+            if is_ultrashort_market(slug_for_filters, end_ts_for_cat):
+                return None, "ultrashort_market"
+
         # Smart expiry filter: bloquea markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS
         # (default 600s = 10min). Cubre slugs con epoch al final, slugs con
         # date+hour ET, y -YYYY-MM-DD$ al final. Fail-open si no parsea.
-        slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
-        if not slug and m:
-            try:
-                slug = m["slug"]
-            except (KeyError, IndexError):
-                slug = None
+        slug = slug_for_filters
         expiry_ts = parse_slug_expiry(slug)
         if expiry_ts is not None:
             time_left = expiry_ts - int(time.time())
