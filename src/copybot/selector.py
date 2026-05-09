@@ -60,6 +60,21 @@ HFT_MAX_SHARPE = float(os.getenv("HFT_MAX_SHARPE", "5.0"))
 HFT_SHARPE_LARGE_SAMPLE = 200       # umbral de muestra para tolerar sharpe alto
 HFT_MAX_VOL_PNL_RATIO = float(os.getenv("HFT_MAX_VOL_PNL_RATIO", "100.0"))
 
+# Kill switch del bucket HFT (Feature F, 2026-05-09).
+# Manual: HFT_BUCKET_ENABLED=false desactiva el merge en select_traders.
+# Auto: si la suma de PnL del bucket en últimas 24h cae por debajo de
+# HFT_AUTO_DISABLE_PNL_24H (con muestra >= HFT_AUTO_DISABLE_MIN_TRADES),
+# skipeamos el merge para esta corrida. Decisión es por-llamada (no
+# persistida): la próxima vez el chequeo se vuelve a hacer.
+def _hft_bucket_enabled() -> bool:
+    """Lee env at-call-time para que cambios sean efectivos sin reload."""
+    return os.getenv("HFT_BUCKET_ENABLED", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+HFT_AUTO_DISABLE_PNL_24H = float(os.getenv("HFT_AUTO_DISABLE_PNL_24H", "-10.0"))
+HFT_AUTO_DISABLE_MIN_TRADES = 5
+
 
 def _build_reason(m: dict) -> str:
     parts: list[str] = []
@@ -162,6 +177,33 @@ def select_hft_traders(top_n: int = DEFAULT_HFT_TOP_N) -> list[dict]:
     return qualifying[:top_n]
 
 
+def _hft_bucket_recent_pnl(window_hours: int = 24) -> tuple[float, int]:
+    """Devuelve (pnl, n_trades) de las paper_trades cerradas en últimas N horas
+    para wallets cuya copy_subscription tiene "HFT" en reason.
+
+    Backend-agnostic: cutoff calculado en Python y pasado como param.
+    Usa db() (read-only). Si la tabla no tiene rows o no hay match, devuelve (0.0, 0).
+    """
+    import time as _t
+    cutoff = int(_t.time()) - window_hours * 3600
+    with db() as conn:
+        r = conn.execute(
+            """
+            SELECT COALESCE(SUM(pt.pnl_usdc), 0) AS pnl,
+                   COUNT(pt.id) AS n
+            FROM paper_trades pt
+            JOIN copy_subscriptions cs ON cs.wallet = pt.source_wallet
+            WHERE pt.entry_at >= ?
+              AND cs.reason LIKE '%HFT%'
+              AND pt.status IN ('closed_win','closed_loss','settled_win','settled_loss')
+            """,
+            (cutoff,),
+        ).fetchone()
+    if not r:
+        return 0.0, 0
+    return float(r["pnl"] or 0.0), int(r["n"] or 0)
+
+
 def select_traders(
     top_n: int = DEFAULT_TOP_N,
     *,
@@ -227,8 +269,32 @@ def select_traders(
     # Bucket HFT (top by trades_per_day) — agregamos al pool. El wallet
     # puede aparecer ya en el bucket clásico (overlap es OK, el dict no
     # duplica). Marcamos los nuevos HFT-only para auditoría.
+    #
+    # Feature F: kill switch (manual + auto). El bucket se puede desactivar
+    # via env (HFT_BUCKET_ENABLED=false) o automáticamente si su PnL 24h
+    # cayó por debajo del threshold con muestra significativa.
     hft_only_wallets: set[str] = set()
-    if include_hft:
+    hft_bucket_active = include_hft
+
+    if hft_bucket_active and not _hft_bucket_enabled():
+        log.info("HFT bucket disabled via HFT_BUCKET_ENABLED env — skipping merge")
+        hft_bucket_active = False
+
+    if hft_bucket_active:
+        hft_pnl, hft_n = _hft_bucket_recent_pnl(window_hours=24)
+        if hft_n >= HFT_AUTO_DISABLE_MIN_TRADES and hft_pnl < HFT_AUTO_DISABLE_PNL_24H:
+            log.warning(
+                "HFT bucket auto-disabled: pnl 24h $%+.2f < $%+.2f con %d trades — skipping merge",
+                hft_pnl, HFT_AUTO_DISABLE_PNL_24H, hft_n,
+            )
+            hft_bucket_active = False
+            summary["hft_auto_disabled"] = {
+                "pnl_24h": hft_pnl,
+                "n_trades": hft_n,
+                "threshold": HFT_AUTO_DISABLE_PNL_24H,
+            }
+
+    if hft_bucket_active:
         hft_candidates = select_hft_traders(top_n=hft_top_n)
         for hft in hft_candidates:
             w = hft["wallet"]
