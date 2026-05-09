@@ -177,11 +177,19 @@ class PolymarketTradesWS:
                 )
                 for task in pending:
                     task.cancel()
-                # surface the first exception, if any
+                # Drenar excepciones de TODOS los done antes de raise — si solo
+                # leemos la del primero, el warning "Task exception was never
+                # retrieved" salta cuando ambos terminan a la vez (caso típico:
+                # ConnectionClosed del server cierra heartbeat y consume juntos).
+                first_exc = None
                 for task in done:
+                    if task.cancelled():
+                        continue
                     exc = task.exception()
-                    if exc is not None:
-                        raise exc
+                    if exc is not None and first_exc is None:
+                        first_exc = exc
+                if first_exc is not None:
+                    raise first_exc
             finally:
                 for task in (heartbeat_task, consume_task):
                     if not task.done():
