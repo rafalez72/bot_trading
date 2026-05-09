@@ -160,6 +160,20 @@ LIVE_RETRY_PRICE_BUMP_PCT = float(os.getenv("LIVE_RETRY_PRICE_BUMP_PCT", "0.01")
 # fill real (BUY paga más, SELL recibe menos).
 LIVE_DRY_SLIPPAGE_PCT = float(os.getenv("LIVE_DRY_SLIPPAGE_PCT", "0.015"))  # 1.5% pesimista
 
+# ---------- Discovery: TopVolume sweep (2026-05-09) ----------
+# Una vez por día (configurable), pulleamos top-N wallets por volumen 24h
+# desde data-api.polymarket.com/trades y disparamos backfill para los que
+# todavía no tenemos en trader_metrics. Diseño: ver
+# src/copybot/discovery_topvolume.py.
+#
+# Sin esto, nuestro universo crece sólo cuando un wallet aparece en el feed
+# global durante el discover de N páginas — los wallets de mayor volumen rara
+# vez tocan el tope del feed (que va por timestamp). Resultado: 4052 wallets
+# vs ~4400 únicos/h reales en Polymarket.
+DISCOVERY_TOPVOLUME_ENABLED = os.getenv("DISCOVERY_TOPVOLUME_ENABLED", "true").lower() == "true"
+DISCOVERY_TOPVOLUME_LIMIT = int(os.getenv("DISCOVERY_TOPVOLUME_LIMIT", "1000"))
+DISCOVERY_TOPVOLUME_INTERVAL_HOURS = int(os.getenv("DISCOVERY_TOPVOLUME_INTERVAL_HOURS", "24"))
+
 # ---------- WebSocket trades listener (Polymarket RTDS) ----------
 # Feature flag para activar el listener de la RTDS WebSocket
 # (`activity:trades`) en lugar del polling HTTP cada 5s.

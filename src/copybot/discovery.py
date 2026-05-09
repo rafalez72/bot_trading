@@ -85,6 +85,19 @@ async def run_cycle(*, force: bool = False) -> dict:
 
     out: dict = {"discovered": 0, "backfilled": 0, "computed": 0, "select": None}
 
+    # 0) TopVolume sweep (1×/día). Tiene su propio guard interno por
+    # `bot_state['topvolume_last_run']`, así que pasarlo cada ciclo es no-op
+    # cuando no toca; sólo corre cuando ya pasaron DISCOVERY_TOPVOLUME_INTERVAL_HOURS.
+    # Lo metemos antes del discover global porque alimenta wallets nuevos
+    # ranked por volumen (los que más nos interesan), aumentando la chance
+    # de que el resto del ciclo encuentre data fresca.
+    try:
+        from src.copybot.discovery_topvolume import discover_top_volume_wallets
+        out["topvolume"] = await discover_top_volume_wallets()
+    except Exception as e:
+        log.exception("topvolume sweep failed: %s", e)
+        out["topvolume"] = {"error": str(e)}
+
     # 1) Discover
     try:
         n = await discover_traders(max_pages=DISCOVER_PAGES, page_size=500)
