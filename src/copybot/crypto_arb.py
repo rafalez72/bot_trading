@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from src.binance.websocket import BinanceTickerWS
+from src.copybot.crypto_arb_signals import edge_vs_mid, get_min_edge
 from src.copybot.tradebook import MODE as TRADEBOOK_MODE, open_position
 from src.polymarket.client import PolymarketClient
 
@@ -109,7 +110,8 @@ class _Metrics:
     markets_seen: int = 0
     markets_in_window: int = 0
     skipped_no_spot: int = 0
-    skipped_low_momentum: int = 0
+    skipped_low_edge: int = 0          # nuevo (edge-based): reemplaza skipped_low_momentum
+    skipped_slope_disagrees: int = 0   # slope de últimos 30s contradice el side
     skipped_overbought: int = 0
     skipped_too_young: int = 0
     skipped_open_failed: int = 0
@@ -121,6 +123,8 @@ class _Metrics:
 
     def snapshot(self) -> dict:
         now = time.time()
+        # ``low_momentum`` se mantiene como alias deprecated de ``low_edge``
+        # para no romper consumidores existentes del snapshot file.
         return {
             "uptime_s": round(now - self.started_at, 1),
             "cycles": self.cycles,
@@ -128,7 +132,9 @@ class _Metrics:
             "markets_in_window": self.markets_in_window,
             "skipped": {
                 "no_spot": self.skipped_no_spot,
-                "low_momentum": self.skipped_low_momentum,
+                "low_edge": self.skipped_low_edge,
+                "low_momentum": self.skipped_low_edge,  # deprecated alias
+                "slope_disagrees": self.skipped_slope_disagrees,
                 "overbought": self.skipped_overbought,
                 "too_young": self.skipped_too_young,
                 "open_failed": self.skipped_open_failed,
@@ -328,23 +334,50 @@ def _evaluate_market(
         return None
 
     move_pct = (cur_price / start_price - 1.0) * 100.0
-    abs_move = abs(move_pct)
-    if abs_move < config.momentum_threshold_pct:
-        metrics.skipped_low_momentum += 1
+
+    # Modelo probabilístico (reemplaza el threshold de momentum):
+    # - p_up = P(close > start) bajo drift normal residual
+    # - edge_vs_mid compara contra el mid del lado UP de Polymarket y
+    #   decide side (Up/Down) o ninguno si el mispricing < threshold.
+    mid_up = _market_midpoint(market.get("outcomePrices"), 0)
+    if mid_up is None:
+        # Sin mid no podemos comparar — no es low_edge propiamente, lo
+        # tratamos como no_spot semánticamente (datos faltantes).
+        metrics.skipped_no_spot += 1
+        return None
+    edge, side_label, p_up = edge_vs_mid(
+        spot_move_pct=move_pct,
+        secs_left=float(secs_to_close),
+        symbol=symbol,
+        mid_up=mid_up,
+    )
+    if side_label is None:
+        metrics.skipped_low_edge += 1
         return None
 
-    # Determinar side. Polymarket suele tener outcomes [Up, Down] o
-    # [Yes, No] dependiendo del market. Asumimos outcome_index 0=Up/Yes,
-    # 1=Down/No (verificar contra outcomes en la primera operación real).
-    if move_pct > 0:
-        side_label = "Up"
-        outcome_index = 0
-    else:
-        side_label = "Down"
-        outcome_index = 1
+    outcome_index = 0 if side_label == "Up" else 1
 
-    mid = _market_midpoint(market.get("outcomePrices"), outcome_index)
-    if mid is not None and mid > config.max_mid_target:
+    # Slope confirmation: si el slope de los últimos 30s contradice el
+    # side, skip (defensa contra rebote tardío). Tomamos el sample más
+    # antiguo dentro de los últimos ~30s + el sample actual.
+    cutoff_ms = (now - 30) * 1000
+    p_30s_ago = None
+    for ts_ms, p in history:
+        if ts_ms >= cutoff_ms:
+            p_30s_ago = p
+            break
+    if p_30s_ago is not None:
+        slope_pct = (cur_price / p_30s_ago - 1.0) * 100.0
+        # Tolerancia chica (~1bp) para evitar descartar por ruido.
+        if (side_label == "Up" and slope_pct < -0.01) or (
+            side_label == "Down" and slope_pct > 0.01
+        ):
+            metrics.skipped_slope_disagrees += 1
+            return None
+
+    # Overbought guard: el mid del lado a comprar.
+    side_mid = mid_up if outcome_index == 0 else (1.0 - mid_up)
+    if side_mid > config.max_mid_target:
         metrics.skipped_overbought += 1
         return None
 
@@ -355,11 +388,15 @@ def _evaluate_market(
         "size_usdc": config.bet_size_usdc,
         "reason": (
             f"spot {symbol} {move_pct:+.2f}% en {bucket_age:.0f}s "
-            f"(thr {config.momentum_threshold_pct:.2f}%) · mid={mid}"
+            f"· p_up={p_up:.3f} mid_up={mid_up:.3f} edge={edge:.3f} "
+            f"side={side_label} secs_left={secs_to_close}"
         ),
         "spot_now": cur_price,
         "spot_start": start_price,
         "secs_to_close": secs_to_close,
+        "p_up": p_up,
+        "mid_up": mid_up,
+        "edge": edge,
     }
 
 
@@ -383,6 +420,9 @@ async def _open_arb_trade(market: dict, decision: dict) -> int | None:
         "spot_now": decision["spot_now"],
         "spot_start": decision["spot_start"],
         "secs_to_close": decision["secs_to_close"],
+        "p_up": decision.get("p_up"),
+        "mid_up": decision.get("mid_up"),
+        "edge": decision.get("edge"),
         "reason": decision["reason"],
         "end_ts": end_ts,
     }
@@ -436,9 +476,11 @@ async def crypto_arb_loop() -> None:
         log.info("crypto_arb: disabled (CRYPTO_ARB_ENABLED!=true)")
         return
     log.info(
-        "crypto_arb: arrancando — interval=%ss thr=%s%% bet=$%s symbols=%s",
-        config.check_interval_s, config.momentum_threshold_pct,
-        config.bet_size_usdc, ",".join(config.symbols),
+        "crypto_arb: arrancando — interval=%ss min_edge=%.3f bet=$%s "
+        "pre_close_window=%ss symbols=%s",
+        config.check_interval_s, get_min_edge(),
+        config.bet_size_usdc, config.pre_close_window_s,
+        ",".join(config.symbols),
     )
 
     # Histórico de precios spot por símbolo. Cada (ts_ms, price). Cap de
