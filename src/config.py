@@ -18,6 +18,27 @@ COPY_POLL_SECONDS = int(os.getenv("COPY_POLL_SECONDS", "10"))
 # Risk management
 BOT_CAPITAL_USDC = float(os.getenv("BOT_CAPITAL_USDC", "100.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.30"))
+
+# Adaptive stop-loss por horizonte de market.
+# Análisis 2026-05-09 (13h trading): 8/12 losses por SL firing 20-26% en
+# markets short-term (crypto-updown 15min, esports live) donde el mid oscila
+# ±50% naturalmente pre-resolución. SL único = 0.30 desclasifica trades
+# que terminan ganadores. En markets >12h (elections, news) un drop 20-30%
+# SÍ es señal real de loss. Solución: 4 buckets por seconds_to_market_end.
+# Si end_date es desconocido, fallback a STOP_LOSS_PCT (compat).
+# Buckets:
+#   < b0  → ULTRASHORT (default 1.00 = effectively disabled, dejamos que resuelva)
+#   < b1  → SHORT      (default 0.40)
+#   < b2  → MEDIUM     (default 0.30)
+#   else  → LONG       (default 0.20)
+STOP_LOSS_PCT_ULTRASHORT = float(os.getenv("STOP_LOSS_PCT_ULTRASHORT", "1.00"))
+STOP_LOSS_PCT_SHORT = float(os.getenv("STOP_LOSS_PCT_SHORT", "0.40"))
+STOP_LOSS_PCT_MEDIUM = float(os.getenv("STOP_LOSS_PCT_MEDIUM", "0.30"))
+STOP_LOSS_PCT_LONG = float(os.getenv("STOP_LOSS_PCT_LONG", "0.20"))
+# Boundaries (segundos) entre buckets, comma-separated.
+# Default: 1800s (30min), 7200s (2h), 43200s (12h).
+STOP_LOSS_HORIZON_BUCKETS_S = os.getenv("STOP_LOSS_HORIZON_BUCKETS_S", "1800,7200,43200")
+
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.80"))
 MAX_PER_MARKET_PCT = float(os.getenv("MAX_PER_MARKET_PCT", "0.20"))
 MIN_MARKET_LIQUIDITY_USDC = float(os.getenv("MIN_MARKET_LIQUIDITY_USDC", "5000"))
@@ -51,6 +72,19 @@ MAX_WALLET_24H_PCT = float(os.getenv("MAX_WALLET_24H_PCT", "0.50"))
 # valores altos demostraron rechazar el 100% del flow.
 _min_exp_user = int(os.getenv("MIN_TIME_TO_EXPIRY_SECONDS", "180"))
 MIN_TIME_TO_EXPIRY_SECONDS = min(_min_exp_user, 300)  # cap 5min
+
+# Market horizon mínimo: bloqueamos mercados cuyo `end_date` (Gamma API) está a
+# menos de N segundos de ahora. Es complementario a MIN_TIME_TO_EXPIRY_SECONDS:
+# ese parsea el slug (epoch al final), éste lee el campo end_date de la tabla
+# markets. Markets <30min son ruido para SL=20% — el mid se mueve por noise y
+# disparamos el stop sin que haya tendencia. Default 30min. Se exenta a
+# `crypto_arb` que está diseñado para markets ultra-cortos (5min).
+MARKET_HORIZON_MIN_SECS = int(os.getenv("MARKET_HORIZON_MIN_SECS", "1800"))
+
+# Bloqueo de categorías ultra-cortas (esports live, crypto-updown 5/15min, sport
+# in-play). Default ON: a corto plazo el bot pierde plata copiando wallets que
+# operan estos markets — el spread + slippage + ruido del mid superan al edge.
+BLOCK_ULTRASHORT_MARKETS = os.getenv("BLOCK_ULTRASHORT_MARKETS", "true").lower() == "true"
 
 # ---------- Live trading (Fase 5 - plata real) ----------
 # LIVE_MODE=false → paper trading (default).

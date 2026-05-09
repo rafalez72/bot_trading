@@ -113,3 +113,71 @@ def test_kill_switch_reactivates_on_new_losses_after_reset(isolated_db, now_ts, 
 
     assert risk.check_kill_switch() is True
     assert risk.kill_switch_status()["active"] is True
+
+
+# ---------- _horizon_bucket: pure function, no DB needed ----------
+
+
+def test_horizon_bucket_unknown_falls_back_to_legacy():
+    """`secs_left=None` → ('unknown', STOP_LOSS_PCT) — back-compat path."""
+    label, thr = risk._horizon_bucket(None)
+    assert label == "unknown"
+    assert thr == risk.STOP_LOSS_PCT
+
+
+def test_horizon_bucket_ultrashort():
+    """secs_left negativo o muy chico → ultrashort threshold."""
+    label, thr = risk._horizon_bucket(-100)
+    assert label == "ultrashort"
+    assert thr == risk.STOP_LOSS_PCT_ULTRASHORT
+
+    label, thr = risk._horizon_bucket(60)  # 1 min
+    assert label == "ultrashort"
+    assert thr == risk.STOP_LOSS_PCT_ULTRASHORT
+
+
+def test_horizon_bucket_short():
+    """30min < secs_left < 2h → short."""
+    label, thr = risk._horizon_bucket(1800)   # exactamente 30 min → short
+    assert label == "short"
+    assert thr == risk.STOP_LOSS_PCT_SHORT
+
+    label, thr = risk._horizon_bucket(3600)   # 1 h
+    assert label == "short"
+
+
+def test_horizon_bucket_medium():
+    """2h < secs_left < 12h → medium."""
+    label, thr = risk._horizon_bucket(7200)   # 2 h boundary → medium
+    assert label == "medium"
+    assert thr == risk.STOP_LOSS_PCT_MEDIUM
+
+    label, _ = risk._horizon_bucket(20000)    # ~5.5 h
+    assert label == "medium"
+
+
+def test_horizon_bucket_long():
+    """secs_left >= 12h → long."""
+    label, thr = risk._horizon_bucket(43200)  # 12 h boundary → long
+    assert label == "long"
+    assert thr == risk.STOP_LOSS_PCT_LONG
+
+    label, _ = risk._horizon_bucket(86400 * 7)  # 1 week
+    assert label == "long"
+
+
+def test_parse_horizon_buckets_invalid_falls_back_to_defaults():
+    """Strings malformados devuelven defaults sin crashear."""
+    assert risk._parse_horizon_buckets("garbage") == (1800, 7200, 43200)
+    assert risk._parse_horizon_buckets("1,2") == (1800, 7200, 43200)        # too few
+    assert risk._parse_horizon_buckets("0,1,2") == (1800, 7200, 43200)      # zero invalid
+    assert risk._parse_horizon_buckets("100,50,200") == (50, 100, 200)      # auto-sort
+
+
+def test_end_date_to_epoch_handles_iso_and_null():
+    """ISO 8601 con sufijo Z se parsea, vacío/None → None."""
+    assert risk._end_date_to_epoch(None) is None
+    assert risk._end_date_to_epoch("") is None
+    assert risk._end_date_to_epoch("not-a-date") is None
+    # 2030-01-01T00:00:00Z = 1893456000
+    assert risk._end_date_to_epoch("2030-01-01T00:00:00Z") == 1893456000

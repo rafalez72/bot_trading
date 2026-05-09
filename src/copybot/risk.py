@@ -20,7 +20,12 @@ from src.config import (
     DATA_API,
     LIVE_CAPITAL_USDC,
     LIVE_MODE,
+    STOP_LOSS_HORIZON_BUCKETS_S,
     STOP_LOSS_PCT,
+    STOP_LOSS_PCT_LONG,
+    STOP_LOSS_PCT_MEDIUM,
+    STOP_LOSS_PCT_SHORT,
+    STOP_LOSS_PCT_ULTRASHORT,
     TAKE_PROFIT_PCT,
     TRAIL_ACTIVATION_PCT,
     TRAIL_DROP_PCT,
@@ -206,6 +211,66 @@ def pause_bot(reason: str = "manual pause") -> None:
 
 # ---------------- Stop-loss / take-profit ----------------
 
+
+def _parse_horizon_buckets(raw: str) -> tuple[int, int, int]:
+    """Parsea STOP_LOSS_HORIZON_BUCKETS_S → (b0, b1, b2) segundos.
+
+    Devuelve los defaults (1800, 7200, 43200) si el string es inválido.
+    Garantiza orden creciente (cualquier permutación se ordena ascendente).
+    """
+    defaults = (1800, 7200, 43200)
+    try:
+        parts = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        if len(parts) != 3 or any(p <= 0 for p in parts):
+            return defaults
+        parts.sort()
+        return (parts[0], parts[1], parts[2])
+    except Exception:
+        return defaults
+
+
+_HORIZON_BUCKETS = _parse_horizon_buckets(STOP_LOSS_HORIZON_BUCKETS_S)
+
+
+def _horizon_bucket(secs_left: float | None) -> tuple[str, float]:
+    """Devuelve (label, threshold_pct) para `secs_left` segundos hasta end_date.
+
+    - secs_left None      → ("unknown", STOP_LOSS_PCT)  fallback
+    - secs_left <= 0      → ("ultrashort", STOP_LOSS_PCT_ULTRASHORT)
+    - secs_left <  b0     → ("ultrashort", STOP_LOSS_PCT_ULTRASHORT)
+    - secs_left <  b1     → ("short",      STOP_LOSS_PCT_SHORT)
+    - secs_left <  b2     → ("medium",     STOP_LOSS_PCT_MEDIUM)
+    - else                → ("long",       STOP_LOSS_PCT_LONG)
+    """
+    if secs_left is None:
+        return ("unknown", STOP_LOSS_PCT)
+    b0, b1, b2 = _HORIZON_BUCKETS
+    if secs_left < b0:
+        return ("ultrashort", STOP_LOSS_PCT_ULTRASHORT)
+    if secs_left < b1:
+        return ("short", STOP_LOSS_PCT_SHORT)
+    if secs_left < b2:
+        return ("medium", STOP_LOSS_PCT_MEDIUM)
+    return ("long", STOP_LOSS_PCT_LONG)
+
+
+def _end_date_to_epoch(end_date: str | None) -> int | None:
+    """Parsea end_date (ISO 8601, ej '2026-12-31T23:59:59Z') → epoch UTC.
+
+    Devuelve None si el valor es nulo, vacío o no parseable. Mismo patrón
+    que crypto_arb._parse_iso_to_epoch — duplicado acá para evitar import
+    cruzado.
+    """
+    if not end_date:
+        return None
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 # Cache de precios CLOB. Cada sweep_stops() corre cada STOPLOSS_SWEEP_SECONDS
 # (default 15s) y agrupa por asset, así que el TTL de 3s es defensivo: cubre
 # el caso de múltiples llamadas dentro del mismo ciclo (open + sweep + dashboard)
@@ -299,10 +364,16 @@ async def sweep_stops() -> dict:
       3. Stop-loss tradicional.
       4. Take-profit tradicional.
     """
+    # JOIN markets para extraer end_date y poder elegir el threshold de SL
+    # adaptado al horizonte (ver `_horizon_bucket`). LEFT JOIN: si el market
+    # no está en la tabla local (raza con indexer, market manual, etc.), la
+    # columna queda NULL y caemos al fallback STOP_LOSS_PCT.
     sql = f"""
-        SELECT id, asset, entry_price, entry_size_usdc, source_wallet, peak_price
-        FROM {TRADES_TABLE}
-        WHERE status='open' AND asset IS NOT NULL
+        SELECT t.id, t.asset, t.entry_price, t.entry_size_usdc,
+               t.source_wallet, t.peak_price, m.end_date
+        FROM {TRADES_TABLE} t
+        LEFT JOIN markets m ON m.condition_id = t.condition_id
+        WHERE t.status='open' AND t.asset IS NOT NULL
     """
     with db() as conn:
         rows = conn.execute(sql).fetchall()
@@ -349,6 +420,10 @@ async def sweep_stops() -> dict:
                 # 2) Trailing stop — corre PRIMERO, toma prioridad sobre SL/TP.
                 # Activa solo si el peak alcanzó la activación y el precio
                 # actual cayó >=TRAIL_DROP_PCT desde el peak.
+                # TODO: aplicar bucketing por horizonte también acá (mismo
+                # patrón que stop-loss adaptativo, ver STOP_LOSS_HORIZON_BUCKETS_S
+                # y `_horizon_bucket`). En markets ultrashort (<30min) el
+                # trailing actual también puede cerrar trades sanos por ruido.
                 trail_sl = new_peak * (1 - TRAIL_DROP_PCT)
                 if peak_gain >= TRAIL_ACTIVATION_PCT and cur < trail_sl:
                     peak_pct = int(peak_gain * 100)
@@ -364,13 +439,28 @@ async def sweep_stops() -> dict:
                     )
                     continue
 
-                # 3) Stop-loss tradicional
-                if drop >= STOP_LOSS_PCT:
-                    force_close(p["id"], cur, reason=f"stop_loss_{int(drop*100)}pct")
+                # 3) Stop-loss adaptado al horizonte del market.
+                # crypto_arb tiene exit logic propia: usamos STOP_LOSS_PCT
+                # plano (sin bucketing por horizonte) para no interferir.
+                wallet_src = (p.get("source_wallet") or "")
+                if wallet_src == "crypto_arb":
+                    sl_threshold = STOP_LOSS_PCT
+                    bucket_label = "crypto_arb"
+                else:
+                    end_epoch = _end_date_to_epoch(p.get("end_date"))
+                    secs_left = (end_epoch - int(time.time())) if end_epoch else None
+                    bucket_label, sl_threshold = _horizon_bucket(secs_left)
+
+                if drop >= sl_threshold:
+                    force_close(
+                        p["id"], cur,
+                        reason=f"stop_loss_{int(drop*100)}pct_h_{bucket_label}",
+                    )
                     sl_count += 1
                     log.info(
-                        "STOP-LOSS  paper #%d  entry=%.3f cur=%.3f  -%.0f%%",
+                        "STOP-LOSS  paper #%d  entry=%.3f cur=%.3f  -%.0f%% [h=%s thr=%.0f%%]",
                         p["id"], entry, cur, drop * 100,
+                        bucket_label, sl_threshold * 100,
                     )
                     # Notif solo si es grande (>$3 perdido)
                     loss_usdc = (cur - entry) * (p["entry_size_usdc"] / entry)
