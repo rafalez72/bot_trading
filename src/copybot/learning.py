@@ -223,9 +223,9 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
             ).fetchone()
         accumulated = total_row["p"] or 0
         if pnl_amount > 0:
-            notif_gain(pnl_amount, accumulated)
+            notif_gain(pnl_amount, accumulated, pt=pt)
         elif pnl_amount < 0:
-            notif_loss(abs(pnl_amount), accumulated)
+            notif_loss(abs(pnl_amount), accumulated, pt=pt)
     except Exception as e:
         log.warning("gain/loss notif failed: %s", e)
 

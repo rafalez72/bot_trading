@@ -96,24 +96,78 @@ def send(text: str, *, parse_mode: str = "Markdown", silent: bool = False) -> bo
 
 # ---------- Helpers de eventos específicos ----------
 
-def gain(amount: float, accumulated: float) -> None:
+_CATEGORY_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    # (regex_or_substr, emoji, label) — primer match gana
+    (r"-updown-(5m|15m|1h|4h)", "🪙", "Crypto-shortterm"),
+    (r"^(btc|eth|sol|xrp|bnb|hype|doge|usdt|usdc)-", "🪙", "Crypto"),
+    (r"(bitcoin|ethereum|crypto)", "🪙", "Crypto"),
+    (r"^(nba|will-.*-nba)", "🏀", "NBA"),
+    (r"^(nfl|will-.*-nfl|super-bowl)", "🏈", "NFL"),
+    (r"^(mlb|will-.*-mlb|world-series)", "⚾", "MLB"),
+    (r"^(nhl|will-.*-nhl|stanley-cup)", "🏒", "NHL"),
+    (r"^(ufc|fight-)", "🥊", "UFC"),
+    (r"^(epl|laliga|serie-a|bundesliga|champions|premier-league)", "⚽", "Soccer"),
+    (r"^(cs2|csgo|lol|valorant|dota|esports)", "🎮", "Esports"),
+    (r"(temperature|weather|will-it-rain|snow)", "☀️", "Weather"),
+    (r"(election|president|senate|congress|gobierno|elecci)", "🗳️", "Politics"),
+    (r"(oscar|grammy|emmy|movie|film|netflix|spotify)", "🎬", "Entertainment"),
+    (r"(fed|inflation|gdp|unemployment|jobs-report|cpi)", "📊", "Economy"),
+)
+
+
+def _classify_market(pt) -> str:
+    """Devuelve un breve descriptor `emoji label · "title"` del trade.
+
+    pt es una row de paper_trades (dict-like). Lee `raw` (JSONB) para
+    sacar slug+title. Si raw no está, fallback a condition_id.
+    """
+    import re as _re
+
+    raw = pt.get("raw") if isinstance(pt, dict) else pt["raw"] if "raw" in pt.keys() else None
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            raw = _json.loads(raw)
+        except Exception:
+            raw = None
+    raw = raw or {}
+    slug = (raw.get("slug") or raw.get("eventSlug") or "").lower()
+    title = raw.get("title") or raw.get("question") or ""
+
+    emoji, label = "🎯", "Otros"
+    for pat, e, lbl in _CATEGORY_PATTERNS:
+        if _re.search(pat, slug):
+            emoji, label = e, lbl
+            break
+
+    parts = [f"{emoji} {label}"]
+    if title:
+        # Cap titulo a 70 chars para no inflar el msg
+        t = title if len(title) <= 70 else title[:67] + "…"
+        parts.append(f"_{t}_")
+    return " · ".join(parts)
+
+
+def gain(amount: float, accumulated: float, pt=None) -> None:
     """Notif por cada trade cerrado con ganancia."""
     if "gain" not in ENABLED_NOTIFICATIONS:
         return
+    detail = f"\n{_classify_market(pt)}" if pt is not None else ""
     send(
         f"📈 *Ganancia*\n"
-        f"Ganó: ${amount:.2f}\n"
+        f"Ganó: ${amount:.2f}{detail}\n"
         f"Acumulado: ${accumulated:+.2f}"
     )
 
 
-def loss(amount: float, accumulated: float) -> None:
+def loss(amount: float, accumulated: float, pt=None) -> None:
     """Notif por cada trade cerrado con pérdida."""
     if "loss" not in ENABLED_NOTIFICATIONS:
         return
+    detail = f"\n{_classify_market(pt)}" if pt is not None else ""
     send(
         f"📉 *Pérdida*\n"
-        f"Perdió: ${amount:.2f}\n"
+        f"Perdió: ${amount:.2f}{detail}\n"
         f"Acumulado: ${accumulated:+.2f}"
     )
 
