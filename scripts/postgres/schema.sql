@@ -302,9 +302,11 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_wallet ON shadow_trades(wallet, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_shadow_observed ON shadow_trades(observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, timestamp DESC);
 -- Idempotent migration for existing PG installs: add mode column if missing.
+-- DEBE ir antes del CREATE INDEX que la referencia, sino en tablas viejas
+-- (creadas pre-feature) el index falla porque la columna no existe.
 ALTER TABLE shadow_trades ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'post_drop';
+CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS dx_trades (
     id              BIGSERIAL PRIMARY KEY,
