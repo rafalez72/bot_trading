@@ -54,17 +54,22 @@ log = logging.getLogger(__name__)
 _SNAPSHOT_PATH = Path(os.getenv("DB_PATH", "data/copybot.db")).parent / "crypto_arb_metrics.json"
 
 # Símbolos que tradeamos. Mapping a los slug-prefixes de Polymarket.
+# HYPE no está en Binance Spot (verificado vía exchangeInfo), así que
+# queda excluido aunque Polymarket sí liste hype-updown-5m-*.
 SYMBOL_TO_SLUG_PREFIX = {
     "BTCUSDT": "btc-updown-5m-",
     "ETHUSDT": "eth-updown-5m-",
     "SOLUSDT": "sol-updown-5m-",
+    "XRPUSDT": "xrp-updown-5m-",
+    "BNBUSDT": "bnb-updown-5m-",
+    "DOGEUSDT": "doge-updown-5m-",
 }
 SLUG_PREFIX_TO_SYMBOL = {v: k for k, v in SYMBOL_TO_SLUG_PREFIX.items()}
-SLUG_REGEX = re.compile(r"^(btc|eth|sol)-updown-5m-(\d+)$")
+SLUG_REGEX = re.compile(r"^(btc|eth|sol|xrp|bnb|hype|doge)-updown-5m-(\d+)$")
 
 # --- Parámetros configurables vía env ---
 DEFAULT_CHECK_INTERVAL_S = 15.0
-DEFAULT_PRE_CLOSE_WINDOW_S = 60.0   # solo evaluar markets que cierran en próximos 60s
+DEFAULT_PRE_CLOSE_WINDOW_S = 180.0  # solo evaluar markets que cierran en próximos 180s
 DEFAULT_MOMENTUM_THRESHOLD_PCT = 0.3
 DEFAULT_MAX_MID_TARGET = 0.70       # midpoint del lado a comprar debe ser <0.70
 DEFAULT_BET_SIZE_USDC = 5.0
