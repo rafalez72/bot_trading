@@ -176,16 +176,21 @@ def api_health() -> dict:
 def api_crypto_arb_status() -> dict:
     """Snapshot del bot crypto_arb (Nivel 2).
 
-    Las métricas viven in-memory en el proceso runner. Por simetría con
-    /api/ws-status, idealmente persistirían a archivo. Por ahora el
-    server lee su propio _Metrics (vacío). El runner podría extenderse
-    para persistir similarmente; por ahora dejamos la lectura desde el
-    server como informativo del enabled flag.
+    Las métricas viven en el proceso runner (otro container). El runner
+    persiste el snapshot a `data/crypto_arb_metrics.json` cada 5s; este
+    endpoint lo lee. Si el archivo no existe (bot deshabilitado o
+    nunca arrancó), devolvemos snapshot vacío con `enabled` derivado del .env.
     """
-    import os
-    from src.copybot.crypto_arb import metrics as ca_metrics, CryptoArbConfig
+    from src.copybot.crypto_arb import (
+        CryptoArbConfig, metrics as ca_metrics, read_snapshot_from_file,
+    )
     cfg = CryptoArbConfig.from_env()
-    snap = ca_metrics.snapshot()
+    snap = read_snapshot_from_file()
+    if snap is None:
+        snap = ca_metrics.snapshot()
+        snap["_source"] = "in_proc_empty"
+    else:
+        snap["_source"] = "runner_file"
     snap["enabled"] = cfg.enabled
     snap["config"] = {
         "check_interval_s": cfg.check_interval_s,

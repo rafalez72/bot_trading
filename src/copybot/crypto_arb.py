@@ -31,11 +31,15 @@ Activación: env var ``CRYPTO_ARB_ENABLED=true``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from src.binance.websocket import BinanceTickerWS
@@ -43,6 +47,11 @@ from src.copybot.tradebook import MODE as TRADEBOOK_MODE, open_position
 from src.polymarket.client import PolymarketClient
 
 log = logging.getLogger(__name__)
+
+# Snapshot path para que /api/crypto-arb-status (corre en server, otro
+# container) pueda leer las métricas reales del runner. Mismo patrón que
+# ws_metrics.py — atómico vía rename, en data/ que es shared volume.
+_SNAPSHOT_PATH = Path(os.getenv("DB_PATH", "data/copybot.db")).parent / "crypto_arb_metrics.json"
 
 # Símbolos que tradeamos. Mapping a los slug-prefixes de Polymarket.
 SYMBOL_TO_SLUG_PREFIX = {
@@ -124,8 +133,59 @@ class _Metrics:
             "last_open_at": self.last_open_at,
         }
 
+    def persist_to_file(self) -> None:
+        """Atómico: escribe snapshot al volumen compartido con server."""
+        try:
+            snap = self.snapshot()
+            snap["_persisted_at"] = time.time()
+            target = _SNAPSHOT_PATH
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix=".crypto_arb_", suffix=".tmp", dir=str(target.parent)
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(snap, f, default=str)
+                os.replace(tmp, target)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            log.debug("crypto_arb.persist_to_file failed: %s", e)
+
+    def start_persist_thread(self, interval_s: float = 5.0) -> None:
+        if getattr(self, "_persist_thread_started", False):
+            return
+        self._persist_thread_started = True
+
+        def _loop() -> None:
+            while True:
+                try:
+                    time.sleep(interval_s)
+                    self.persist_to_file()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_loop, name="crypto_arb-persist", daemon=True)
+        t.start()
+
 
 metrics = _Metrics()
+
+
+def read_snapshot_from_file() -> dict[str, Any] | None:
+    """Lee el snapshot persistido por el runner (usado por el server)."""
+    try:
+        if not _SNAPSHOT_PATH.exists():
+            return None
+        with _SNAPSHOT_PATH.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        log.debug("crypto_arb.read_snapshot_from_file failed: %s", e)
+        return None
 
 
 # --- Utilidades ---
@@ -178,15 +238,21 @@ async def _list_active_updown_markets(client: PolymarketClient) -> list[dict]:
     now = int(time.time())
     out: list[dict] = []
     seen = 0
-    # iter_markets ya viene paginado en el client. Usamos un cap de
-    # páginas para no quemar la API si no hay matches (no debería).
-    async for m in client.iter_markets(page_size=500, closed=False):
+    # Filtro server-side por endDate: solo markets que cierran en próximos
+    # 30 min. Sin esto, iter_markets devolvería miles de markets viejos
+    # con `closed=false` administrativo y nunca llegaríamos a los
+    # updown-5m activos. Con end_date_min=now la API devuelve <100 rows.
+    from datetime import datetime, timezone
+    iso_now = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_max = datetime.fromtimestamp(now + 1800, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    async for m in client.iter_markets(
+        page_size=500, closed=False, order="endDate", ascending=True,
+        end_date_min=iso_now, end_date_max=iso_max,
+    ):
         seen += 1
         slug = m.get("slug") or ""
         parsed = _parse_slug(slug)
         if not parsed:
-            if seen >= 2000:
-                break
             continue
         end_ts = _parse_iso_to_epoch(m.get("endDate") or "")
         if end_ts is None or end_ts <= now:
@@ -195,7 +261,6 @@ async def _list_active_updown_markets(client: PolymarketClient) -> list[dict]:
         m["_slug_prefix"] = parsed[0]
         out.append(m)
         if len(out) >= 100:
-            # Suficiente para 1 ciclo (típicamente 6-12 markets activos)
             break
     metrics.markets_seen += seen
     return out
@@ -386,10 +451,18 @@ async def crypto_arb_loop() -> None:
     binance_ws = BinanceTickerWS(symbols=config.symbols, on_tick=_on_tick)
     binance_task = asyncio.create_task(binance_ws.run(), name="binance-ws")
 
+    # Persist snapshot to file para que /api/crypto-arb-status (server) lo lea.
+    metrics.start_persist_thread(interval_s=5.0)
+
     # Espera inicial para acumular history (necesitamos al menos
     # min_bucket_age_s de muestras para calcular momentum).
     log.info("crypto_arb: warming up %ss para acumular spot history…", config.min_bucket_age_s)
     await asyncio.sleep(config.min_bucket_age_s + 5)
+
+    # Log heartbeat cada N ciclos (cycles*15s ~ 5min con N=20). Sin
+    # heartbeat el bot es silent si no abre ops, y no podemos saber si
+    # está vivo desde docker logs.
+    HEARTBEAT_EVERY = 20
 
     try:
         async with PolymarketClient() as client:
@@ -412,6 +485,15 @@ async def crypto_arb_loop() -> None:
                     decision = _evaluate_market(m, binance_ws, config, spot_history)
                     if decision and decision["action"] == "buy":
                         await _open_arb_trade(m, decision)
+
+                if metrics.cycles % HEARTBEAT_EVERY == 0:
+                    snap = metrics.snapshot()
+                    log.info(
+                        "crypto_arb.heartbeat cycles=%d markets_seen=%d in_window=%d "
+                        "skipped=%s opens=%s",
+                        snap["cycles"], snap["markets_seen"], snap["markets_in_window"],
+                        snap["skipped"], snap["opens"],
+                    )
 
                 await asyncio.sleep(config.check_interval_s)
     finally:

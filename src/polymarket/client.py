@@ -69,12 +69,24 @@ class PolymarketClient:
         closed: bool | None = None,
         limit: int = 500,
         offset: int = 0,
+        order: str | None = None,
+        ascending: bool | None = None,
+        end_date_min: str | None = None,
+        end_date_max: str | None = None,
     ) -> list[dict]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if active is not None:
             params["active"] = str(active).lower()
         if closed is not None:
             params["closed"] = str(closed).lower()
+        if order is not None:
+            params["order"] = order
+        if ascending is not None:
+            params["ascending"] = str(ascending).lower()
+        if end_date_min is not None:
+            params["end_date_min"] = end_date_min
+        if end_date_max is not None:
+            params["end_date_max"] = end_date_max
         return await self._get(f"{GAMMA_API}/markets", params=params)
 
     async def iter_markets(
@@ -83,12 +95,18 @@ class PolymarketClient:
         page_size: int = 500,
         active: bool | None = None,
         closed: bool | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
+        end_date_min: str | None = None,
+        end_date_max: str | None = None,
     ) -> AsyncIterator[dict]:
         offset = 0
         while True:
             try:
                 page = await self.list_markets(
-                    active=active, closed=closed, limit=page_size, offset=offset
+                    active=active, closed=closed, limit=page_size, offset=offset,
+                    order=order, ascending=ascending,
+                    end_date_min=end_date_min, end_date_max=end_date_max,
                 )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (400, 422):
