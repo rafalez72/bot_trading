@@ -135,6 +135,20 @@ PAPER_MAX_PER_WALLET_USDC = float(os.getenv("PAPER_MAX_PER_WALLET_USDC", "8.0"))
 # Mínimo de PnL esperado para que el trade paper se abra (anti-fees-comen-todo).
 PAPER_MIN_EXPECTED_PNL_USDC = float(os.getenv("PAPER_MIN_EXPECTED_PNL_USDC", "0.30"))
 
+# Máximo de entries simultáneas por (source_wallet, condition_id). Las wallets
+# copiadas suelen hacer DCA / pyramiding (varias entries averaging in en el mismo
+# market). El cap previo basado en USDC (PAPER_MAX_PER_WALLET_USDC) bloqueaba el
+# 2do/3er entry, perdiendo posiciones legítimas. Con N=3 dejamos pasar el patrón
+# DCA típico sin permitir over-concentration ilimitada.
+MAX_ENTRIES_PER_WALLET_MARKET = int(os.getenv("MAX_ENTRIES_PER_WALLET_MARKET", "3"))
+
+# Edad máxima (segundos) del trade del source cuando lo procesamos. Si el polling
+# detecta un trade más viejo que esto → reject 'stale_trade'. Default 300s (5min)
+# tolera lag de polling sin abrir entries demasiado tardías que ya perdieron edge.
+# El valor antiguo (60s) era muy estricto: el polling RE-procesa los mismos trades
+# detectados por WS, generando ráfagas de stale_trade rejects.
+STALE_TRADE_MAX_AGE_S = int(os.getenv("STALE_TRADE_MAX_AGE_S", "300"))
+
 # ---------- Live trading: mejoras de fricción ----------
 # Cap por wallet copiado en live (forzosa diversificación).
 # Default $10 con cap total $30 → max 3 wallets concurrentes con full size.
