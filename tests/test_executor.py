@@ -149,13 +149,17 @@ def test_open_rejected_on_low_expected_pnl(isolated_db):
 
 
 def test_open_rejected_on_wallet_concentration(isolated_db):
-    """Existing open exposure on this wallet near LIVE_MAX_PER_WALLET_USDC
-    ($10 default) blocks new opens with reason 'wallet_concentration'."""
+    """N=MAX_ENTRIES_PER_WALLET_MARKET open positions for the same
+    (source_wallet, condition_id) → 'wallet_concentration' on the next entry.
+    Default cap is 3 — we seed 3 open trades and assert the 4th rejects.
+    """
+    from src.config import MAX_ENTRIES_PER_WALLET_MARKET
+
     _seed_subscription()
 
-    # Pre-seed $9 of open exposure on this wallet. Adding LIVE_BASE_USDC=$2.5
-    # would put us at $11.5, past the $10 cap.
-    _insert_open_live_trade(entry_size_usdc=9.0)
+    # Seed exactly the cap of open trades on the same (wallet, cid).
+    for i in range(MAX_ENTRIES_PER_WALLET_MARKET):
+        _insert_open_live_trade(entry_size_usdc=2.5)
 
     result, reject = _validate(source_trade_id="trade-different")
 

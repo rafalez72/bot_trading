@@ -24,11 +24,13 @@ from src.config import (
     BOT_CAPITAL_USDC,
     COPY_BASE_USDC,
     MARKET_HORIZON_MIN_SECS,
+    MAX_ENTRIES_PER_WALLET_MARKET,
     MAX_PER_MARKET_PCT,
     MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
     MIN_MARKET_VOLUME_USDC,
     MIN_TIME_TO_EXPIRY_SECONDS,
+    STALE_TRADE_MAX_AGE_S,
 )
 from src.copybot._slug_expiry import parse_slug_expiry
 from src.copybot.learning import on_paper_trade_closed
@@ -91,8 +93,48 @@ REJECT_REASONS = {
 # de antigüedad, perdimos el edge — entramos tarde a un movimiento ya hecho.
 # Caso real 2026-05-06: 2 trades LoL Game 2 entry@0.45 con el match casi
 # terminado → expiraron a $0.001 minutos después → -$10 cada uno.
+#
+# 2026-05-09: el threshold ahora vive en config.STALE_TRADE_MAX_AGE_S (default
+# 300s). Mantenemos `MAX_TRADE_AGE_SECONDS` como alias re-exportado para
+# back-compat con executor.py. El env var legacy `MAX_TRADE_AGE_SECONDS` toma
+# precedencia si está seteado (deploys viejos lo usan).
 import os as _os
-MAX_TRADE_AGE_SECONDS = int(_os.getenv("MAX_TRADE_AGE_SECONDS", "60"))
+_legacy_age = _os.getenv("MAX_TRADE_AGE_SECONDS")
+MAX_TRADE_AGE_SECONDS = int(_legacy_age) if _legacy_age is not None else STALE_TRADE_MAX_AGE_S
+
+
+# LRU in-memory dict para deduplicar logs de 'stale_trade'. El polling
+# re-procesa los mismos trades detectados por WS varias veces por segundo,
+# generando spam (12+ rejects iguales por segundo en producción). Suprimimos
+# el log si ya rechazamos el mismo source_trade_id en los últimos 60s. La
+# rejection sigue ocurriendo (no se abre el trade); solo silencia el log.
+_STALE_LOG_TTL_SECONDS = 60
+_STALE_LOG_MAX_ENTRIES = 1000
+_stale_log_seen: dict[str, float] = {}
+
+
+def _should_log_stale(trade_id: str | None) -> bool:
+    """True si este source_trade_id no fue logueado como 'stale' en los últimos
+    _STALE_LOG_TTL_SECONDS. Mantiene un LRU rudimentario (purga la entrada más
+    vieja cuando supera _STALE_LOG_MAX_ENTRIES).
+
+    Si trade_id es None/empty → siempre loguear (no podemos deduplicar sin key).
+    """
+    if not trade_id:
+        return True
+    now = time.time()
+    last = _stale_log_seen.get(trade_id)
+    if last is not None and (now - last) < _STALE_LOG_TTL_SECONDS:
+        return False
+    # Bound the dict size: si excede el cap, dropeamos la entrada más vieja.
+    if len(_stale_log_seen) >= _STALE_LOG_MAX_ENTRIES:
+        try:
+            oldest_key = min(_stale_log_seen, key=_stale_log_seen.get)
+            _stale_log_seen.pop(oldest_key, None)
+        except ValueError:
+            _stale_log_seen.clear()
+    _stale_log_seen[trade_id] = now
+    return True
 
 
 def _check_kill_switch(conn) -> bool:
@@ -183,6 +225,14 @@ def open_position(
         import time as _time
         age = int(_time.time()) - int(timestamp or 0)
         if age > MAX_TRADE_AGE_SECONDS:
+            # Suprimimos logs duplicados del mismo source_trade_id en 60s
+            # (polling re-procesa los mismos trades 10+ veces/segundo).
+            if _should_log_stale(source_trade_id):
+                log.info(
+                    "paper.stale_trade wallet=%s cid=%s age_s=%d threshold=%d",
+                    (source_wallet or "")[:10], (condition_id or "")[:10],
+                    age, MAX_TRADE_AGE_SECONDS,
+                )
             return None, "stale_trade"
 
         sub = conn.execute(
@@ -344,21 +394,25 @@ def open_position(
 
         # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
         # no vale la pena. Descarta trades con sizing_mult muy chico.
-        from src.config import PAPER_MIN_EXPECTED_PNL_USDC, PAPER_MAX_PER_WALLET_USDC
+        from src.config import PAPER_MIN_EXPECTED_PNL_USDC
         expected = expected_net_pnl(size_usdc)
         if expected < PAPER_MIN_EXPECTED_PNL_USDC:
             return None, "expected_pnl_too_low"
 
-        # Cap por wallet: forzosa diversificación entre traders.
-        wallet_open = conn.execute(
+        # Cap de entries por (wallet, market): el source wallet suele hacer
+        # DCA / pyramiding (varias entries averaging in en el mismo cid).
+        # Bloqueamos a partir de N entries simultáneas — no antes — para
+        # dejar pasar el patrón legítimo. El per-market dollar cap
+        # (MAX_PER_MARKET_PCT) sigue aplicándose abajo como guard adicional.
+        entries_open = conn.execute(
             """
-            SELECT COALESCE(SUM(entry_size_usdc), 0) as v
+            SELECT COUNT(*) AS c
             FROM paper_trades
-            WHERE source_wallet=? AND status='open'
+            WHERE source_wallet=? AND condition_id=? AND status='open'
             """,
-            (source_wallet,),
-        ).fetchone()["v"]
-        if wallet_open + size_usdc > PAPER_MAX_PER_WALLET_USDC + EPSILON:
+            (source_wallet, condition_id),
+        ).fetchone()["c"]
+        if entries_open >= MAX_ENTRIES_PER_WALLET_MARKET:
             return None, "wallet_concentration"
 
         # Cap por mercado: max MAX_PER_MARKET_PCT del capital en un solo cid

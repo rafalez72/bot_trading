@@ -180,6 +180,13 @@ DISCOVERY_TOPVOLUME_INTERVAL_HOURS = int(os.getenv("DISCOVERY_TOPVOLUME_INTERVAL
 # Default: false — el módulo existe pero no se enchufa al runner todavía.
 WEBSOCKET_TRADES_ENABLED = os.getenv("WEBSOCKET_TRADES_ENABLED", "false").lower() == "true"
 
+# Shadow watch (pre-promote): además de las wallets activas que copiamos,
+# observa N wallets candidatas via WS. Sus trades se persisten en
+# ``shadow_trades(mode='pre_promote_watch')`` para análisis previo a promover.
+# Default true porque solo agrega observación pasiva (no riesgo operativo).
+SHADOW_WATCH_ENABLED = os.getenv("SHADOW_WATCH_ENABLED", "true").lower() == "true"
+SHADOW_WATCH_LIMIT = int(os.getenv("SHADOW_WATCH_LIMIT", "200"))
+
 # ---------- Hyperliquid (copy-bot perps en paralelo, dry-run) ----------
 # Activación: HL_MODE=true. Si false, el HL runner no arranca y nada cambia.
 HL_MODE = os.getenv("HL_MODE", "false").lower() == "true"

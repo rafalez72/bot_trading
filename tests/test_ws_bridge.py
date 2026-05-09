@@ -296,6 +296,52 @@ def test_idempotencia_WS_primero_polling_segundo(isolated_db, monkeypatch):
     assert n == 1, f"Esperaba 1 paper_trade, encontré {n}"
 
 
+# ---------- tests de shadow watch routing ----------
+
+
+def test_shadow_wallet_NO_llama_open_position():
+    """Wallet en el shadow set: NO debe abrir paper_trade ni ejecutar copy."""
+    handle = ws_bridge._make_handle_trade(
+        active_wallets_lc=set(),  # ninguna activa
+        shadow_wallets_lc={"0xwallet1"},  # solo shadow
+    )
+    with patch.object(ws_bridge, "open_position") as op, \
+         patch.object(ws_bridge, "close_position") as cp, \
+         patch.object(ws_bridge.shadow_watch, "record_shadow_trade",
+                      return_value=True) as rec, \
+         patch.object(ws_bridge, "_set_cursor"):
+        _run(handle(_make_payload(side="BUY")))
+
+    assert op.call_count == 0, "shadow NO debe llamar open_position"
+    assert cp.call_count == 0, "shadow NO debe llamar close_position"
+    assert rec.call_count == 1, "shadow DEBE llamar record_shadow_trade"
+
+
+def test_shadow_wallet_avanza_cursor():
+    """Aunque sea shadow, el cursor debe avanzar para que el polling no
+    reprocese el mismo trade si la wallet es promovida luego."""
+    handle = ws_bridge._make_handle_trade(set(), {"0xwallet1"})
+    with patch.object(ws_bridge.shadow_watch, "record_shadow_trade", return_value=True), \
+         patch.object(ws_bridge, "_set_cursor") as sc:
+        _run(handle(_make_payload(timestamp=1778000000)))
+    assert sc.call_count == 1
+    assert sc.call_args.args == ("0xwallet1", 1778000000)
+
+
+def test_active_set_gana_sobre_shadow_set():
+    """Si una wallet aparece en ambos sets (race en disjunto), active gana."""
+    handle = ws_bridge._make_handle_trade(
+        active_wallets_lc={"0xwallet1"},
+        shadow_wallets_lc={"0xwallet1"},  # debería ser disjunto, pero por defensa
+    )
+    with patch.object(ws_bridge, "open_position", return_value=(1, None)) as op, \
+         patch.object(ws_bridge.shadow_watch, "record_shadow_trade") as rec, \
+         patch.object(ws_bridge, "_set_cursor"):
+        _run(handle(_make_payload(side="BUY")))
+    assert op.call_count == 1, "active gana → open_position se llama"
+    assert rec.call_count == 0, "shadow NO debe llamarse cuando active match"
+
+
 def test_idempotencia_polling_primero_WS_segundo(isolated_db, monkeypatch):
     """Caso reverso: polling abrió primero, WS llega después (re-entrega tras
     un reconnect, o race en la otra dirección). El WS debe ver el guard."""

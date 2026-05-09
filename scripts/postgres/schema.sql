@@ -297,10 +297,14 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     outcome_index INTEGER,
     price         DOUBLE PRECISION,
     size_usdc     DOUBLE PRECISION,
-    observed_at   BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT)
+    observed_at   BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT),
+    mode          TEXT DEFAULT 'post_drop'
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_wallet ON shadow_trades(wallet, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_shadow_observed ON shadow_trades(observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, timestamp DESC);
+-- Idempotent migration for existing PG installs: add mode column if missing.
+ALTER TABLE shadow_trades ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'post_drop';
 
 CREATE TABLE IF NOT EXISTS dx_trades (
     id              BIGSERIAL PRIMARY KEY,

@@ -31,8 +31,8 @@ from src.config import (
     LIVE_CAPITAL_USDC,
     LIVE_DRY_RUN,
     LIVE_DRY_SLIPPAGE_PCT,
-    LIVE_MAX_PER_WALLET_USDC,
     LIVE_MIN_EXPECTED_PNL_USDC,
+    MAX_ENTRIES_PER_WALLET_MARKET,
     MAX_PER_MARKET_PCT,
     MAX_WALLET_24H_PCT,
     MIN_MARKET_LIQUIDITY_USDC,
@@ -299,12 +299,19 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "kill_switch")
         return None, "kill_switch"
 
-    # Anti-stale: ver paper.open_position. Mismo umbral compartido.
-    from src.copybot.paper import MAX_TRADE_AGE_SECONDS
+    # Anti-stale: ver paper.open_position. Mismo umbral compartido (config.STALE_TRADE_MAX_AGE_S).
+    # _should_log_stale dedupea logs del mismo source_trade_id en 60s — el
+    # polling re-procesa los mismos trades 10+ veces/segundo (caso real
+    # 2026-05-09: 12 stale_trade rejects en 1 segundo para el mismo wallet+cid).
+    # La rejection sigue ocurriendo; solo silenciamos el log + el insert al
+    # tabla live_rejects para evitar spam.
+    from src.copybot.paper import MAX_TRADE_AGE_SECONDS, _should_log_stale
     age = int(time.time()) - int(timestamp or 0)
     if age > MAX_TRADE_AGE_SECONDS:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
-                    "stale_trade", detail=json.dumps({"age_s": age}))
+        if _should_log_stale(source_trade_id):
+            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
+                        "stale_trade", detail=json.dumps({"age_s": age,
+                                                          "threshold_s": MAX_TRADE_AGE_SECONDS}))
         return None, "stale_trade"
 
     sub = conn.execute(
@@ -450,19 +457,26 @@ def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_i
                                         "min": LIVE_MIN_EXPECTED_PNL_USDC}))
         return None, "expected_pnl_too_low"
 
-    # Cap por wallet (forzosa diversificación): no más de X open por wallet.
-    wallet_open = conn.execute(
+    # Cap de entries por (wallet, market): el source wallet suele hacer
+    # DCA / pyramiding (varias entries averaging in en el mismo cid). Antes
+    # bloqueábamos por dollar-cap LIVE_MAX_PER_WALLET_USDC, lo que con base
+    # $2.5 y cap $10 dejaba pasar 4 entries — pero sumaba cross-market
+    # spuriamente. Ahora contamos entries open por (wallet, cid): hasta
+    # MAX_ENTRIES_PER_WALLET_MARKET (default 3). El per-market dollar cap
+    # (MAX_PER_MARKET_PCT * LIVE_CAPITAL_USDC) sigue actuando abajo como
+    # segundo guard sobre el size acumulado.
+    entries_open = conn.execute(
         """
-        SELECT COALESCE(SUM(entry_size_usdc), 0) as v
+        SELECT COUNT(*) AS c
         FROM live_trades
-        WHERE source_wallet=? AND status='open'
+        WHERE source_wallet=? AND condition_id=? AND status='open'
         """,
-        (source_wallet,),
-    ).fetchone()["v"]
-    if wallet_open + size_usdc > LIVE_MAX_PER_WALLET_USDC + EPSILON:
+        (source_wallet, condition_id),
+    ).fetchone()["c"]
+    if entries_open >= MAX_ENTRIES_PER_WALLET_MARKET:
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "wallet_concentration",
-                    detail=json.dumps({"open_usdc": wallet_open, "size_usdc": size_usdc,
-                                        "cap": LIVE_MAX_PER_WALLET_USDC}))
+                    detail=json.dumps({"entries_open": entries_open,
+                                        "max": MAX_ENTRIES_PER_WALLET_MARKET}))
         return None, "wallet_concentration"
 
     per_market_cap = LIVE_CAPITAL_USDC * MAX_PER_MARKET_PCT

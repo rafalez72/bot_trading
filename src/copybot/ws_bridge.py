@@ -36,6 +36,7 @@ from src.copybot.tradebook import (
     close_position,
     open_position,
 )
+from src.copybot import shadow_watch
 from src.copybot.ws_metrics import metrics as ws_metrics
 from src.db.schema import db, tx
 from src.indexer.trades import _trade_id as _make_trade_id
@@ -45,6 +46,11 @@ log = logging.getLogger(__name__)
 
 # Cada cuánto refrescamos la lista de wallets activas (sin reconectar el WS).
 WALLET_REFRESH_S = 60.0
+
+# Cap absoluto de wallets watched por conexión RTDS. La spec upstream no es
+# explícita pero observamos rejects con sets >300. Capeamos a 250 con margen
+# para evitar disconnects durante un refresh ruidoso (active+shadow).
+MAX_WATCHED_PER_CONN = 250
 
 
 def _fetch_clob_mid(asset: str | None) -> float | None:
@@ -83,6 +89,28 @@ def _active_wallets() -> list[str]:
     return [r["wallet"] for r in rows]
 
 
+def _active_and_shadow_wallets(shadow_limit: int) -> tuple[set[str], set[str]]:
+    """Devuelve (active_lc, shadow_lc) — sets *disjuntos* de wallets en lower-case.
+
+    El shadow set excluye explícitamente las wallets ya activas, así una
+    misma wallet nunca cae en ambas ramas del callback. ``select_shadow_candidates``
+    ya filtra ``status='active'``, pero por defensa-en-profundidad reaplicamos
+    la diferencia acá: en un race entre el INSERT a copy_subscriptions y la
+    query del shadow, garantizar disjuntos a nivel set.
+    """
+    active_lc: set[str] = {w.lower() for w in _active_wallets() if w}
+    shadow_lc: set[str] = set()
+    if shadow_limit > 0:
+        try:
+            shadow_lc = set(shadow_watch.select_shadow_candidates(limit=shadow_limit))
+        except Exception:
+            log.exception("ws_bridge: select_shadow_candidates falló (ignoro shadow)")
+            shadow_lc = set()
+    # Garantizar disjoint: copy gana sobre shadow.
+    shadow_lc -= active_lc
+    return active_lc, shadow_lc
+
+
 def _set_cursor(wallet: str, ts: int) -> None:
     """Avanza ``paper_cursor:<wallet>`` al timestamp dado (idempotente).
 
@@ -108,11 +136,27 @@ def _set_cursor(wallet: str, ts: int) -> None:
         )
 
 
-def _make_handle_trade(active_wallets_lc: set[str]):
-    """Genera el callback con closure sobre el set actual de wallets activas.
+def _make_handle_trade(
+    active_wallets_lc: set[str],
+    shadow_wallets_lc: set[str] | None = None,
+):
+    """Genera el callback con closure sobre el set actual de wallets watched.
 
-    El set se mutates in-place desde ``ws_run_loop`` cuando refrescamos.
+    Hay dos sets DISJUNTOS:
+    - ``active_wallets_lc``: wallets en ``copy_subscriptions.status='active'``;
+      sus trades activan el flujo completo (open_position → tradebook → ejecutor).
+    - ``shadow_wallets_lc``: wallets candidatas (``shadow_watch.select_shadow_candidates``);
+      sus trades SOLO se persisten en ``shadow_trades`` con ``mode='pre_promote_watch'``.
+      NO se abre paper_trade, NO se ejecuta orden, NO dispara learning.
+
+    Ambos sets se mutate in-place desde ``ws_run_loop`` al refrescar (cada
+    ``WALLET_REFRESH_S``). Si una wallet shadow es promovida a active entre
+    refreshes, el match cae al branch de "wallet desconocida" hasta el próximo
+    refresh — comportamiento aceptable y conservador (preferimos perder un
+    trade del primer refresh que duplicar entre branches).
     """
+    if shadow_wallets_lc is None:
+        shadow_wallets_lc = set()
 
     async def _handle_trade(payload: dict[str, Any]) -> None:
         try:
@@ -121,8 +165,10 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                 return
             wallet_lc = wallet.lower()
 
-            # Defensivo: validar contra el set actual aunque el WS ya filtró.
-            if wallet_lc not in active_wallets_lc:
+            # Routing: branch por set. Si no está en NINGUNO, ignoramos.
+            in_active = wallet_lc in active_wallets_lc
+            in_shadow = (not in_active) and (wallet_lc in shadow_wallets_lc)
+            if not in_active and not in_shadow:
                 return
 
             side = (payload.get("side") or "").upper()
@@ -170,6 +216,33 @@ def _make_handle_trade(active_wallets_lc: set[str]):
                 # Sin transactionHash _trade_id devuelve None; nunca debería
                 # pasar acá porque ya validamos `txh` arriba, pero defensa.
                 return
+
+            # Shadow branch: NO copia, solo persiste para análisis posterior.
+            # Importante: usamos un payload con timestamp ya normalizado a
+            # segundos para que ``_trade_id`` interno + el ``ts`` que guarda
+            # ``record_shadow_trade`` queden coherentes con el resto del bot.
+            if in_shadow:
+                shadow_payload = dict(payload)
+                shadow_payload["timestamp"] = ts
+                inserted = await asyncio.to_thread(
+                    shadow_watch.record_shadow_trade, shadow_payload
+                )
+                if inserted:
+                    log.info(
+                        "shadow_watch: wallet=%s cid=%s.. side=%s price=%.3f",
+                        wallet_lc[:10], (cid or "")[:10], side, price,
+                    )
+                # Avanzar cursor igual que en el path activo: si más adelante
+                # promovemos esta wallet a active, el polling no reprocesa
+                # trades viejos que el WS ya observó.
+                try:
+                    await asyncio.to_thread(_set_cursor, wallet_lc, ts)
+                except Exception:
+                    log.exception(
+                        "WS shadow: no se pudo avanzar cursor de %s",
+                        wallet_lc[:10],
+                    )
+                return  # CRÍTICO: NO caer al flujo de copy.
 
             # CRÍTICO (fix 2026-05-06): `open_position`, `close_position` y
             # `_set_cursor` son SYNC y hacen DB writes + HTTP calls al CLOB
@@ -250,38 +323,101 @@ def _make_handle_trade(active_wallets_lc: set[str]):
     return _handle_trade
 
 
+def _capped_union(active_lc: set[str], shadow_lc: set[str]) -> set[str]:
+    """Une active+shadow respetando ``MAX_WATCHED_PER_CONN``.
+
+    Las activas tienen prioridad ABSOLUTA: NUNCA se sacrifican por shadow.
+    Si la unión excede el cap, recortamos *solo del shadow set*. Si las
+    activas SOLAS exceden el cap (caso raro: >250 wallets copiadas), avisamos
+    en WARN pero las pasamos enteras — perder copias-vivas por un cap
+    arbitrario sería peor que un disconnect sospechoso.
+    """
+    if len(active_lc) >= MAX_WATCHED_PER_CONN:
+        if len(active_lc) > MAX_WATCHED_PER_CONN:
+            log.warning(
+                "ws_bridge: %d wallets activas exceden cap RTDS=%d — "
+                "pasamos todas igual (shadow=0)",
+                len(active_lc), MAX_WATCHED_PER_CONN,
+            )
+        return set(active_lc)
+
+    budget = MAX_WATCHED_PER_CONN - len(active_lc)
+    if len(shadow_lc) <= budget:
+        return active_lc | shadow_lc
+
+    log.warning(
+        "ws_bridge: union active(%d)+shadow(%d) excede cap=%d, "
+        "shadow recortado a %d",
+        len(active_lc), len(shadow_lc), MAX_WATCHED_PER_CONN, budget,
+    )
+    # Recorte determinístico: orden lex-asc para reproducibilidad. La
+    # selección por `select_shadow_candidates` ya viene ordenada por
+    # volumen DESC, pero al pasar por set() se desordena. Para no perder
+    # las top-N de volumen necesitaríamos preservar lista; el cap solo
+    # entra en juego cuando shadow_limit + active >250, raro en práctica.
+    return active_lc | set(sorted(shadow_lc)[:budget])
+
+
 async def ws_run_loop() -> None:
     """Loop principal del bridge WS: arranca el cliente RTDS + refresh task.
 
+    Watched wallets = active_copy ∪ shadow_candidates (capped a
+    ``MAX_WATCHED_PER_CONN``). El callback ``_handle_trade`` enruta cada
+    match al flujo correspondiente (copy vs shadow) según a qué set pertenece.
+
     Corre indefinidamente. Cancelable desde el caller (asyncio.Task.cancel).
     """
-    wallets = _active_wallets()
-    active_lc: set[str] = {w.lower() for w in wallets if w}
-    log.info("ws_bridge: arrancando con %d wallet(s) activas", len(active_lc))
+    # Lazy import: SHADOW_WATCH_* viven en config.py y otros agents tocan
+    # ese módulo. No queremos que un import-time error de config
+    # rompa el módulo entero — solo el feature.
+    try:
+        from src.config import SHADOW_WATCH_ENABLED, SHADOW_WATCH_LIMIT
+    except ImportError:
+        SHADOW_WATCH_ENABLED = False
+        SHADOW_WATCH_LIMIT = 0
+
+    shadow_limit = int(SHADOW_WATCH_LIMIT) if SHADOW_WATCH_ENABLED else 0
+
+    active_lc, shadow_lc = _active_and_shadow_wallets(shadow_limit)
+    watched = _capped_union(active_lc, shadow_lc)
+    log.info(
+        "ws_bridge: arrancando con %d activas + %d shadow = %d watched (cap=%d)",
+        len(active_lc), len(shadow_lc), len(watched), MAX_WATCHED_PER_CONN,
+    )
 
     # Arranca el thread que persiste el snapshot al archivo compartido.
     # El server (otro contenedor) lee desde ahí para /api/ws-status.
     ws_metrics.start_persist_thread(interval_s=5.0)
-    ws_metrics.set_watched(len(active_lc))
+    ws_metrics.set_watched(len(watched))
 
-    handle_trade = _make_handle_trade(active_lc)
-    client = PolymarketTradesWS(active_lc, handle_trade)
+    handle_trade = _make_handle_trade(active_lc, shadow_lc)
+    client = PolymarketTradesWS(watched, handle_trade)
 
     async def _refresher() -> None:
-        """Cada WALLET_REFRESH_S, sincroniza el set watched con la DB."""
+        """Cada WALLET_REFRESH_S, sincroniza ambos sets con la DB."""
         while True:
             try:
                 await asyncio.sleep(WALLET_REFRESH_S)
-                fresh = {w.lower() for w in _active_wallets() if w}
-                if fresh != active_lc:
-                    added = fresh - active_lc
-                    removed = active_lc - fresh
+                fresh_active, fresh_shadow = _active_and_shadow_wallets(shadow_limit)
+                if fresh_active != active_lc or fresh_shadow != shadow_lc:
+                    added_a = fresh_active - active_lc
+                    removed_a = active_lc - fresh_active
+                    added_s = fresh_shadow - shadow_lc
+                    removed_s = shadow_lc - fresh_shadow
+                    # Mutamos in-place — el closure de _make_handle_trade
+                    # tiene referencia a estos sets, así que reasignar
+                    # active_lc=... en este scope NO se vería allá.
                     active_lc.clear()
-                    active_lc.update(fresh)
-                    client.update_watched(active_lc)
+                    active_lc.update(fresh_active)
+                    shadow_lc.clear()
+                    shadow_lc.update(fresh_shadow)
+                    new_watched = _capped_union(active_lc, shadow_lc)
+                    client.update_watched(new_watched)
                     log.info(
-                        "ws_bridge: wallets refrescadas (+%d -%d, total=%d)",
-                        len(added), len(removed), len(active_lc),
+                        "ws_bridge: refresh active(+%d -%d=%d) shadow(+%d -%d=%d) watched=%d",
+                        len(added_a), len(removed_a), len(active_lc),
+                        len(added_s), len(removed_s), len(shadow_lc),
+                        len(new_watched),
                     )
             except asyncio.CancelledError:
                 raise

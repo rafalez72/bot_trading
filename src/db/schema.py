@@ -716,6 +716,12 @@ _MIGRATIONS = [
     # mide copy lag (segundos) y price gap (slippage de copia).
     "ALTER TABLE paper_trades ADD COLUMN our_entry_at INTEGER",
     "ALTER TABLE paper_trades ADD COLUMN our_entry_price REAL",
+    # shadow_trades.mode: distingue 'post_drop' (legacy: shadow_tracker.py
+    # observa wallets dropped) de 'pre_promote_watch' (nuevo: ws_bridge
+    # observa candidatas vía RTDS antes de promover). Default a 'post_drop'
+    # mantiene compat con filas existentes.
+    "ALTER TABLE shadow_trades ADD COLUMN mode TEXT DEFAULT 'post_drop'",
+    "CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, timestamp DESC)",
 ]
 
 
