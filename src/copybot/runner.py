@@ -155,6 +155,14 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
             # se llama. Resultado: bot colgado, watchdog kill loop.
             # to_thread los corre en thread pool y libera el event loop.
             if side == "BUY":
+                # Feature G: copy-lag telemetry. Capturamos OUR processing ts.
+                # Para mid usamos el mismo helper que ws_bridge (httpx sync +
+                # 1s timeout). El polling ya tiene latencia base ~5-7s, así
+                # que un fetch extra es despreciable. Si falla, our_entry_price
+                # queda None — análisis lo trata como unknown.
+                from src.copybot.ws_bridge import _fetch_clob_mid
+                our_at = int(time.time())
+                our_mid = await asyncio.to_thread(_fetch_clob_mid, t.get("asset"))
                 pid, reason = await asyncio.to_thread(
                     open_position,
                     source_wallet=wallet,
@@ -165,6 +173,8 @@ async def _process_wallet(client: PolymarketClient, wallet: str) -> tuple[int, i
                     price=price,
                     timestamp=ts,
                     raw=t,
+                    our_entry_at=our_at,
+                    our_entry_price=our_mid,
                 )
                 if pid:
                     actions += 1
@@ -577,6 +587,20 @@ async def run_loop(*, once: bool = False) -> None:
                         )
                 except Exception as e:
                     log.exception("auto_drop_by_inactivity error: %s", e)
+
+                # Auto-pause por PnL reciente negativo (mismo intervalo: ~6h).
+                # Distinto al drop por inactividad: wallets aquí SÍ tradean,
+                # pero la última ventana 24h está en rojo. Pause (no drop)
+                # para permitir recuperación si la mala racha revierte.
+                try:
+                    from src.copybot.learning import auto_pause_by_recent_loss
+                    n = auto_pause_by_recent_loss()
+                    if n:
+                        console.print(
+                            f"[yellow]auto-pause:[/yellow] {n} wallets pausados por PnL 24h negativo"
+                        )
+                except Exception as e:
+                    log.exception("auto_pause_by_recent_loss error: %s", e)
 
             # Shadow tracker: pollea wallets dropped y registra su actividad
             # post-drop para análisis a posteriori (cada ~1h).

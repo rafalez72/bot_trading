@@ -125,3 +125,103 @@ def test_auto_drop_skips_wallet_under_threshold(isolated_db):
             ("0xfew",),
         ).fetchone()
     assert row["status"] == "active"
+
+
+# --- Feature D: auto_pause_by_recent_loss ----------------------------------
+
+def _insert_closed_paper_trade(
+    wallet: str,
+    *,
+    pnl_usdc: float,
+    age_seconds: int = 3600,
+    tid_suffix: str = "x",
+) -> None:
+    """Insert one closed paper_trade with explicit pnl + entry/exit_at."""
+    at_ts = int(time.time()) - age_seconds
+    status = "closed_win" if pnl_usdc > 0 else "closed_loss"
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO paper_trades (
+                source_wallet, source_trade_id, condition_id,
+                outcome, outcome_index, side, entry_price, entry_size_usdc,
+                entry_at, exit_at, exit_price, status, pnl_usdc
+            )
+            VALUES (?, ?, '0xcid', 'YES', 0, 'BUY', 0.5, 5.0, ?, ?, 0.6, ?, ?)
+            """,
+            (wallet, f"tid-{wallet}-{tid_suffix}", at_ts, at_ts + 60, status, pnl_usdc),
+        )
+
+
+def test_auto_pause_pauses_wallet_with_recent_loss(isolated_db):
+    """Wallet active con 3 closed losses 24h → pausado."""
+    _seed_subscription("0xloser", sizing_mult=1.0)
+    _insert_closed_paper_trade("0xloser", pnl_usdc=-3.0, age_seconds=3600, tid_suffix="a")
+    _insert_closed_paper_trade("0xloser", pnl_usdc=-2.0, age_seconds=7200, tid_suffix="b")
+
+    n = learning.auto_pause_by_recent_loss(pnl_threshold=-2.0, window_hours=24)
+    assert n == 1
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status FROM copy_subscriptions WHERE wallet=?",
+            ("0xloser",),
+        ).fetchone()
+    assert row["status"] == "paused"
+
+    # learning_event debe quedar log con reason auto_paused_recent_loss
+    with db() as conn:
+        ev = conn.execute(
+            "SELECT trigger, event_type, metric_snapshot FROM learning_events "
+            "WHERE wallet=? ORDER BY id DESC LIMIT 1",
+            ("0xloser",),
+        ).fetchone()
+    assert ev is not None
+    assert ev["event_type"] == "pause"
+    assert "auto_paused_recent_loss" in (ev["metric_snapshot"] or "")
+
+
+def test_auto_pause_skips_wallet_with_positive_recent_pnl(isolated_db):
+    """Wallet con PnL positivo 24h → no se pausa."""
+    _seed_subscription("0xwinner", sizing_mult=1.0)
+    _insert_closed_paper_trade("0xwinner", pnl_usdc=5.0, age_seconds=3600, tid_suffix="a")
+    _insert_closed_paper_trade("0xwinner", pnl_usdc=3.0, age_seconds=7200, tid_suffix="b")
+
+    n = learning.auto_pause_by_recent_loss(pnl_threshold=-2.0, window_hours=24)
+    assert n == 0
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status FROM copy_subscriptions WHERE wallet=?",
+            ("0xwinner",),
+        ).fetchone()
+    assert row["status"] == "active"
+
+
+def test_auto_pause_skips_small_sample(isolated_db):
+    """Wallet con solo 1 trade en ventana (< min_trades) → no se pausa."""
+    _seed_subscription("0xnewbie", sizing_mult=1.0)
+    _insert_closed_paper_trade("0xnewbie", pnl_usdc=-10.0, age_seconds=3600, tid_suffix="a")
+
+    n = learning.auto_pause_by_recent_loss(pnl_threshold=-2.0, window_hours=24, min_trades=2)
+    assert n == 0
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status FROM copy_subscriptions WHERE wallet=?",
+            ("0xnewbie",),
+        ).fetchone()
+    assert row["status"] == "active"
+
+
+def test_auto_pause_skips_already_paused_or_dropped(isolated_db):
+    """Wallets paused/dropped no se reprocesan."""
+    _seed_subscription("0xpaused", sizing_mult=1.0, status="paused")
+    _seed_subscription("0xdropped", sizing_mult=0.0, status="dropped")
+    _insert_closed_paper_trade("0xpaused", pnl_usdc=-5.0, age_seconds=3600, tid_suffix="a")
+    _insert_closed_paper_trade("0xpaused", pnl_usdc=-5.0, age_seconds=7200, tid_suffix="b")
+    _insert_closed_paper_trade("0xdropped", pnl_usdc=-5.0, age_seconds=3600, tid_suffix="a")
+    _insert_closed_paper_trade("0xdropped", pnl_usdc=-5.0, age_seconds=7200, tid_suffix="b")
+
+    n = learning.auto_pause_by_recent_loss(pnl_threshold=-2.0, window_hours=24)
+    assert n == 0  # no toca a los que ya están paused/dropped

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Iterable
 
 from src.db.schema import db, tx
@@ -40,6 +41,15 @@ DROP_PNL_MIN_TRADES = 5
 # Detectado vía paper_cursor:<wallet> en index_state (avanza on-poll si
 # hay trade nuevo, sino queda flat).
 DROP_INACTIVITY_HOURS = 48
+
+# Auto-pause por PnL reciente negativo (Feature D, 2026-05-09).
+# A diferencia de auto_drop_by_inactivity (sin actividad on-chain) o
+# auto_drop_by_rejects (señales rechazadas), este detecta wallets activos
+# que ESTÁN tradeando pero perdiendo plata en las últimas 24h. Pause vs
+# drop porque la mala racha puede revertir; el siguiente select_traders
+# decide si reactiva o no según métricas históricas.
+AUTO_PAUSE_PNL_24H_USDC = float(os.getenv("AUTO_PAUSE_PNL_24H_USDC", "-2.0"))
+AUTO_PAUSE_MIN_TRADES_24H = 2  # mínimo de trades para considerar la muestra
 
 
 def _log_event(
@@ -385,6 +395,93 @@ def auto_drop_by_inactivity(window_hours: int | None = None) -> int:
             log.warning("auto-replace post-inactivity failed: %s", e)
 
     return len(dropped)
+
+
+def auto_pause_by_recent_loss(
+    *,
+    pnl_threshold: float | None = None,
+    window_hours: int = 24,
+    min_trades: int = AUTO_PAUSE_MIN_TRADES_24H,
+) -> int:
+    """Pausa wallets ``active`` cuyo PnL en la última ventana sea <= threshold.
+
+    Distinto a:
+      - ``auto_drop_by_inactivity``: detecta wallets sin trades on-chain.
+      - ``auto_drop_by_rejects``: detecta wallets con señales todas rechazadas.
+    Este detecta wallets que SÍ están tradeando, pero perdiendo plata.
+
+    Pause (no drop): la mala racha puede revertir. El próximo
+    ``select_traders`` decide si vuelve a 'active' o no.
+
+    Skip:
+      - wallets ya ``paused`` o ``dropped``.
+      - wallets con menos de ``min_trades`` en la ventana (muestra chica).
+
+    Returns el número de wallets pausados.
+    """
+    import time as _t
+    from src.copybot.tradebook import TABLE as TRADES_TABLE
+
+    threshold = pnl_threshold if pnl_threshold is not None else AUTO_PAUSE_PNL_24H_USDC
+    cutoff = int(_t.time()) - window_hours * 3600
+
+    paused: list[tuple[str, float, int]] = []  # (wallet, pnl, n_trades)
+
+    with tx() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT cs.wallet AS wallet,
+                   COALESCE(SUM(pt.pnl_usdc), 0) AS recent_pnl,
+                   COUNT(pt.id) AS n_trades
+            FROM copy_subscriptions cs
+            LEFT JOIN {TRADES_TABLE} pt
+              ON pt.source_wallet = cs.wallet
+             AND pt.entry_at >= ?
+             AND pt.status IN ('closed_win','closed_loss','settled_win','settled_loss')
+            WHERE cs.status = 'active'
+            GROUP BY cs.wallet
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        for r in rows:
+            n = int(r["n_trades"] or 0)
+            pnl = float(r["recent_pnl"] or 0.0)
+            if n < min_trades:
+                continue
+            if pnl > threshold:
+                continue
+            wallet = r["wallet"]
+            conn.execute(
+                """
+                UPDATE copy_subscriptions
+                SET status='paused', stopped_at=datetime('now')
+                WHERE wallet=?
+                """,
+                (wallet,),
+            )
+            _log_event(
+                conn, wallet, "pause", None, None,
+                f"PnL {window_hours}h ${pnl:+.2f} <= ${threshold:+.2f} ({n} trades)",
+                {
+                    "reason": "auto_paused_recent_loss",
+                    "pnl_window_usdc": pnl,
+                    "n_trades": n,
+                    "window_hours": window_hours,
+                    "threshold": threshold,
+                },
+            )
+            paused.append((wallet, pnl, n))
+
+    if paused:
+        log.info(
+            "auto_pause_by_recent_loss: %d wallets pausados (pnl %dh <= $%.2f)",
+            len(paused), window_hours, threshold,
+        )
+        for w, pnl, n in paused:
+            log.info("  pause recent_loss: %s.. pnl=$%+.2f n=%d", w[:10], pnl, n)
+
+    return len(paused)
 
 
 def recent_events(limit: int = 100) -> list[dict]:
