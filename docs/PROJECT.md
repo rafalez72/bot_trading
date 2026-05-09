@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-07 (fix bucle de muerte del watchdog discovery + fix idempotencia WS bridge: source_trade_id divergente del polling → DOBLE POSICIÓN. Tests 26 cubriendo el bridge.)
+> **Última actualización**: 2026-05-09 (día denso: fix BIGINT cursors RTDS ms→s + 8 features defensivas A-G+I post-análisis pérdidas + bot N2 crypto_arb con edge model probabilístico + Telegram con categoría/título + auto-rebalance 2h + discovery topvolume diario + shadow watch 200 candidatas + relax wallet_concentration y stale_trade. ~17 commits, 109 tests verde.)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -667,7 +667,53 @@ Si abrís un chat nuevo y el AI no sabe nada del proyecto:
 
 ---
 
-## 15. Estado actual operativo (al 2026-04-29)
+## 15. Estado actual operativo (al 2026-05-09 noche)
+
+### Composición wallets
+```
+50 active (35 clásicos + 15 HFT)  · target 60 (40+20)
+200 shadow (RTDS observa, no copia — pipeline pre-promote)
+56 paused
+33 dropped
+trader_metrics universe: 4062 (post topvolume run #1)
+```
+
+### N1 copybot (PolyMarket, paper)
+```
+LIVE_MODE=true / LIVE_DRY_RUN=true (cap $100)
+HFT_BUCKET_ENABLED=true
+DAILY_KILL_SWITCH_PCT=0.30 (subido de 0.10)
+MARKET_HORIZON_MIN_SECS=900 (15min, bajado de 30min)
+filter_thresholds: MIN_SCORE=0.70, MIN_PNL=100, MIN_TRADES=80, MIN_VOLUME=10k
+auto-rebalance: select_traders cada 2h
+auto-pause: pnl_24h <= -$2 → pause (cada 6h)
+WS bridge: 250 watched, ~116 matches/5min
+```
+
+### N2 crypto_arb (Binance vs Polymarket, paper)
+```
+CRYPTO_ARB_ENABLED=true · bet=$5
+6 símbolos: BTC/ETH/SOL/XRP/BNB/DOGE updown-5m
+Edge model probabilístico (CRYPTO_ARB_MIN_EDGE=0.10 = 10pp)
+Pre-close window 180s, slope guard 30s
+```
+
+### Resultados acumulados (paper, congelado pre-2026-05-09)
+```
+1140 trades cerrados · 373 wins / 767 losses · win rate 32.7%
+PnL acumulado: +$1,470.66 sobre cap $100
+```
+
+### 2026-05-09 (post-defensas, validando)
+```
+Reset kill_switch + 8 features defensivas + universe scaling
+Volumen objetivo: 5-15 trades/h con shadow validation pipeline
+Validation window: próximas 24-48h
+```
+
+---
+
+## 15.bis. Estado pre-defensas (al 2026-04-29) — congelado
 
 ### Infra
 ```
@@ -723,6 +769,136 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-09 — N1+N2 deploy + 8 features defensivas + bot crypto_arb + universe scaling
+
+**Hito**: día post-mortem y refactor mayor. Análisis de 13h de trading mostró
+**0 wins / 22 losses / -$19.91** post-deploy del bucket HFT (commit `cf9c812` del
+día anterior). Diagnosis: scalpers con métricas raras (sharpe 200+, vol/PnL 4000×)
+imitables solo con latencia 0; markets cripto-shortterm y esports-en-vivo donde
+mid oscila ±50% naturalmente disparando stop_loss=20% en ruido normal. Pre-N1 ya
+tenía win rate 25% — bot estructuralmente no rentable.
+
+#### Fixes urgentes
+- **`fa4c599` fix(cursors)**: WS bridge guardaba timestamps en ms (13 dígitos
+  ~1.7e12), `CAST AS INTEGER` en PG hacía overflow (INT32 max 2.1B). Normalizar
+  ms→s al recibir + cambiar a BIGINT en learning.auto_drop_by_inactivity y
+  ws_bridge._set_cursor.
+- **`f107240` fix(rtds-ws)**: `Task exception was never retrieved` cuando
+  heartbeat+consume terminan a la vez. Drenar `.exception()` de TODOS los done
+  tasks antes del raise.
+- **`360ef55` fix(selector)**: `psycopg %H ProgrammingError` por LIKE `'%HFT%'`
+  literal. Parametrizar el pattern.
+- **`7238c97` fix(pg-schema)**: `CREATE INDEX idx_shadow_mode` antes del ALTER
+  que agrega la columna → tablas pre-existentes fallaban en init_db. Reordenar.
+
+#### 8 features defensivas A-G+I (3 agentes en paralelo)
+- **A — `market_too_short` filter** (env `MARKET_HORIZON_MIN_SECS`, default
+  900s = 15min, bajado de 30min al validar 58% de rejects): skip markets que
+  cierran en <N segundos. Crypto_arb exempt.
+- **B — Stop loss adaptativo por horizon** (config.py: `STOP_LOSS_PCT_*` y
+  `STOP_LOSS_HORIZON_BUCKETS_S`): <30min→1.00 (off), <2h→0.40, <12h→0.30,
+  >12h→0.20. Razón: mid en short-term oscila ±50% normal; SL fijo dispara en
+  ruido. risk.py:sweep_stops joinea markets para `end_date`. Reason string
+  ahora termina en `_h_<bucket>` para auditoría.
+- **C — HFT filter sharpe/scalper**: `HFT_MAX_SHARPE=5.0` (exempt si trades≥200)
+  + `HFT_MAX_VOL_PNL_RATIO=100`. Drop wallets con métricas absurdas o de
+  scalper-de-spread (no copiable con latencia).
+- **D — `auto_pause_by_recent_loss`**: pausa wallets con PnL_24h <
+  `AUTO_PAUSE_PNL_24H_USDC` (-$2 default) y ≥2 trades en ventana. Wireado en
+  runner cada ~6h. Pause (no drop) — permite recuperación si la mala racha
+  revierte.
+- **E — `is_ultrashort_market` blocklist** (env `BLOCK_ULTRASHORT_MARKETS=true`):
+  regex match crypto-updown-Nm, esports en vivo (cs2/lol/valorant/dota), sports
+  vivos próximas 6h. Crypto_arb exempt.
+- **F — HFT bucket kill switch** (env `HFT_BUCKET_ENABLED`, también auto si
+  PnL_24h del bucket < `HFT_AUTO_DISABLE_PNL_24H` con sample ≥5). Manual flip
+  no requiere reload. Soft kill: detiene reposición, no liquida actuales.
+- **G — Copy-lag telemetry**: columnas `our_entry_at`/`our_entry_price` en
+  `paper_trades`. WS bridge captura `time.time()` y midpoint del CLOB al
+  procesar (timeout 1s, fail-open). Permite medir lag y slippage real-time.
+- **I — `recent_weighted_score` helper** (`src/copybot/scoring.py`): blend
+  histórico × peso reciente (PnL_7d). Building block; no integrado al selector
+  todavía.
+
+#### N2 — Bot crypto temporal arbitrage (Binance vs Polymarket)
+**Concept correction crítico**: el bot original pre-2026-05-09 comparaba
+`spot_move_pct > 0.3%` — eso NO es arbitraje, es momentum threshold. Después
+del refactor:
+- **Multi-symbol** `0a44337`: 6 símbolos (BTC/ETH/SOL/XRP/BNB/DOGE). HYPE no
+  está en Binance Spot. Volatilidad 4min: BTC ~0.10-0.20%, DOGE/HYPE 0.5-1.5%.
+- **Pre-close window** 60s→180s `0a44337`: 3× más oportunidades por bucket.
+- **Edge model** `92c6a46` (`src/copybot/crypto_arb_signals.py`): modelo
+  probabilístico normal-residual-drift. `implied_up_probability(spot_move_pct,
+  secs_left, sigma_pct_per_min)` calcula P(close UP) con CDF normal.
+  `edge_vs_mid` compara con mid Polymarket, devuelve (edge, side). Solo opera
+  si `edge ≥ CRYPTO_ARB_MIN_EDGE` (0.10 default = 10pp).
+- **Slope guard** `2cc0f80`: slope de últimos 30s debe agree con side elegido,
+  sino skip (defensa anti-rebote).
+- **Métricas**: `skipped_low_edge` (nuevo) reemplaza `low_momentum`; alias
+  retenido para backward compat del snapshot.
+
+#### Universe scaling (#1+#2+#3+#5)
+**Diagnóstico**: Polymarket procesa ~6000 trades/h con ~4400 wallets/h activas.
+El bot conocía 4052, seguía 58 (1.4% del universe, 0.06% del real). Bottleneck.
+- **#1 — `discover_top_volume_wallets`** `4efc2a1` (nuevo
+  `src/copybot/discovery_topvolume.py`): pull diario top-1000 wallets por
+  volumen 24h de `/trades`, alimentar `trader_metrics`. Idempotente vía
+  `bot_state.topvolume_last_run`. Throttle 5 req/s, semaphore 5 backfills,
+  watchdog 30min wall-clock.
+- **#2 — Shadow WS watch** `0c637ad` (nuevo `src/copybot/shadow_watch.py` +
+  ws_bridge.py): RTDS observa 200 candidatas extra (no copiamos, persistimos
+  a `shadow_trades` con `mode='pre_promote_watch'`). Filtro relajado:
+  `pnl > $50, trades > 30, win > 0.50, active 7d`. Cap 250 watched/conn.
+- **#3 — Thresholds relajados** (vía `filter_thresholds` table): MIN_SCORE
+  0.75→0.70, MIN_PNL 200→100, MIN_TRADES 140→80, MIN_VOLUME 20k→10k. Pool
+  qualifying 23 → ~55.
+- **#5 — Relax `wallet_concentration` + `stale_trade`** `0c637ad` +
+  `14ca1c7`: count-based check N=3 entries/(wallet,cid) en lugar de dollar-cap;
+  `STALE_TRADE_MAX_AGE_S=300` (era 60); LRU dedup `_should_log_stale` evita
+  spam de rejects duplicados (12 logs/seg vistos antes).
+
+#### Telegram + observabilidad
+- **`b169072` notif gain/loss con categoría+título**: helper
+  `_classify_market(pt)` regex-matchea slug → 14 categorías (Crypto,
+  Crypto-shortterm, NBA, NFL, MLB, NHL, UFC, Soccer, Esports, Weather,
+  Politics, Entertainment, Economy, Otros). Output:
+  `📉 Pérdida\nPerdió: $1.42\n🪙 Crypto-shortterm · "Will BTC be Up at 04:15 UTC?"\nAcumulado: $-19.91`
+- **`fa3b06b` auto-rebalance loop**: runner llama `select_traders` cada
+  ~7200s (2h) — antes solo se llamaba post-drop. Asegura que paused-qualifying
+  vuelvan al pool cuando hay huecos.
+
+#### Operations day
+- **Reset kill_switch**: subido `DAILY_KILL_SWITCH_PCT` 0.10→0.30 (más runway).
+- **HFT bucket cycle**: off durante 1h para validar pérdidas → on después de
+  agregar Features A/B/D/E que filtran a nivel de trade (no a nivel wallet).
+- **Cutovers múltiples** en Lenovo (Windows + Git Bash + Docker Desktop).
+  Validado: container recreado vía `docker compose up -d --force-recreate`,
+  pull de `ghcr.io/rafalez72/bot_trading:latest` post-build de GHA.
+- **MIN_SCORE 0.75→0.70** + auto-rebalance llevó active 23 → 50 (35 clásicos +
+  15 HFT). Top objetivo 60 (40+20) — ~10 wallets HFT-tagged no qualify aún.
+
+#### Métricas observadas post-deploy completo
+- **WS bridge**: 250 wallets watched (50 active + 200 shadow), 116 matches en
+  5min uptime (12× más visibilidad que con 58 watched).
+- **Rejects**: bajaron 84% al pasar `MARKET_HORIZON_MIN_SECS` 30min→15min
+  (53 market_too_short → 10).
+- **Opens**: 0-1 trade/h al cierre del día. Sistema correcto pero conservador.
+  Universe expansion (topvolume + shadow promote pipeline) es lo que va a
+  destrabar volumen sin sacrificar calidad.
+
+#### Tests
+- 109 passing (vs 34 baseline), +20 crypto_arb_signals, +9 discovery_topvolume,
+  +10 shadow_watch, +7 scoring, +7 horizon, +4 concentration_stale.
+- 7 fallas pre-existentes en `test_executor.py` (deadlock SQLite `_log_reject`
+  dentro de tx() — no relacionado).
+
+#### Comandos útiles agregados
+- `python copybot.py reset-killswitch` (ya existía, usado este día).
+- Endpoint `/api/crypto-arb-status` ahora lee snapshot persistido (no in-proc
+  vacío del server).
+
+---
 
 ### 2026-05-07 (tarde) — fix idempotencia WS bridge + tests 26 + smoke test
 
