@@ -602,6 +602,26 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("auto_pause_by_recent_loss error: %s", e)
 
+            # Auto-rebalance del top via select_traders (cada ~2h).
+            # 2026-05-09: select_traders solo se llamaba post-drop. Si auto_pause
+            # o el sync de selectores anteriores deja huecos en el top, no se
+            # rellenaban hasta el próximo drop. Loop periódico mantiene el top
+            # rebalanceado: las paused-qualifying se reactivan, las nunca-vistas
+            # entran si tienen score alto, las HFT del bucket activo se mantienen.
+            if cycle % max(1, 7200 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.copybot.selector import DEFAULT_TOP_N, select_traders
+                    res = select_traders(top_n=DEFAULT_TOP_N)
+                    added = len(res.get("added", []))
+                    paused = len(res.get("paused", []))
+                    if added or paused:
+                        console.print(
+                            f"[cyan]auto-rebalance:[/cyan] +{added} active, "
+                            f"-{paused} paused, total_active={res.get('total_active', 0)}"
+                        )
+                except Exception as e:
+                    log.exception("auto-rebalance error: %s", e)
+
             # Shadow tracker: pollea wallets dropped y registra su actividad
             # post-drop para análisis a posteriori (cada ~1h).
             # Wrap en wait_for: serial sobre N wallets dropped puede tardar
