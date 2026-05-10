@@ -544,6 +544,33 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar adversarial_asks: %s", e)
 
+    # Strategy D — long_horizon_arb (default off, gated por LONG_HORIZON_ENABLED).
+    # Pivot N2 a markets crypto $30k+ liq (BTC monthly, sports, etc — no thin
+    # 5min orderbooks que rompieron el live anterior).
+    lh_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.config import LONG_HORIZON_ENABLED
+            if LONG_HORIZON_ENABLED:
+                from src.copybot.long_horizon_arb import long_horizon_loop
+                lh_task = asyncio.create_task(long_horizon_loop())
+                log.info("long_horizon_arb: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar long_horizon_arb: %s", e)
+
+    # Hedge crypto_arb (default off, gated por HEDGE_ENABLED). Long Polymarket
+    # + Short Binance perp = neutral a dirección, captura solo lag mid vs spot.
+    hedge_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.config import HEDGE_ENABLED
+            if HEDGE_ENABLED:
+                from src.copybot.crypto_arb_hedge import crypto_arb_hedge_loop
+                hedge_task = asyncio.create_task(crypto_arb_hedge_loop())
+                log.info("crypto_arb_hedge: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar crypto_arb_hedge: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))
