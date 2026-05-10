@@ -86,6 +86,11 @@ class CryptoArbConfig:
     max_mid_target: float = DEFAULT_MAX_MID_TARGET
     bet_size_usdc: float = DEFAULT_BET_SIZE_USDC
     min_bucket_age_s: float = DEFAULT_MIN_BUCKET_AGE_S
+    # Activación explícita en LIVE_MODE. Default false: los markets crypto-updown-5m
+    # tienen orderbooks thin ($1-5k liquidez), un BUY de $5-10 = 0.5-1% del book →
+    # slippage 50-90% en live → pierde plata garantizado. Validar 24h en paper antes
+    # de poner CRYPTO_ARB_ALLOW_LIVE=true.
+    allow_live: bool = False
     # Símbolos activos
     symbols: tuple[str, ...] = field(
         default_factory=lambda: tuple(SYMBOL_TO_SLUG_PREFIX.keys())
@@ -100,6 +105,7 @@ class CryptoArbConfig:
             momentum_threshold_pct=float(os.getenv("CRYPTO_ARB_MOMENTUM_THRESHOLD_PCT", DEFAULT_MOMENTUM_THRESHOLD_PCT)),
             max_mid_target=float(os.getenv("CRYPTO_ARB_MAX_MID_TARGET", DEFAULT_MAX_MID_TARGET)),
             bet_size_usdc=float(os.getenv("CRYPTO_ARB_BET_SIZE_USDC", DEFAULT_BET_SIZE_USDC)),
+            allow_live=os.getenv("CRYPTO_ARB_ALLOW_LIVE", "false").lower() == "true",
         )
 
 
@@ -614,12 +620,25 @@ async def crypto_arb_loop() -> None:
     if not config.enabled:
         log.info("crypto_arb: disabled (CRYPTO_ARB_ENABLED!=true)")
         return
+    # Guard contra LIVE: orderbooks de updown-5m son thin ($1-5k) y un BUY de
+    # $5-10 mueve 0.5-1% del book → slippage real 50-90% → pérdida garantizada.
+    # Solo lo habilitamos en LIVE si el user lo activa explícitamente con
+    # CRYPTO_ARB_ALLOW_LIVE=true (después de validar 24h en paper).
+    from src.config import LIVE_MODE
+    if LIVE_MODE and not config.allow_live:
+        log.warning(
+            "crypto_arb: deshabilitado en LIVE_MODE (orderbooks thin → "
+            "slippage extremo). Para activar, setear CRYPTO_ARB_ALLOW_LIVE=true "
+            "después de validar 24h en paper."
+        )
+        return
     log.info(
         "crypto_arb: arrancando — interval=%ss min_edge=%.3f bet=$%s "
-        "pre_close_window=%ss symbols=%s",
+        "pre_close_window=%ss symbols=%s%s",
         config.check_interval_s, get_min_edge(),
         config.bet_size_usdc, config.pre_close_window_s,
         ",".join(config.symbols),
+        "  (LIVE_MODE — opt-in)" if (LIVE_MODE and config.allow_live) else "",
     )
 
     # Histórico de precios spot por símbolo. Cada (ts_ms, price). Cap de
