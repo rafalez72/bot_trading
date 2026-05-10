@@ -337,8 +337,17 @@ def open_position(
     price: float,
     timestamp: int,
     raw: dict | None = None,
+    our_entry_at: int | None = None,
+    our_entry_price: float | None = None,
 ) -> tuple[int | None, str | None]:
-    """Abre un live_trade ejecutando una orden BUY real en el CLOB."""
+    """Abre un live_trade ejecutando una orden BUY real en el CLOB.
+
+    `our_entry_at` y `our_entry_price` (Feature G — copy-lag telemetry):
+    timestamp y mid local en el momento que procesamos. ws_bridge los
+    pasa siempre. Aceptamos en la firma para paridad con paper.open_position.
+    Si la columna existe en live_trades los persistimos; sino se ignoran
+    (back-compat con installs viejos).
+    """
     # Lazy import: no cargar py-clob-client si nunca se llama
     from src.polymarket.clob_client import get_token_id, place_market_order
 
