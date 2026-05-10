@@ -18,6 +18,51 @@
 
 ---
 
+## ⚠️ RESPONSABILIDADES DEL ASISTENTE (NO DELEGAR AL USUARIO)
+
+El usuario NO debe tener que tocar `.env`, hacer pulls, restarts, ni diagnósticos manuales. **El asistente se encarga de todo el ciclo:** dev → push → deploy verify → audit → fix → re-push.
+
+### Acceso disponible para el asistente
+
+| Recurso | Acceso |
+|---|---|
+| Repo `polymarket_copybot` Mac local | ✅ Read/Write/Edit/git push |
+| Lenovo dashboard HTTP `:8000` | ✅ via Tailscale `100.98.174.60:8000` |
+| GitHub Actions (Docker build) | ⚠️ vía push trigger (sin gh auth, no logs) |
+| SSH Lenovo | ❌ no disponible |
+| Filesystem Lenovo | ❌ no disponible |
+| `.env` Lenovo (filesystem) | ❌ no editable directo |
+
+### Lo que el asistente debe hacer SIEMPRE
+
+1. **Configuración de strategies (enable/disable)**: agregar gates defensivos en código, NO pedir al usuario que edite `.env` Lenovo.
+   - Ej: `HEDGE_ENABLED=true` debe requerir además `BINANCE_API_KEY` presente; sin key, el código no arranca el loop aunque el flag esté true. Patrón: validar pre-requisitos en runtime, no asumir `.env` correcto.
+2. **Endpoints admin** para acciones operacionales (kill switch reset, version, config diag). Agregar nuevos cuando sea necesario en `src/api/server.py` bajo prefix `/api/admin/`.
+3. **Defaults paper-safe**: si `LIVE_MODE=false`, defaults agresivos para validar. Si `LIVE_MODE=true`, defaults conservadores. Patrón en `src/config.py`: `_FLAG_DEFAULT = "false" if LIVE_MODE else "true"`.
+4. **Deploy verification**: tras cada push, verificar `/api/admin/version` reporta el commit esperado. Si no, esperar Task Scheduler tick o solicitar al user `docker compose pull && up -d` (única acción manual aceptable).
+5. **Auto-diagnóstico**: bugs visuales del dashboard (nombres ENV mal escritos en `/strategies/status`, etc.) detectables vía `/api/admin/config` vs `/api/strategies/status` — el asistente compara y fixea.
+6. **Audit periódico**: curl `/api/admin/kill-switch/status`, `/api/strategies/status`, `/api/crypto-arb-status` para verificar salud del bot.
+
+### Lo que SÍ requiere acción manual del usuario (única excepción)
+
+- `docker compose pull && docker compose up -d` en Lenovo cuando Task Scheduler (5min cron) no es suficientemente rápido.
+- Setup inicial de API keys reales (BINANCE_API_KEY, POLYMARKET_PROXY_*) — secretos no commiteables.
+- Depósitos de capital (USDC Polymarket, USDT Binance).
+- Confirmaciones explícitas para acciones destructivas (reset DB, force-push, etc.).
+
+### Endpoints admin disponibles (mantener actualizado)
+
+| Endpoint | Método | Propósito |
+|---|---|---|
+| `/api/admin/version` | GET | Commit SHA + build time imagen Docker |
+| `/api/admin/config` | GET | Runtime gates strategies + source (env vs default) |
+| `/api/admin/kill-switch/status` | GET | Estado kill switch |
+| `/api/admin/kill-switch/reset?rebaseline_peak=true` | POST | Reset + rebaseline peak balance |
+
+Agregar más cuando sean necesarios. Naming convention: `/api/admin/<resource>/<action>`.
+
+---
+
 ## 1. ¿Qué es esto?
 
 Bot que **copia trades** de los mejores wallets de Polymarket (prediction market sobre Polygon). Apuesta réplicas en paper trading con un cap simulado de $100 USDC. Tiene autoaprendizaje multicapa para minimizar pérdidas. La idea última (Fase 5, NO construida aún) es ejecutar con USDC reales en Polymarket.

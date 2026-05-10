@@ -560,14 +560,24 @@ async def run_loop(*, once: bool = False) -> None:
 
     # Hedge crypto_arb (default off, gated por HEDGE_ENABLED). Long Polymarket
     # + Short Binance perp = neutral a dirección, captura solo lag mid vs spot.
+    # Gate defensivo (2026-05-10): requiere ADEMÁS BINANCE_API_KEY presente.
+    # Sin key, hedge_loop arrancaría y spam-loggearía errores cada eval. Mejor
+    # no arrancar si falta key, aunque HEDGE_ENABLED=true en .env (caso real:
+    # user activó flag prematuramente, sin depositar $$ aún).
     hedge_task: asyncio.Task | None = None
     if not once:
         try:
             from src.config import HEDGE_ENABLED
             if HEDGE_ENABLED:
-                from src.copybot.crypto_arb_hedge import crypto_arb_hedge_loop
-                hedge_task = asyncio.create_task(crypto_arb_hedge_loop())
-                log.info("crypto_arb_hedge: arrancado en paralelo")
+                if not os.getenv("BINANCE_API_KEY"):
+                    log.warning(
+                        "crypto_arb_hedge: HEDGE_ENABLED=true pero BINANCE_API_KEY "
+                        "ausente — no arrancado (configure key antes de activar)"
+                    )
+                else:
+                    from src.copybot.crypto_arb_hedge import crypto_arb_hedge_loop
+                    hedge_task = asyncio.create_task(crypto_arb_hedge_loop())
+                    log.info("crypto_arb_hedge: arrancado en paralelo")
         except Exception as e:
             log.warning("no se pudo arrancar crypto_arb_hedge: %s", e)
 

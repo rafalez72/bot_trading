@@ -437,7 +437,12 @@ def api_strategies_status() -> dict:
         """,
         (today_ts,),
     )
-    hd["enabled"] = os.getenv("HEDGE_ENABLED", "false").lower() == "true"
+    # Hedge "enabled" refleja si efectivamente arrancó (mismo gate que runner.py):
+    # requiere HEDGE_ENABLED=true Y BINANCE_API_KEY presente.
+    hd["enabled"] = (
+        os.getenv("HEDGE_ENABLED", "false").lower() == "true"
+        and bool(os.getenv("BINANCE_API_KEY", ""))
+    )
 
     return {
         "_ts": int(_t.time()),
