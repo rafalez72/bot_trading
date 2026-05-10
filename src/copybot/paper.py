@@ -380,7 +380,7 @@ def settle_resolved() -> int:
         rows = conn.execute(
             """
             SELECT pt.id, pt.entry_price, pt.entry_size_usdc, pt.outcome_index,
-                   m.outcome_prices
+                   pt.side, m.outcome_prices
             FROM paper_trades pt
             JOIN markets m ON m.condition_id = pt.condition_id
             WHERE pt.status IN ('open', 'waiting_settlement') AND m.closed=1
@@ -388,6 +388,7 @@ def settle_resolved() -> int:
         ).fetchall()
 
     to_settle: list[tuple] = []
+    clv_records: list[tuple] = []  # (trade_id, entry, payout, side)
     for r in rows:
         payout = _resolved_payout(r["outcome_prices"], r["outcome_index"])
         if payout is None:
@@ -404,6 +405,7 @@ def settle_resolved() -> int:
         _, _, net_pnl = post_close_costs(gross)
         status = "settled_win" if net_pnl > 0 else "settled_loss"
         to_settle.append((payout, net_pnl, status, r["id"]))
+        clv_records.append((r["id"], entry, payout, r["side"]))
 
     if not to_settle:
         return 0
@@ -417,6 +419,21 @@ def settle_resolved() -> int:
             """,
             to_settle,
         )
+    # CLV tracking: ortogonal al PnL, no bloquea si falla. Llamado fuera
+    # de la tx() porque record_clv abre su propia transacción.
+    try:
+        from src.copybot.clv_tracker import record_clv
+        for tid, entry, payout, side in clv_records:
+            try:
+                record_clv(
+                    trade_id=tid, entry_price=entry, closing_price=payout,
+                    side=side or "BUY", source="paper",
+                )
+            except Exception:
+                log.debug("clv_tracker.record_clv falló pid=%s", tid)
+    except Exception:
+        log.debug("clv_tracker import/loop error — settle continúa")
+
     for _, _, _, pid in to_settle:
         on_paper_trade_closed(pid)
         settled += 1

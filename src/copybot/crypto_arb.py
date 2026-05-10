@@ -544,7 +544,8 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
         # los liquida.
         rows = conn.execute(
             """
-            SELECT id, condition_id, entry_price, entry_size_usdc, outcome_index, raw
+            SELECT id, condition_id, entry_price, entry_size_usdc, outcome_index,
+                   side, raw
             FROM paper_trades
             WHERE source_wallet='crypto_arb' AND status IN ('open', 'waiting_settlement')
             """,
@@ -579,6 +580,7 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
         by_slug.setdefault(slug, []).append(r)
 
     to_settle: list[tuple] = []
+    clv_records: list[tuple] = []  # (trade_id, entry, payout, side, slug)
     for slug, rs in by_slug.items():
         try:
             data = await client._get(
@@ -633,6 +635,7 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
             _, _, net_pnl = post_close_costs(gross)
             status = "settled_win" if net_pnl > 0 else "settled_loss"
             to_settle.append((payout, net_pnl, status, r["id"]))
+            clv_records.append((r["id"], entry, payout, r["side"], slug))
 
     if not to_settle:
         return 0
@@ -646,6 +649,23 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
             """,
             to_settle,
         )
+    # CLV tracking: edge real ortogonal al PnL (positivo si bot captó
+    # movimiento de market post-entry). source='crypto_arb' lo separa
+    # de paper genérico en compute_clv_summary. No bloquea si falla.
+    try:
+        from src.copybot.clv_tracker import record_clv
+        for tid, entry, payout, side, bslug in clv_records:
+            try:
+                await asyncio.to_thread(
+                    record_clv, tid, entry, payout,
+                    side=side or "BUY", source="crypto_arb",
+                    bucket_slug=bslug,
+                )
+            except Exception:
+                log.debug("crypto_arb.settle clv record fail pid=%s", tid)
+    except Exception:
+        log.debug("crypto_arb.settle clv import error — settle continúa")
+
     # on_paper_trade_closed dispara la notif Telegram (gain/loss) + bandit
     # recompute. Llamado fuera de tx() porque cada uno abre su propia tx.
     for _, _, _, pid in to_settle:

@@ -354,3 +354,20 @@ CREATE TABLE IF NOT EXISTS dx_rejects (
     detail        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dx_rejects_at ON dx_rejects(at DESC);
+
+-- CLV (Closing Line Value): edge real ortogonal al PnL ruidoso.
+-- Cada trade settlement registra (entry_price, closing_price) y el delta
+-- porcentual desde la perspectiva del side. Ver src/copybot/clv_tracker.py.
+CREATE TABLE IF NOT EXISTS clv_metrics (
+    id              BIGSERIAL PRIMARY KEY,
+    trade_id        BIGINT,
+    source          TEXT,
+    entry_price     DOUBLE PRECISION,
+    closing_price   DOUBLE PRECISION,
+    clv_pct         DOUBLE PRECISION,
+    side            TEXT,
+    bucket_slug     TEXT,
+    recorded_at     BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_clv_recorded ON clv_metrics(recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clv_source ON clv_metrics(source, recorded_at DESC);

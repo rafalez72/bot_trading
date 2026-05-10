@@ -722,6 +722,24 @@ _MIGRATIONS = [
     # mantiene compat con filas existentes.
     "ALTER TABLE shadow_trades ADD COLUMN mode TEXT DEFAULT 'post_drop'",
     "CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, timestamp DESC)",
+    # CLV (Closing Line Value): edge real ortogonal al PnL ruidoso.
+    # Por trade settlement, registramos (entry_price, closing_price) y el
+    # delta porcentual desde la perspectiva del side. Positivo → bot
+    # captó edge real (mercado movió a favor); negativo → adversarial
+    # (mercado nos castigó). Ver src/copybot/clv_tracker.py.
+    """CREATE TABLE IF NOT EXISTS clv_metrics (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id        INTEGER,
+        source          TEXT,
+        entry_price     REAL,
+        closing_price   REAL,
+        clv_pct         REAL,
+        side            TEXT,
+        bucket_slug     TEXT,
+        recorded_at     INTEGER
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_clv_recorded ON clv_metrics(recorded_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_clv_source ON clv_metrics(source, recorded_at DESC)",
 ]
 
 
