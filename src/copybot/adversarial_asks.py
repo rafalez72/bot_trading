@@ -1,0 +1,719 @@
+"""Adversarial dust asks pre-close — explota retail/bots en último minuto.
+
+ADVERSARIAL — explota retail/bots tontos comprando a market en el último
+minuto. Es éticamente cuestionable pero financieramente válido en mercados
+de prediction. Usar bajo responsabilidad del operador.
+
+Estrategia (Nivel 3, 2026-05-10):
+- Mercados ``{symbol}-updown-5m-{epoch}`` resuelven en 5 min.
+- En los últimos 30-60s pre-close, si ``crypto_arb_signals.implied_up_probability``
+  estima P(UP) >= 0.85 (o <=0.15), el lado perdedor ya está prácticamente
+  decidido (el spot tiene poca varianza residual para flippear).
+- Postear LIMIT ASK (SELL) del lado perdedor a precio basura (0.05).
+- Retail/bots desinformados que entran a market BUY en el último minuto
+  pueden pegar nuestra ask → recibimos $0.05 por share.
+- Settle: el lado vale $0 → pero ya cobramos. PROFIT puro.
+
+INVESTIGACIÓN: ¿se puede SELL sin shares previas en Polymarket?
+================================================================
+Polymarket CLOB requiere ERC1155 balance del token_id antes de aceptar
+la orden SELL. NO se puede shortear directamente. Verificación:
+    - py_clob_client_v2 acepta side=SELL en OrderArgs sin chequear balance
+      cliente-side, pero el server-side valida la wallet (POLY_GNOSIS_SAFE
+      con balance ERC1155 en CTF Exchange contract).
+    - Sin balance → response: ``not enough balance / allowance``.
+
+Workarounds viables:
+- **Plan A (BUY-then-ASK)**: si vemos a OTRO operador postear dust ask
+  en el lado perdedor, le compramos las shares barato y reposteamos
+  nuestra ask un tick más alto. Funciona pero depende de oferta externa.
+- **Plan B (mint complete set)**: split 1 USDC en 1 YES + 1 NO via
+  ``CTFExchange.splitPosition`` (neg-risk markets) o ConditionalTokens.
+  Después postear ASK del lado perdedor. Si fillea: recibimos $0.05 y
+  retenemos el ganador (settle $1). Net si fillea = $0.05 ganancia
+  marginal sobre el cost basis $1. Si no fillea: ganador settle $1,
+  perdedor $0, net $0.
+- **Plan C (existing inventory)**: si el bot ya tiene posiciones abiertas
+  del lado perdedor (e.g., crypto_arb falló y quedó con shares del lado
+  que va a perder), las usamos como inventario para postear la ask en
+  lugar de cerrar a SL. "Salvataje" de posiciones perdedoras.
+
+Implementación actual (esqueleto v1):
+- Modo ``signal_only=true`` (default): NO postea órdenes. Solo detecta
+  oportunidades, las loggea y las persiste en ``adversarial_orders``
+  con ``status='detected'``. Permite analizar fill-rate teórico antes
+  de comprometer capital.
+- Modo ``signal_only=false``: requiere implementación adicional de
+  ``_post_adversarial_ask`` que coordine con CTF Exchange para mint
+  complete set + post limit. Stub queda con ``NotImplementedError``.
+
+Activación: ``ADVERSARIAL_ENABLED=true``.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Optional
+
+from src.copybot.crypto_arb_signals import (
+    get_sigma_pct_per_min,
+    implied_up_probability,
+)
+
+log = logging.getLogger(__name__)
+
+
+# --- Constantes ---
+
+# Slugs crypto-updown-5m soportados (mismos que crypto_arb).
+SYMBOL_TO_SLUG_PREFIX = {
+    "BTCUSDT": "btc-updown-5m-",
+    "ETHUSDT": "eth-updown-5m-",
+    "SOLUSDT": "sol-updown-5m-",
+    "XRPUSDT": "xrp-updown-5m-",
+    "BNBUSDT": "bnb-updown-5m-",
+    "DOGEUSDT": "doge-updown-5m-",
+}
+SLUG_PREFIX_TO_SYMBOL = {v: k for k, v in SYMBOL_TO_SLUG_PREFIX.items()}
+SLUG_REGEX = re.compile(r"^(btc|eth|sol|xrp|bnb|hype|doge)-updown-5m-(\d+)$")
+
+# Sides
+SIDE_UP = "Up"
+SIDE_DOWN = "Down"
+
+# Status valores en tabla adversarial_orders
+STATUS_DETECTED = "detected"      # señal observada (signal_only)
+STATUS_OPEN = "open"              # ask posteada al CLOB
+STATUS_FILLED = "filled"          # retail pegó nuestra ask
+STATUS_CANCELLED = "cancelled"    # cancelada antes de fill
+STATUS_SETTLED_WIN = "settled_win"
+STATUS_SETTLED_LOSS = "settled_loss"
+STATUS_EXPIRED_NOFILL = "expired_nofill"  # nadie pegó, settle $0
+
+
+# --- Configuración ---
+
+@dataclass
+class AdversarialConfig:
+    """Config leída de env. Defaults conservadores: signal_only y desactivado."""
+
+    enabled: bool = False
+    signal_only: bool = True            # default true: NO postea órdenes reales
+    max_secs_to_close: float = 60.0     # solo último minuto
+    min_secs_to_close: float = 10.0     # margen pa que la orden filtre antes de close
+    min_loser_prob: float = 0.85        # P(side ganador) >= 0.85 → opuesto es loser
+    ask_price: float = 0.05             # bait price del ask
+    size_usdc: float = 2.0              # tamaño nominal del ask (USDC notional)
+    check_interval_s: float = 5.0       # cada cuánto evaluar markets
+    history_cap: int = 360              # samples max por símbolo (6 min @ 1/s)
+    symbols: tuple[str, ...] = field(
+        default_factory=lambda: tuple(SYMBOL_TO_SLUG_PREFIX.keys())
+    )
+
+    @classmethod
+    def from_env(cls) -> "AdversarialConfig":
+        return cls(
+            enabled=_envbool("ADVERSARIAL_ENABLED", False),
+            signal_only=_envbool("ADVERSARIAL_SIGNAL_ONLY", True),
+            max_secs_to_close=_envfloat("ADVERSARIAL_MAX_SECS_TO_CLOSE", 60.0),
+            min_secs_to_close=_envfloat("ADVERSARIAL_MIN_SECS_TO_CLOSE", 10.0),
+            min_loser_prob=_envfloat("ADVERSARIAL_MIN_LOSER_PROB", 0.85),
+            ask_price=_envfloat("ADVERSARIAL_ASK_PRICE", 0.05),
+            size_usdc=_envfloat("ADVERSARIAL_SIZE_USDC", 2.0),
+            check_interval_s=_envfloat("ADVERSARIAL_CHECK_INTERVAL_S", 5.0),
+        )
+
+
+def _envbool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "y", "on")
+
+
+def _envfloat(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# --- Schema lazy ---
+
+def init_schema() -> None:
+    """Crea la tabla ``adversarial_orders`` si no existe (idempotente).
+
+    Usa el connector compartido ``src.db.schema.db()``. Soporta SQLite y
+    Postgres — la sintaxis CREATE TABLE IF NOT EXISTS es estándar y los
+    tipos usados (BIGSERIAL/PRIMARY KEY/TEXT/BIGINT/DOUBLE PRECISION)
+    son compatibles con ambos backends a través del traductor SQL del
+    schema module.
+
+    Es lazy a propósito: el módulo no quiere requerir cambios en
+    ``schema.py`` para no acoplarse al ciclo de vida de migraciones.
+    Idempotente — re-llamar es seguro y barato (no caché global porque
+    el path de DB puede cambiar runtime en tests con monkeypatch).
+    """
+    try:
+        from src.db.schema import BACKEND, db
+    except Exception as e:  # pragma: no cover — entornos sin DB
+        log.debug("adversarial_asks.init_schema: db unavailable (%s)", e)
+        return
+
+    # Tipo de PK depende del backend: PG usa BIGSERIAL, SQLite usa
+    # INTEGER PRIMARY KEY AUTOINCREMENT. El traductor SQL de schema.py
+    # NO traduce BIGSERIAL — emitimos el DDL apropiado a cada backend.
+    pk_decl = (
+        "id BIGSERIAL PRIMARY KEY"
+        if BACKEND == "postgres"
+        else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    )
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS adversarial_orders (
+      {pk_decl},
+      symbol TEXT,
+      bucket_slug TEXT NOT NULL,
+      bucket_end_ts BIGINT NOT NULL,
+      loser_side TEXT NOT NULL,
+      p_up_at_signal DOUBLE PRECISION,
+      ask_price DOUBLE PRECISION,
+      size_usdc DOUBLE PRECISION,
+      order_id TEXT,
+      status TEXT DEFAULT 'detected',
+      fill_price DOUBLE PRECISION,
+      pnl_usdc DOUBLE PRECISION,
+      signal_at BIGINT,
+      filled_at BIGINT
+    )
+    """
+    try:
+        with db() as conn:
+            conn.execute(ddl)
+    except Exception as e:
+        log.warning("adversarial_asks.init_schema failed: %s", e)
+
+
+# --- Persistencia ---
+
+def record_signal(
+    *,
+    symbol: Optional[str],
+    bucket_slug: str,
+    bucket_end_ts: int,
+    loser_side: str,
+    p_up: float,
+    ask_price: float,
+    size_usdc: float,
+    status: str = STATUS_DETECTED,
+    order_id: Optional[str] = None,
+    signal_at: Optional[int] = None,
+) -> Optional[int]:
+    """Persiste señal/orden en ``adversarial_orders``. Devuelve id (o None)."""
+    init_schema()
+    try:
+        from src.db.schema import tx
+    except Exception:
+        return None
+
+    signal_at = signal_at if signal_at is not None else int(time.time())
+    sql = """
+    INSERT INTO adversarial_orders (
+      symbol, bucket_slug, bucket_end_ts, loser_side, p_up_at_signal,
+      ask_price, size_usdc, order_id, status, signal_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        symbol, bucket_slug, int(bucket_end_ts), loser_side,
+        float(p_up), float(ask_price), float(size_usdc),
+        order_id, status, signal_at,
+    )
+    try:
+        with tx() as conn:
+            cur = conn.execute(sql, params)
+            try:
+                return cur.lastrowid  # SQLite
+            except Exception:
+                return None
+    except Exception as e:
+        log.warning("adversarial_asks.record_signal failed: %s", e)
+        return None
+
+
+def update_settlement(
+    *, order_id_db: int, status: str,
+    fill_price: Optional[float] = None,
+    pnl_usdc: Optional[float] = None,
+    filled_at: Optional[int] = None,
+) -> bool:
+    """Actualiza una row tras fill/settle/cancel."""
+    init_schema()
+    try:
+        from src.db.schema import tx
+    except Exception:
+        return False
+    try:
+        with tx() as conn:
+            conn.execute(
+                """
+                UPDATE adversarial_orders
+                SET status=?, fill_price=?, pnl_usdc=?, filled_at=?
+                WHERE id=?
+                """,
+                (status, fill_price, pnl_usdc, filled_at, int(order_id_db)),
+            )
+        return True
+    except Exception as e:
+        log.warning("adversarial_asks.update_settlement failed: %s", e)
+        return False
+
+
+# --- Lógica de detección de loser side ---
+
+def detect_loser_side(
+    *, p_up: float, min_loser_prob: float,
+) -> Optional[str]:
+    """Devuelve ``'Down'`` si UP es ganador casi seguro, ``'Up'`` si DOWN
+    es ganador casi seguro, ``None`` si la prob está en zona incierta.
+
+    Logic:
+    - p_up >= min_loser_prob → UP gana, DOWN es el loser → vendemos DOWN
+      (su token va a $0).
+    - p_up <= 1 - min_loser_prob → DOWN gana, UP es el loser → vendemos UP.
+    - sino → incertidumbre alta → skip.
+    """
+    if p_up >= min_loser_prob:
+        return SIDE_DOWN
+    if p_up <= 1.0 - min_loser_prob:
+        return SIDE_UP
+    return None
+
+
+def parse_slug(slug: str) -> Optional[tuple[str, int]]:
+    """Devuelve (slug_prefix, end_epoch) o None."""
+    if not slug:
+        return None
+    m = SLUG_REGEX.match(slug)
+    if not m:
+        return None
+    return f"{m.group(1)}-updown-5m-", int(m.group(2))
+
+
+def _match_to_symbol(slug_prefix: str) -> Optional[str]:
+    return SLUG_PREFIX_TO_SYMBOL.get(slug_prefix)
+
+
+# --- Evaluador puro (testeable) ---
+
+@dataclass
+class AdversarialDecision:
+    """Decisión de postear ask adversarial. ``post=False`` → skip.
+
+    Campos:
+    - ``post``: si True, postear ask en ``token_id`` del loser_side.
+    - ``loser_side``: ``"Up"`` o ``"Down"`` (None si no aplica).
+    - ``p_up``: probabilidad implied calculada (logging).
+    - ``secs_to_close``: secs hasta el bucket end.
+    - ``reason``: motivo del skip o el match.
+    """
+    post: bool
+    loser_side: Optional[str]
+    p_up: float
+    secs_to_close: float
+    reason: str
+    bucket_slug: str = ""
+    bucket_end_ts: int = 0
+    symbol: Optional[str] = None
+
+
+def evaluate_market(
+    *,
+    bucket_slug: str,
+    bucket_end_ts: int,
+    spot_now: Optional[float],
+    spot_at_bucket_start: Optional[float],
+    now_ts: int,
+    config: AdversarialConfig,
+) -> AdversarialDecision:
+    """Evalúa un market y devuelve si debemos postear ask adversarial.
+
+    Función pura (no I/O, no DB) — fácil de testear con datos sintéticos.
+
+    Args:
+        bucket_slug: e.g., ``"btc-updown-5m-1777505400"``.
+        bucket_end_ts: epoch (s) del cierre del bucket.
+        spot_now: precio Binance actual del símbolo, o None si no hay.
+        spot_at_bucket_start: precio Binance al inicio del bucket
+            (bucket_end_ts - 300), o None si no hay history.
+        now_ts: timestamp actual en s.
+        config: ``AdversarialConfig``.
+
+    Returns:
+        ``AdversarialDecision`` con ``post=True`` si toca postear.
+    """
+    parsed = parse_slug(bucket_slug)
+    if not parsed:
+        return AdversarialDecision(
+            post=False, loser_side=None, p_up=0.5, secs_to_close=0.0,
+            reason="invalid_slug", bucket_slug=bucket_slug,
+            bucket_end_ts=bucket_end_ts,
+        )
+    slug_prefix, _epoch = parsed
+    symbol = _match_to_symbol(slug_prefix)
+
+    secs_to_close = float(bucket_end_ts - now_ts)
+
+    # Ventana temporal: solo cerrar al final del bucket, con margen mínimo.
+    if secs_to_close > config.max_secs_to_close:
+        return AdversarialDecision(
+            post=False, loser_side=None, p_up=0.5, secs_to_close=secs_to_close,
+            reason="too_far_from_close", bucket_slug=bucket_slug,
+            bucket_end_ts=bucket_end_ts, symbol=symbol,
+        )
+    if secs_to_close < config.min_secs_to_close:
+        return AdversarialDecision(
+            post=False, loser_side=None, p_up=0.5, secs_to_close=secs_to_close,
+            reason="too_close_to_close", bucket_slug=bucket_slug,
+            bucket_end_ts=bucket_end_ts, symbol=symbol,
+        )
+
+    if spot_now is None or spot_at_bucket_start is None or spot_at_bucket_start <= 0:
+        return AdversarialDecision(
+            post=False, loser_side=None, p_up=0.5, secs_to_close=secs_to_close,
+            reason="no_spot", bucket_slug=bucket_slug,
+            bucket_end_ts=bucket_end_ts, symbol=symbol,
+        )
+
+    move_pct = (spot_now / spot_at_bucket_start - 1.0) * 100.0
+    sigma = get_sigma_pct_per_min(symbol or "BTCUSDT")
+    p_up = implied_up_probability(
+        spot_move_pct=move_pct,
+        secs_left=max(secs_to_close, 0.0),
+        sigma_pct_per_min=sigma,
+    )
+
+    loser = detect_loser_side(p_up=p_up, min_loser_prob=config.min_loser_prob)
+    if loser is None:
+        return AdversarialDecision(
+            post=False, loser_side=None, p_up=p_up, secs_to_close=secs_to_close,
+            reason=f"uncertain_p_up_{p_up:.3f}", bucket_slug=bucket_slug,
+            bucket_end_ts=bucket_end_ts, symbol=symbol,
+        )
+
+    return AdversarialDecision(
+        post=True, loser_side=loser, p_up=p_up, secs_to_close=secs_to_close,
+        reason=(
+            f"loser={loser} p_up={p_up:.3f} move={move_pct:+.3f}% "
+            f"secs_left={secs_to_close:.0f}"
+        ),
+        bucket_slug=bucket_slug, bucket_end_ts=bucket_end_ts, symbol=symbol,
+    )
+
+
+# --- Posting (stubs / paper) ---
+
+# Hook tipado para inyectar en tests / live. Devuelve order_id o None.
+PostAskHook = Callable[
+    [str, str, float, float],  # token_id, side, price, size_usdc
+    Awaitable[Optional[str]],
+]
+
+
+async def _post_adversarial_ask_signal_only(
+    token_id: str, side: str, price: float, size_usdc: float,
+) -> Optional[str]:
+    """No-op: solo loggea. Default cuando ``signal_only=True``."""
+    log.info(
+        "adversarial.signal_only token=%s side=%s price=%.4f size=%.2f USDC",
+        token_id[:10] + "..." if len(token_id) > 10 else token_id,
+        side, price, size_usdc,
+    )
+    return None
+
+
+async def _post_adversarial_ask_live(
+    token_id: str, side: str, price: float, size_usdc: float,
+) -> Optional[str]:
+    """STUB — postear ask resting (GTC) en el CLOB. NO IMPLEMENTADO.
+
+    Razón: requiere mint de complete set (split position vía CTF Exchange)
+    o BUY-then-resell, ninguno de los cuales está expuesto en
+    ``src.polymarket.clob_client``. El flujo correcto sería:
+
+    1. ``CTFExchange.splitPosition(condition_id, amount)`` — gasta USDC,
+       recibe ERC1155 de YES + NO.
+    2. ``client.create_order + post_order(OrderType.GTC)`` con side=SELL,
+       price=ask_price, size=size_usdc/ask_price del token_id loser.
+    3. Listen al WS user channel para detectar fill.
+    4. En fill: registrar PnL = (price - 0) * shares - fees.
+    5. En no-fill: cancel pre-close, redeem winner side por $1.
+
+    Implementarlo requiere extender ``clob_client.py`` con:
+    - ``split_position(condition_id, amount_usdc)`` (web3 call al CTF Exchange)
+    - ``place_limit_order_gtc(token_id, side, price, size)`` (orden resting)
+    - ``cancel_order(order_id)``
+
+    Por ahora, ``signal_only=False`` levanta NotImplementedError.
+    """
+    raise NotImplementedError(
+        "live adversarial asks require splitPosition + GTC orders; "
+        "extend clob_client.py first. Use signal_only=true to log opportunities."
+    )
+
+
+# --- Loop coordinator ---
+
+class AdversarialAsks:
+    """Orquestador del flujo adversarial.
+
+    Mantiene history de spot prices, evalúa markets activos cerca del
+    close, y postea (o loggea) asks adversarial.
+
+    Diseñado para ser inyectable en tests:
+        - ``markets_provider``: async fn () -> list[market_dict] con
+          ``slug``, ``end_ts``, opcional ``clobTokenIds``.
+        - ``post_ask_hook``: async fn(token_id, side, price, size_usdc) -> order_id
+          (default: signal_only logger).
+        - ``now_fn``: () -> int (default: time.time).
+
+    En production, el caller plugea un ``markets_provider`` que llame
+    a ``PolymarketClient.iter_markets`` y un ``post_ask_hook`` que llame
+    al CLOB real.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: Optional[AdversarialConfig] = None,
+        markets_provider: Optional[Callable[[], Awaitable[list[dict]]]] = None,
+        post_ask_hook: Optional[PostAskHook] = None,
+        now_fn: Optional[Callable[[], int]] = None,
+    ):
+        self.config = config or AdversarialConfig.from_env()
+        self.markets_provider = markets_provider
+        self.post_ask_hook = post_ask_hook or (
+            _post_adversarial_ask_signal_only
+            if self.config.signal_only
+            else _post_adversarial_ask_live
+        )
+        self.now_fn = now_fn or (lambda: int(time.time()))
+
+        # spot_history[symbol] = list[(ts_ms, price)]
+        self.spot_history: dict[str, list[tuple[int, float]]] = {
+            s: [] for s in self.config.symbols
+        }
+
+        # Dedup: no postear más de una ask por (slug, side) por bucket.
+        self._posted: set[tuple[str, str]] = set()
+
+    # ----- Spot tick ingestion -----
+
+    async def on_binance_tick(
+        self, symbol: str, price: float, ts_ms: int,
+    ) -> None:
+        """Acumula history. Se llama desde el callback del Binance WS."""
+        h = self.spot_history.setdefault(symbol, [])
+        h.append((ts_ms, price))
+        if len(h) > self.config.history_cap:
+            del h[: len(h) - self.config.history_cap]
+
+    # ----- Spot lookup -----
+
+    def spot_at(self, symbol: str, target_ts_s: int, tol_s: int = 10) -> Optional[float]:
+        """Devuelve el precio spot más cercano a target_ts_s, o None."""
+        h = self.spot_history.get(symbol) or []
+        target_ms = target_ts_s * 1000
+        # Búsqueda lineal — N≤360, no vale la pena binary search.
+        best_diff = tol_s * 1000 + 1
+        best_p: Optional[float] = None
+        for ts_ms, p in h:
+            d = abs(ts_ms - target_ms)
+            if d < best_diff:
+                best_diff = d
+                best_p = p
+        return best_p
+
+    def spot_now(self, symbol: str) -> Optional[float]:
+        """Último precio observado del símbolo."""
+        h = self.spot_history.get(symbol) or []
+        if not h:
+            return None
+        return h[-1][1]
+
+    # ----- Eval & post -----
+
+    async def evaluate_and_post(self, market: dict) -> Optional[AdversarialDecision]:
+        """Evalúa un market y, si toca, postea la ask.
+
+        Espera market dict con:
+        - ``slug``: str
+        - ``end_ts``: int (epoch)
+        - ``clobTokenIds``: list[str] o JSON string (opcional para signal_only)
+        """
+        slug = market.get("slug") or ""
+        end_ts = int(market.get("end_ts") or 0)
+        if not slug or end_ts <= 0:
+            return None
+
+        parsed = parse_slug(slug)
+        symbol = _match_to_symbol(parsed[0]) if parsed else None
+        bucket_start_ts = end_ts - 300
+
+        spot_start = self.spot_at(symbol or "", bucket_start_ts) if symbol else None
+        spot_cur = self.spot_now(symbol or "") if symbol else None
+
+        decision = evaluate_market(
+            bucket_slug=slug,
+            bucket_end_ts=end_ts,
+            spot_now=spot_cur,
+            spot_at_bucket_start=spot_start,
+            now_ts=self.now_fn(),
+            config=self.config,
+        )
+
+        if not decision.post or not decision.loser_side:
+            log.debug("adversarial.skip slug=%s reason=%s", slug, decision.reason)
+            return decision
+
+        # Dedup: una ask por (slug, side).
+        dedup_key = (slug, decision.loser_side)
+        if dedup_key in self._posted:
+            return decision
+
+        # Resolver token_id del lado loser.
+        token_id = self._resolve_token_id(market, decision.loser_side)
+        if not token_id:
+            log.warning(
+                "adversarial.no_token_id slug=%s side=%s",
+                slug, decision.loser_side,
+            )
+            return decision
+
+        # Postear (o loggear) la ask.
+        try:
+            order_id = await self.post_ask_hook(
+                token_id, "SELL",
+                self.config.ask_price, self.config.size_usdc,
+            )
+        except NotImplementedError:
+            log.warning(
+                "adversarial.live_not_implemented slug=%s — set signal_only=true",
+                slug,
+            )
+            return decision
+        except Exception:
+            log.exception("adversarial.post_ask error slug=%s", slug)
+            return decision
+
+        self._posted.add(dedup_key)
+
+        # Persistir.
+        record_signal(
+            symbol=symbol,
+            bucket_slug=slug,
+            bucket_end_ts=end_ts,
+            loser_side=decision.loser_side,
+            p_up=decision.p_up,
+            ask_price=self.config.ask_price,
+            size_usdc=self.config.size_usdc,
+            status=STATUS_OPEN if order_id else STATUS_DETECTED,
+            order_id=order_id,
+            signal_at=self.now_fn(),
+        )
+
+        log.info(
+            "adversarial.posted slug=%s side=%s p_up=%.3f price=%.4f size=$%.2f order_id=%s",
+            slug, decision.loser_side, decision.p_up,
+            self.config.ask_price, self.config.size_usdc,
+            order_id or "(signal_only)",
+        )
+        return decision
+
+    @staticmethod
+    def _resolve_token_id(market: dict, side: str) -> Optional[str]:
+        """Lee ``clobTokenIds[0]`` (Up) o ``[1]`` (Down) del market dict."""
+        ct_raw = market.get("clobTokenIds")
+        if isinstance(ct_raw, str):
+            try:
+                ct_raw = json.loads(ct_raw)
+            except Exception:
+                return None
+        if not isinstance(ct_raw, list) or len(ct_raw) < 2:
+            return None
+        idx = 0 if side == SIDE_UP else 1
+        try:
+            return str(ct_raw[idx])
+        except Exception:
+            return None
+
+    # ----- Cycle loop -----
+
+    async def run_once(self) -> int:
+        """Una iteración del loop: pulla markets activos y evalúa.
+
+        Devuelve cantidad de decisiones con ``post=True``.
+        """
+        if not self.markets_provider:
+            return 0
+        try:
+            markets = await self.markets_provider()
+        except Exception:
+            log.exception("adversarial.markets_provider error")
+            return 0
+
+        posted = 0
+        for m in markets:
+            d = await self.evaluate_and_post(m)
+            if d and d.post:
+                posted += 1
+        return posted
+
+    async def run_loop(self) -> None:
+        """Loop indefinido. ``check_interval_s`` entre iteraciones."""
+        if not self.config.enabled:
+            log.info("adversarial: disabled (ADVERSARIAL_ENABLED!=true)")
+            return
+        log.warning(
+            "adversarial: arrancando — signal_only=%s min_loser_prob=%.2f "
+            "ask_price=%.3f size=$%.2f window=[%s..%s]s",
+            self.config.signal_only, self.config.min_loser_prob,
+            self.config.ask_price, self.config.size_usdc,
+            self.config.min_secs_to_close, self.config.max_secs_to_close,
+        )
+        init_schema()
+        while True:
+            try:
+                await self.run_once()
+            except Exception:
+                log.exception("adversarial.run_once error")
+            await asyncio.sleep(self.config.check_interval_s)
+
+
+__all__ = [
+    "AdversarialAsks",
+    "AdversarialConfig",
+    "AdversarialDecision",
+    "detect_loser_side",
+    "evaluate_market",
+    "init_schema",
+    "parse_slug",
+    "record_signal",
+    "update_settlement",
+    "SIDE_UP",
+    "SIDE_DOWN",
+    "STATUS_DETECTED",
+    "STATUS_OPEN",
+    "STATUS_FILLED",
+    "STATUS_CANCELLED",
+    "STATUS_SETTLED_WIN",
+    "STATUS_SETTLED_LOSS",
+    "STATUS_EXPIRED_NOFILL",
+]

@@ -323,5 +323,19 @@ SPIKE_ARB_WINDOW_S = int(os.getenv("SPIKE_ARB_WINDOW_S", "30"))
 SPIKE_ARB_TARGET_USDC = float(os.getenv("SPIKE_ARB_TARGET_USDC", "3.0"))
 SPIKE_ARB_LIMIT_TTL_S = int(os.getenv("SPIKE_ARB_LIMIT_TTL_S", "60"))
 
+# ---------- Adversarial dust asks pre-close (Nivel 3, 2026-05-10) ----------
+# Estrategia adversarial: cuando un bucket crypto-updown-5m está por cerrar
+# (10-60s antes) y la prob implied del lado ganador >= ADVERSARIAL_MIN_LOSER_PROB,
+# postear ASK del lado perdedor a precio basura (0.05). Si retail/bot pega a
+# market BUY → fill → recibimos $0.05/share. Settle: lado perdedor vale $0
+# pero ya cobramos. Default: ENABLED=false + SIGNAL_ONLY=true (solo loggea).
+# Implementación live requiere extender clob_client (split_position + GTC)
+# — ver docstring de src/copybot/adversarial_asks.py.
+ADVERSARIAL_ENABLED = os.getenv("ADVERSARIAL_ENABLED", "false").lower() == "true"
+ADVERSARIAL_MAX_SECS_TO_CLOSE = float(os.getenv("ADVERSARIAL_MAX_SECS_TO_CLOSE", "60"))
+ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.85"))
+ADVERSARIAL_ASK_PRICE = float(os.getenv("ADVERSARIAL_ASK_PRICE", "0.05"))
+ADVERSARIAL_SIZE_USDC = float(os.getenv("ADVERSARIAL_SIZE_USDC", "2.0"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)
