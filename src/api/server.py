@@ -102,19 +102,42 @@ def api_wallets_reactivate_recent(
     cambios de threshold que generaron drops por motivo NO relacionado
     al edge real.
     """
+    # Portable: query all dropped + filter en Python (cutoff en TEXT/timestamp
+    # tiene diferente formato entre SQLite y PG, evitamos datetime() function).
+    from datetime import datetime, timedelta, timezone
     from src.db.schema import tx
-    cutoff_clause = f"datetime('now', '-{float(hours)} hours')"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=float(hours))
     with db() as conn:
         rows = conn.execute(
-            f"""
+            """
             SELECT wallet, reason, stopped_at FROM copy_subscriptions
-            WHERE status='dropped' AND stopped_at >= {cutoff_clause}
+            WHERE status='dropped'
               AND reason LIKE '%' || ? || '%'
-            ORDER BY stopped_at DESC
+              AND stopped_at IS NOT NULL
+            ORDER BY stopped_at DESC LIMIT 200
             """,
             (reason_substr,),
         ).fetchall()
-    wallets = [dict(r) for r in rows]
+
+    def _parse_ts(v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+        s = str(v)
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(s.split("+")[0], fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    wallets = []
+    for r in rows:
+        d = dict(r)
+        ts = _parse_ts(d.get("stopped_at"))
+        if ts and ts >= cutoff:
+            wallets.append(d)
     if not wallets:
         return {"reactivated": 0, "wallets": []}
     with tx() as conn:
