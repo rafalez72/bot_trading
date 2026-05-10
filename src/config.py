@@ -89,10 +89,14 @@ MIN_TIME_TO_EXPIRY_SECONDS = min(_min_exp_user, 300)  # cap 5min
 # Market horizon mínimo: bloqueamos mercados cuyo `end_date` (Gamma API) está a
 # menos de N segundos de ahora. Es complementario a MIN_TIME_TO_EXPIRY_SECONDS:
 # ese parsea el slug (epoch al final), éste lee el campo end_date de la tabla
-# markets. Markets <30min son ruido para SL=20% — el mid se mueve por noise y
-# disparamos el stop sin que haya tendencia. Default 30min. Se exenta a
-# `crypto_arb` que está diseñado para markets ultra-cortos (5min).
-MARKET_HORIZON_MIN_SECS = int(os.getenv("MARKET_HORIZON_MIN_SECS", "1800"))
+# markets. Markets cortos son ruido para SL=20% — el mid se mueve por noise y
+# disparamos el stop sin que haya tendencia.
+# 2026-05-10: bajado 1800 → 600 (10 min). El threshold de 30min rechazaba
+# 100% del flow del WS (traders top operan MLB live, LoL Esports, game
+# spreads que cierran <30min). Con 10min, hay tiempo suficiente para que
+# SL=20% se mueva por tendencia antes de settle. Se exenta a `crypto_arb`
+# que está diseñado para markets ultra-cortos (5min).
+MARKET_HORIZON_MIN_SECS = int(os.getenv("MARKET_HORIZON_MIN_SECS", "600"))
 
 # Bloqueo de categorías ultra-cortas (esports live, crypto-updown 5/15min, sport
 # in-play). Default ON: a corto plazo el bot pierde plata copiando wallets que
