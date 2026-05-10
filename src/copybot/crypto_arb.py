@@ -483,11 +483,15 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
     # Targets: trades open de crypto_arb cuyos end_ts pasaron hace >=20s
     # (margen para que la resolución on-chain se setee).
     with db() as conn:
+        # Incluye waiting_settlement: sweep_stops puede marcar buckets cuyo
+        # slug ya expiró pero todavía no aparecen en gamma como closed=1.
+        # Al settler le interesan ambos estados — si gamma confirma resuelto,
+        # los liquida.
         rows = conn.execute(
             """
             SELECT id, condition_id, entry_price, entry_size_usdc, outcome_index, raw
             FROM paper_trades
-            WHERE source_wallet='crypto_arb' AND status='open'
+            WHERE source_wallet='crypto_arb' AND status IN ('open', 'waiting_settlement')
             """,
         ).fetchall()
     candidates = []

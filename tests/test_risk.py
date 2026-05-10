@@ -181,3 +181,193 @@ def test_end_date_to_epoch_handles_iso_and_null():
     assert risk._end_date_to_epoch("not-a-date") is None
     # 2030-01-01T00:00:00Z = 1893456000
     assert risk._end_date_to_epoch("2030-01-01T00:00:00Z") == 1893456000
+
+
+# ---------- Pre-pase: waiting_settlement (anti force_close infinite loop) ----------
+
+def _insert_open_paper_trade(
+    *,
+    condition_id: str,
+    asset: str = "tok-1",
+    entry_price: float = 0.5,
+    entry_size_usdc: float = 5.0,
+    source_wallet: str = "0xabc",
+    outcome_index: int = 0,
+) -> int:
+    """Inserta un paper_trade open para un condition_id dado."""
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO paper_trades
+                (source_wallet, source_trade_id, condition_id, asset, outcome,
+                 outcome_index, side, entry_price, entry_size_usdc, entry_at,
+                 status)
+            VALUES (?, ?, ?, ?, 'YES', ?, 'BUY', ?, ?, ?, 'open')
+            """,
+            (
+                source_wallet, f"trade-{condition_id}", condition_id, asset,
+                outcome_index, entry_price, entry_size_usdc, int(time.time()),
+            ),
+        )
+        return cur.lastrowid
+
+
+def _insert_market_for_risk(
+    *,
+    condition_id: str,
+    slug: str,
+    closed: int = 0,
+    end_date: str | None = None,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO markets (condition_id, slug, question, active, closed, end_date)
+            VALUES (?, ?, '?', 1, ?, ?)
+            ON CONFLICT(condition_id) DO UPDATE SET
+                slug=excluded.slug, closed=excluded.closed, end_date=excluded.end_date
+            """,
+            (condition_id, slug, closed, end_date),
+        )
+
+
+def test_sweep_stops_marks_waiting_settlement_when_market_closed(isolated_db):
+    """market.closed=1 en DB → trade pasa a 'waiting_settlement', NO force_close."""
+    import asyncio
+
+    cid = "0xclosed"
+    _insert_market_for_risk(condition_id=cid, slug="us-election-2026", closed=1)
+    pid = _insert_open_paper_trade(condition_id=cid)
+
+    # Mock _last_price para que NUNCA retorne — si aún así llega ahí significa
+    # que el pre-pase no excluyó el trade. Por seguridad, retornamos None.
+    async def _fake_last_price(client, asset):
+        raise AssertionError(
+            "no debería llegar a _last_price: el market closed=1 debió "
+            "marcarse waiting_settlement antes"
+        )
+
+    import src.copybot.risk as risk_mod
+    orig = risk_mod._last_price
+    risk_mod._last_price = _fake_last_price
+    try:
+        result = asyncio.run(risk.sweep_stops())
+    finally:
+        risk_mod._last_price = orig
+
+    # El status del trade debe ser waiting_settlement
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason FROM paper_trades WHERE id=?", (pid,)
+        ).fetchone()
+    assert row["status"] == "waiting_settlement"
+    assert "market_closed" in (row["exit_reason"] or "")
+    assert result["waiting_settlement"] >= 1
+
+
+def test_sweep_stops_marks_waiting_settlement_when_slug_expired(isolated_db):
+    """slug-epoch en el pasado (btc-updown-5m-<past_ts>) → waiting_settlement."""
+    import asyncio
+
+    past_epoch = int(time.time()) - 600  # 10 min en el pasado
+    slug = f"btc-updown-5m-{past_epoch}"
+    cid = "0xexpired"
+    _insert_market_for_risk(condition_id=cid, slug=slug, closed=0)
+    pid = _insert_open_paper_trade(condition_id=cid, source_wallet="crypto_arb")
+
+    async def _fake_last_price(client, asset):
+        raise AssertionError("no debería llamarse cuando el slug expiró")
+
+    import src.copybot.risk as risk_mod
+    orig = risk_mod._last_price
+    risk_mod._last_price = _fake_last_price
+    try:
+        result = asyncio.run(risk.sweep_stops())
+    finally:
+        risk_mod._last_price = orig
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason FROM paper_trades WHERE id=?", (pid,)
+        ).fetchone()
+    assert row["status"] == "waiting_settlement"
+    assert "slug_expired" in (row["exit_reason"] or "")
+    assert result["waiting_settlement"] >= 1
+
+
+def test_sweep_stops_marks_waiting_settlement_after_3_empty_orderbooks(isolated_db, monkeypatch):
+    """Orderbook vacío 3 veces consecutivas → trade marca waiting_settlement."""
+    import asyncio
+
+    cid = "0xempty"
+    _insert_market_for_risk(condition_id=cid, slug="active-news-2026", closed=0)
+    pid = _insert_open_paper_trade(condition_id=cid)
+
+    # Reset del contador en caso de que otro test lo haya tocado
+    monkeypatch.setattr(risk, "_empty_orderbook_count", {})
+
+    async def _empty_price(client, asset):
+        return None
+
+    import src.copybot.risk as risk_mod
+    orig = risk_mod._last_price
+    risk_mod._last_price = _empty_price
+    try:
+        # 1er sweep: counter=1, status sigue open
+        asyncio.run(risk.sweep_stops())
+        with db() as conn:
+            assert conn.execute(
+                "SELECT status FROM paper_trades WHERE id=?", (pid,)
+            ).fetchone()["status"] == "open"
+        # 2do sweep: counter=2
+        asyncio.run(risk.sweep_stops())
+        with db() as conn:
+            assert conn.execute(
+                "SELECT status FROM paper_trades WHERE id=?", (pid,)
+            ).fetchone()["status"] == "open"
+        # 3er sweep: counter=3 → mark waiting_settlement
+        asyncio.run(risk.sweep_stops())
+    finally:
+        risk_mod._last_price = orig
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason FROM paper_trades WHERE id=?", (pid,)
+        ).fetchone()
+    assert row["status"] == "waiting_settlement"
+    assert "empty_orderbook" in (row["exit_reason"] or "")
+
+
+def test_sweep_stops_resets_empty_counter_when_price_returns(isolated_db, monkeypatch):
+    """Si después de 2 empties el orderbook vuelve a tener precio, counter resetea."""
+    import asyncio
+
+    cid = "0xreset"
+    _insert_market_for_risk(condition_id=cid, slug="active-news-2026", closed=0)
+    pid = _insert_open_paper_trade(condition_id=cid, entry_price=0.5)
+
+    monkeypatch.setattr(risk, "_empty_orderbook_count", {})
+
+    states = ["empty", "empty", "alive", "empty"]
+
+    async def _alternating(client, asset):
+        s = states.pop(0)
+        return None if s == "empty" else 0.55  # alive: 10% rise, no SL trigger
+
+    import src.copybot.risk as risk_mod
+    orig = risk_mod._last_price
+    risk_mod._last_price = _alternating
+    try:
+        for _ in range(4):
+            asyncio.run(risk.sweep_stops())
+    finally:
+        risk_mod._last_price = orig
+
+    # Counter debe estar en 1 (último empty), no en 3 → status sigue open.
+    with db() as conn:
+        status = conn.execute(
+            "SELECT status FROM paper_trades WHERE id=?", (pid,)
+        ).fetchone()["status"]
+    assert status == "open", (
+        f"expected 'open' (counter resetea con price alive), got {status!r}"
+    )

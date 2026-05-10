@@ -662,6 +662,10 @@ def settle_resolved() -> int:
     """
     settled = 0
     with db() as conn:
+        # Incluye waiting_settlement además de open: trades que sweep_stops
+        # marcó como esperando settlement (market closed/slug expirado/
+        # orderbook stale) deben ser settleados normalmente cuando aparezca
+        # outcome_prices en la tabla markets.
         rows = conn.execute(
             """
             SELECT lt.id, lt.entry_price, lt.entry_shares, lt.outcome_index,
@@ -669,7 +673,7 @@ def settle_resolved() -> int:
                    m.outcome_prices, m.slug
             FROM live_trades lt
             JOIN markets m ON m.condition_id = lt.condition_id
-            WHERE lt.status='open' AND m.closed=1
+            WHERE lt.status IN ('open', 'waiting_settlement') AND m.closed=1
             """,
         ).fetchall()
 
@@ -764,12 +768,16 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
 
     cutoff_ts = int(time.time()) - max(min_age_seconds, 0)
     with db() as conn:
+        # Incluye waiting_settlement además de open: trades parqueados por
+        # sweep_stops también pueden quedar phantom on-chain (settled/redeemed
+        # mientras el bot estaba apagado, etc.) y deben ser limpiados.
         rows = conn.execute(
             """
             SELECT id, source_wallet, condition_id, token_id, asset, entry_at,
                    entry_price, entry_size_usdc
             FROM live_trades
-            WHERE status='open' AND dry_run=0 AND entry_at <= ?
+            WHERE status IN ('open', 'waiting_settlement')
+              AND dry_run=0 AND entry_at <= ?
             """,
             (cutoff_ts,),
         ).fetchall()
@@ -849,7 +857,7 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
                 exit_shares=entry_shares,
                 pnl_usdc=0,
                 exit_reason='phantom_cleanup'
-            WHERE id IN ({placeholders}) AND status='open'
+            WHERE id IN ({placeholders}) AND status IN ('open', 'waiting_settlement')
             """,
             [now_ts] + phantom_ids,
         )

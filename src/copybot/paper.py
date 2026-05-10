@@ -371,16 +371,19 @@ def force_close(paper_trade_id: int, exit_price: float, *, reason: str) -> None:
 
 
 def settle_resolved() -> int:
-    """Liquida paper_trades open cuyo mercado ya resolvió."""
+    """Liquida paper_trades open o waiting_settlement cuyo mercado ya resolvió."""
     settled = 0
     with db() as conn:
+        # Incluye waiting_settlement además de open: trades que sweep_stops
+        # marcó parados (market closed/slug expirado/orderbook stale) deben
+        # settlearse normalmente cuando outcome_prices esté en markets.
         rows = conn.execute(
             """
             SELECT pt.id, pt.entry_price, pt.entry_size_usdc, pt.outcome_index,
                    m.outcome_prices
             FROM paper_trades pt
             JOIN markets m ON m.condition_id = pt.condition_id
-            WHERE pt.status='open' AND m.closed=1
+            WHERE pt.status IN ('open', 'waiting_settlement') AND m.closed=1
             """,
         ).fetchall()
 

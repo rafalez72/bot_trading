@@ -30,6 +30,7 @@ from src.config import (
     TRAIL_ACTIVATION_PCT,
     TRAIL_DROP_PCT,
 )
+from src.copybot._slug_expiry import parse_slug_expiry
 from src.copybot.tradebook import TABLE as TRADES_TABLE, force_close
 from src.db.schema import db, tx
 
@@ -354,23 +355,64 @@ async def _last_price(client: httpx.AsyncClient, asset: str) -> float | None:
     return None
 
 
+# Counter: trades cuyo orderbook devolvió vacío/404 en sweeps consecutivos.
+# Después de EMPTY_ORDERBOOK_THRESHOLD intentos seguidos, los marcamos
+# `waiting_settlement` para frenar el loop infinito de force_close. Resetea
+# si el orderbook vuelve a tener precios.
+EMPTY_ORDERBOOK_THRESHOLD = 3
+_empty_orderbook_count: dict[int, int] = {}  # trade_id → consecutive empty sweeps
+
+
+def _mark_waiting_settlement(trade_id: int, reason: str) -> None:
+    """Marca un trade como `waiting_settlement` para excluirlo de sweep_stops.
+
+    El estado significa: "no podemos cerrar manualmente (market closed/expirado/
+    sin liquidez); esperamos al settler on-chain o al reconciler". Persiste
+    `exit_reason` con el motivo del marcado para auditoría posterior.
+
+    settle_resolved() y cleanup_phantom_positions() en executor.py incluyen
+    también `waiting_settlement` en su WHERE para que estos trades sigan
+    siendo settleados/limpiados normalmente cuando el market resuelva o el
+    reconciler detecte que ya no existe on-chain.
+    """
+    try:
+        with tx() as conn:
+            conn.execute(
+                f"""
+                UPDATE {TRADES_TABLE}
+                SET status='waiting_settlement', exit_reason=?
+                WHERE id=? AND status='open'
+                """,
+                (reason, trade_id),
+            )
+        log.info(
+            "%s #%d → waiting_settlement (%s)",
+            TRADES_TABLE, trade_id, reason,
+        )
+    except Exception as e:
+        log.warning("_mark_waiting_settlement falló id=%s: %s", trade_id, e)
+
+
 async def sweep_stops() -> dict:
     """Recorre todas las posiciones open (paper o live) y cierra las que disparen stop/tp.
 
     Order de evaluación:
+      0. Skip + mark waiting_settlement si el market ya cerró o el slug-epoch
+         expiró → no tiene sentido force_close (orderbook vacío garantizado).
       1. Update peak_price si cur > peak actual.
       2. Trailing stop (si peak_gain >= TRAIL_ACTIVATION_PCT y cur cae
          TRAIL_DROP_PCT desde el peak) — toma prioridad sobre SL/TP.
       3. Stop-loss tradicional.
       4. Take-profit tradicional.
     """
-    # JOIN markets para extraer end_date y poder elegir el threshold de SL
-    # adaptado al horizonte (ver `_horizon_bucket`). LEFT JOIN: si el market
-    # no está en la tabla local (raza con indexer, market manual, etc.), la
-    # columna queda NULL y caemos al fallback STOP_LOSS_PCT.
+    # JOIN markets para extraer end_date/slug/closed y poder elegir el
+    # threshold de SL adaptado al horizonte y detectar markets ya resueltos.
+    # LEFT JOIN: si el market no está en la tabla local (raza con indexer),
+    # las columnas quedan NULL y caemos al fallback STOP_LOSS_PCT.
     sql = f"""
         SELECT t.id, t.asset, t.entry_price, t.entry_size_usdc,
-               t.source_wallet, t.peak_price, m.end_date
+               t.source_wallet, t.peak_price, t.condition_id,
+               m.end_date, m.slug, m.closed
         FROM {TRADES_TABLE} t
         LEFT JOIN markets m ON m.condition_id = t.condition_id
         WHERE t.status='open' AND t.asset IS NOT NULL
@@ -379,7 +421,39 @@ async def sweep_stops() -> dict:
         rows = conn.execute(sql).fetchall()
 
     if not rows:
-        return {"checked": 0, "stop_loss": 0, "take_profit": 0, "trailing": 0}
+        return {"checked": 0, "stop_loss": 0, "take_profit": 0, "trailing": 0,
+                "waiting_settlement": 0}
+
+    now_ts = int(time.time())
+
+    # 0) Pre-pase: detectar trades cuyos markets ya cerraron o cuyo slug-epoch
+    # expiró → marcar waiting_settlement y excluir del resto del sweep.
+    # Critical pre-2026-05-10: sin esto, sweep_stops llamaba force_close
+    # cada 15s para markets crypto-updown-5m ya expirados → orderbook 404 →
+    # SELL nunca matcheaba → loop infinito hasta settle_resolved (que solo
+    # corre cada 4h en el polling de markets).
+    skip_ids: set[int] = set()
+    waiting_count = 0
+    for r in rows:
+        # market.closed=1 en DB local
+        if r["closed"]:
+            _mark_waiting_settlement(r["id"], "market_closed")
+            skip_ids.add(r["id"])
+            waiting_count += 1
+            continue
+        # slug-epoch expirado (ej. btc-updown-5m-1715000000)
+        slug = r["slug"]
+        expiry_ts = parse_slug_expiry(slug)
+        if expiry_ts is not None and expiry_ts < now_ts:
+            _mark_waiting_settlement(r["id"], f"slug_expired_{now_ts - expiry_ts}s")
+            skip_ids.add(r["id"])
+            waiting_count += 1
+            continue
+
+    rows = [r for r in rows if r["id"] not in skip_ids]
+    if not rows:
+        return {"checked": 0, "stop_loss": 0, "take_profit": 0, "trailing": 0,
+                "waiting_settlement": waiting_count}
 
     # Agrupar por asset para evitar requests duplicados
     by_asset: dict[str, list] = defaultdict(list)
@@ -393,7 +467,24 @@ async def sweep_stops() -> dict:
         for asset, positions in by_asset.items():
             cur = await _last_price(client, asset)
             if cur is None:
+                # 3) Orderbook vacío/404 N veces consecutivas → marcar
+                # waiting_settlement y dejar de intentar. Cualquier sweep
+                # anterior con price ≠ None ya habría reseteado el contador.
+                for p in positions:
+                    n = _empty_orderbook_count.get(p["id"], 0) + 1
+                    _empty_orderbook_count[p["id"]] = n
+                    if n >= EMPTY_ORDERBOOK_THRESHOLD:
+                        _mark_waiting_settlement(
+                            p["id"],
+                            f"empty_orderbook_x{n}",
+                        )
+                        waiting_count += 1
+                        # cleanup del contador post-mark para no crecer la dict
+                        _empty_orderbook_count.pop(p["id"], None)
                 continue
+            # Reset del contador cuando el orderbook responde con precio.
+            for p in positions:
+                _empty_orderbook_count.pop(p["id"], None)
             for p in positions:
                 entry = p["entry_price"] or 0
                 if entry <= 0:
@@ -493,6 +584,7 @@ async def sweep_stops() -> dict:
         "stop_loss": sl_count,
         "take_profit": tp_count,
         "trailing": trail_count,
+        "waiting_settlement": waiting_count,
     }
 
 
