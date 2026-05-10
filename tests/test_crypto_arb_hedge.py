@@ -21,7 +21,9 @@ import pytest
 from src.copybot.crypto_arb_hedge import (
     CryptoArbHedge,
     HedgeConfig,
+    _hedge_evaluate_setup,
     init_table,
+    recover_orphan_perps,
 )
 
 
@@ -398,3 +400,246 @@ async def test_margin_gate_blocks_open(isolated_db):
     assert len(poly.calls) == 0
     assert len(perp.calls) == 0
     assert orch.metrics.skipped_margin == 1
+
+
+# ---------- Test 8 (bug #7): detector encuentra edge y llama _open_atomic ----------
+
+class _FakeWS:
+    """Mock minimal de BinanceTickerWS — solo expone get_price."""
+
+    def __init__(self, prices: dict[str, tuple[float, int]]):
+        self._prices = prices
+
+    def get_price(self, symbol: str):
+        return self._prices.get(symbol)
+
+
+@pytest.mark.asyncio
+async def test_hedge_detector_finds_edge(isolated_db, monkeypatch):
+    """Feed mock Binance spot + market list → verifica que evaluate_and_open
+    se llama con decision correcta (detector wired).
+    """
+    _ensure_schema(isolated_db)
+    import time as _t
+    now = int(_t.time())
+    # Bucket cierra en 120s (dentro de pre_close_window=180s).
+    end_ts = now + 120
+    bucket_start = end_ts - 300
+
+    cfg = HedgeConfig(enabled=True, min_edge=0.05, bet_usdc=10.0, leverage=2)
+
+    market = {
+        "_end_ts": end_ts,
+        "_slug_prefix": "btc-updown-5m-",
+        "slug": f"btc-updown-5m-{end_ts}",
+        "conditionId": "0xCID_BTC",
+        # mid_up=0.40 — spot subió +1% → edge >> 0.05
+        "outcomePrices": '["0.40", "0.60"]',
+    }
+
+    # Spot ahora = 101, hace 5min (bucket_start) era 100 → move = +1%.
+    # History tiene el sample bucket_start con timestamp en ms.
+    ws = _FakeWS({"BTCUSDT": (101.0, now * 1000)})
+    spot_history = {"BTCUSDT": [(bucket_start * 1000, 100.0)]}
+
+    setup = _hedge_evaluate_setup(market, cfg, spot_history, ws)
+    assert setup is not None, "detector debe encontrar setup con edge"
+    assert setup["symbol"] == "BTCUSDT"
+    assert setup["outcome"] == "Up"   # +1% move → buy UP
+    assert setup["outcome_index"] == 0
+    assert setup["spot_now"] == pytest.approx(101.0)
+    assert setup["spot_move_pct"] == pytest.approx(1.0, abs=1e-6)
+    assert setup["mid_up"] == pytest.approx(0.40)
+    assert setup["mid_for_side"] == pytest.approx(0.40)
+    assert setup["bucket_slug"] == f"btc-updown-5m-{end_ts}"
+
+    # E2E: pasamos el setup a evaluate_and_open con mocks y verificamos que
+    # las dos piernas se llaman atómicamente.
+    poly = _make_poly_opener(pid=77)
+    perp = _make_perp_executor(ok=True, avg_price=101.0, qty=0.099)
+    rb = _make_rollback_tracker()
+    orch = CryptoArbHedge(
+        config=cfg, poly_opener=poly, perp_executor=perp, poly_rollback=rb,
+    )
+    record, err = await orch.evaluate_and_open(**setup)
+    assert err is None, f"Esperaba éxito, got err={err}"
+    assert record is not None and record["poly_trade_id"] == 77
+    assert len(perp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_detector_skips_below_min_edge(isolated_db):
+    """Spot apenas se movió → edge < min_edge → detector devuelve None."""
+    _ensure_schema(isolated_db)
+    import time as _t
+    now = int(_t.time())
+    end_ts = now + 120
+    bucket_start = end_ts - 300
+
+    cfg = HedgeConfig(enabled=True, min_edge=0.20, bet_usdc=10.0)
+    market = {
+        "_end_ts": end_ts,
+        "_slug_prefix": "btc-updown-5m-",
+        "slug": f"btc-updown-5m-{end_ts}",
+        "conditionId": "0xCID_BTC",
+        "outcomePrices": '["0.50", "0.50"]',  # mid neutral
+    }
+    # Movimiento mínimo (+0.02%) → p_up ~ 0.5 → edge ~ 0
+    ws = _FakeWS({"BTCUSDT": (100.02, now * 1000)})
+    spot_history = {"BTCUSDT": [(bucket_start * 1000, 100.0)]}
+
+    setup = _hedge_evaluate_setup(market, cfg, spot_history, ws)
+    assert setup is None
+
+
+# ---------- Test 9 (bug #8): recovery cierra orphan perps ----------
+
+class _FakePerpClient:
+    """Mock BinancePerpClient como async context manager."""
+
+    def __init__(self, qty: float):
+        self.qty = qty
+        self.close_calls: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get_position(self, symbol: str, *, position_side: str = "SHORT"):
+        return {
+            "qty": self.qty, "entry_price": 100.0, "unrealized_pnl": 0.0,
+            "position_side": position_side, "raw": None,
+        }
+
+    async def close_position(self, *, symbol: str, position_side: str, quantity: float):
+        self.close_calls.append({
+            "symbol": symbol, "position_side": position_side, "quantity": quantity,
+        })
+        return {"status": "FILLED", "executedQty": str(quantity)}
+
+
+@pytest.mark.asyncio
+async def test_recover_orphan_perps(isolated_db):
+    """DB con leg_failed + perp open mock → verificar close llamado + status updated."""
+    _ensure_schema(isolated_db)
+    # Sembramos un row leg_failed con perp_order_id seteado.
+    from src.db.schema import tx, db
+    import time as _t
+    now = int(_t.time())
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO hedge_trades
+                (bucket_slug, symbol, side, poly_trade_id, poly_trade_table,
+                 perp_order_id, perp_qty, perp_entry_price, spot_at_entry,
+                 edge_at_open, status, opened_at, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "btc-updown-5m-1700000000", "BTCUSDT", "Up", 555, "paper_trades",
+                "PERP-ORPHAN-1", 0.1, 100.0, 100.0, 0.10,
+                "leg_failed", now - 30, "{}",
+            ),
+        )
+
+    fake_client = _FakePerpClient(qty=-0.1)  # short position abierta
+    notif_calls: list[str] = []
+
+    def _notif(msg: str):
+        notif_calls.append(msg)
+
+    n = await recover_orphan_perps(
+        perp_client_factory=lambda: fake_client,
+        notifier=_notif,
+    )
+    assert n == 1
+    # Se llamó close_position con qty=0.1.
+    assert len(fake_client.close_calls) == 1
+    assert fake_client.close_calls[0]["symbol"] == "BTCUSDT"
+    assert fake_client.close_calls[0]["position_side"] == "SHORT"
+    assert fake_client.close_calls[0]["quantity"] == pytest.approx(0.1)
+    # Status updated.
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status, closed_at FROM hedge_trades WHERE perp_order_id=?",
+            ("PERP-ORPHAN-1",),
+        ).fetchone()
+    assert row["status"] == "recovered"
+    assert row["closed_at"] is not None
+    # Notif Telegram disparada.
+    assert len(notif_calls) == 1
+    assert "HEDGE RECOVERY" in notif_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_recover_orphan_perps_no_position_on_chain(isolated_db):
+    """Si get_position devuelve qty=0 (ya cerrada manual), no llama close,
+    pero igual marca status='recovered' para no reintentarlo cada startup.
+    """
+    _ensure_schema(isolated_db)
+    from src.db.schema import tx, db
+    import time as _t
+    now = int(_t.time())
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO hedge_trades
+                (bucket_slug, symbol, side, poly_trade_id, poly_trade_table,
+                 perp_order_id, perp_qty, perp_entry_price, spot_at_entry,
+                 edge_at_open, status, opened_at, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "eth-updown-5m-1700000001", "ETHUSDT", "Up", 666, "paper_trades",
+                "PERP-ORPHAN-2", 0.5, 3000.0, 3000.0, 0.08,
+                "leg_failed", now - 60, "{}",
+            ),
+        )
+
+    fake_client = _FakePerpClient(qty=0.0)  # ya no hay position en Binance
+    n = await recover_orphan_perps(
+        perp_client_factory=lambda: fake_client,
+        notifier=lambda _: None,
+    )
+    assert n == 1
+    # close_position NO se llama (no hay position abierta).
+    assert len(fake_client.close_calls) == 0
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status FROM hedge_trades WHERE perp_order_id=?",
+            ("PERP-ORPHAN-2",),
+        ).fetchone()
+    assert row["status"] == "recovered"
+
+
+# ---------- Test 10 (bug #9): persist setea poly_trade_table ----------
+
+@pytest.mark.asyncio
+async def test_persist_includes_poly_trade_table(isolated_db):
+    """Verificar que el discriminador poly_trade_table se setea en hedge_trades
+    según el modo (paper_trades vs live_trades) actual de tradebook.
+    """
+    _ensure_schema(isolated_db)
+    cfg = HedgeConfig(enabled=True, min_edge=0.05, bet_usdc=10.0, leverage=2)
+
+    poly = _make_poly_opener(pid=123)
+    perp = _make_perp_executor(ok=True, avg_price=100.0, qty=0.1)
+    orch = CryptoArbHedge(config=cfg, poly_opener=poly, perp_executor=perp)
+
+    record, err = await orch.evaluate_and_open(**_make_decision(spot_now=100.0))
+    assert err is None
+    # El record en memoria también lo tiene.
+    assert record.get("poly_trade_table") in ("paper_trades", "live_trades")
+
+    # Y el row persistido en DB.
+    from src.db.schema import db
+    from src.copybot.tradebook import TABLE as TB_TABLE
+    with db() as conn:
+        row = conn.execute(
+            "SELECT poly_trade_id, poly_trade_table FROM hedge_trades WHERE id=?",
+            (record["id"],),
+        ).fetchone()
+    assert row["poly_trade_id"] == 123
+    assert row["poly_trade_table"] == TB_TABLE  # consistente con runtime mode
