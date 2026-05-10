@@ -568,41 +568,134 @@ async def _paper_order_executor(signal: dict) -> dict:
 
 
 async def _live_order_executor(signal: dict) -> dict:
-    """Executor "live": postea LIMIT GTC al CLOB y polea hasta TTL.
+    """Executor "live": resuelve token_id + postea LIMIT GTC al CLOB.
 
-    Importa ``py_clob_client_v2`` solo cuando se llama (lazy) — lo mismo
-    que hace ``executor.py``. Si el SDK no está disponible o falla la firma,
-    devuelve ok=False y se persiste como ``failed``.
+    Wiring real (Nivel B):
+      1) Toma ``bucket_slug`` (o ``symbol`` como fallback) + ``side`` (UP/DOWN)
+         y resuelve ``token_id`` vía ``token_resolver`` (módulo paralelo).
+      2) Postea LIMIT BUY GTC al ``limit_price`` con ``size_usdc / limit_price``
+         shares y ``ttl_s`` (default 60s, viene del config SPIKE_ARB_LIMIT_TTL_S).
+      3) Devuelve dict con ``ok``, ``order_id``, ``fill_price`` (placeholder al
+         limit_price hasta tener fill real desde WS user-channel) y ``token_id``.
 
-    Nota: este path NO se ejercita en los tests unitarios (necesita CLOB
-    real); su responsabilidad real está cubierta por mocks en
-    ``tests/test_spike_arb.py`` vía un executor inyectable.
+    Errores capturados → ok=False con ``error`` descriptivo. NO raise — el
+    caller (``_dispatch_order``) ya hace try/except, pero queremos errores
+    diferenciados (clob_import / token_id_not_found / executor_failed).
     """
+    side_label = (signal.get("side") or "").upper()
+    if side_label not in ("UP", "DOWN"):
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None,
+            "error": f"side invalido: {side_label!r}", "raw": None,
+        }
+    outcome_index = 0 if side_label == "UP" else 1
+    # Bucket slug es el handle del market en Gamma; fallback a symbol si no
+    # vino explícito en la signal (compat detector actual).
+    bucket_slug = signal.get("bucket_slug") or signal.get("symbol")
+    if not bucket_slug:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None,
+            "error": "bucket_slug ausente en signal", "raw": None,
+        }
+
+    # token_resolver vive en otro módulo (creado por agent paralelo).
+    # Si todavía no aterrizó → fallamos limpio sin tirar import error.
     try:
-        from src.polymarket.clob_client import (
-            compute_limit_price as _clp,  # noqa: F401  — importable para tests
-            get_client,
+        from src.polymarket.token_resolver import (
+            resolve_token_id_by_condition_id as _resolve,
         )
+    except Exception:
+        try:
+            # Compat: alias sin el sufijo (puede que el otro agent eligiera
+            # un nombre más corto).
+            from src.polymarket.token_resolver import (  # type: ignore
+                resolve_token_id as _resolve,
+            )
+        except Exception as e:
+            return {
+                "ok": False, "order_id": None, "filled": False,
+                "fill_price": None,
+                "error": f"token_resolver import: {e}", "raw": None,
+            }
+
+    try:
+        from src.polymarket.client import PolymarketClient
     except Exception as e:
         return {"ok": False, "order_id": None, "filled": False,
-                "fill_price": None, "error": f"clob import: {e}", "raw": None}
+                "fill_price": None, "error": f"client import: {e}",
+                "raw": None}
 
-    client = get_client()
-    if client is None:
+    try:
+        async with PolymarketClient() as c:
+            token_id = await _resolve(c, bucket_slug, outcome_index)
+    except Exception as e:
+        log.exception(
+            "spike_arb.token_resolver raised slug=%s side=%s",
+            bucket_slug, side_label,
+        )
         return {"ok": False, "order_id": None, "filled": False,
-                "fill_price": None, "error": "CLOB not configured", "raw": None}
+                "fill_price": None,
+                "error": f"resolve_token_id: {e}", "raw": None}
 
-    # Resolución de token_id queda fuera del scope de este módulo: el
-    # mid_resolver del live debe entregar mid junto a token_id, o la
-    # integración real necesita una segunda llamada. Para no acoplar a
-    # market discovery aquí, devolvemos failed con motivo claro.
+    if not token_id:
+        return {"ok": False, "order_id": None, "filled": False,
+                "fill_price": None,
+                "error": "token_id_not_found", "raw": None}
+
+    try:
+        from src.polymarket.clob_client import place_limit_order_gtc
+    except Exception as e:
+        return {"ok": False, "order_id": None, "filled": False,
+                "fill_price": None, "error": f"clob import: {e}",
+                "raw": None}
+
+    limit_price = float(signal["limit_price"])
+    size_usdc = float(signal["size_usdc"])
+    ttl_s = int(signal.get("ttl_s", DEFAULT_LIMIT_TTL_S))
+    # CLOB usa shares (no USDC notional). shares = USDC / price.
+    if limit_price <= 0:
+        return {"ok": False, "order_id": None, "filled": False,
+                "fill_price": None,
+                "error": f"limit_price invalido: {limit_price}", "raw": None}
+    size_shares = size_usdc / limit_price
+
+    try:
+        result = place_limit_order_gtc(
+            token_id=token_id,
+            side="BUY",  # spike_arb siempre BUY al lado direccional
+            price=limit_price,
+            size=size_shares,
+            ttl_s=ttl_s,
+        )
+    except Exception as e:
+        log.exception("spike_arb.place_limit_order raised tk=%s",
+                      str(token_id)[:12])
+        return {"ok": False, "order_id": None, "filled": False,
+                "fill_price": None, "error": f"place_limit: {e}",
+                "raw": None}
+
+    if not getattr(result, "ok", False):
+        return {
+            "ok": False, "order_id": getattr(result, "order_id", None),
+            "filled": False, "fill_price": None,
+            "error": getattr(result, "error", None) or "executor returned not-ok",
+            "raw": getattr(result, "raw", None),
+        }
+
+    # Fill_price es PLACEHOLDER: en GTC posteamos y devolvemos sin esperar
+    # match. El fill real llega vía user-channel WS (no en este path). El
+    # _dispatch_order persiste como filled=False → status='cancelled' al TTL,
+    # que es la semántica correcta hasta que ate WS user-channel.
     return {
-        "ok": False,
-        "order_id": None,
+        "ok": True,
+        "order_id": getattr(result, "order_id", None),
         "filled": False,
-        "fill_price": None,
-        "error": "live executor pending market resolution wiring",
-        "raw": None,
+        "fill_price": limit_price,  # placeholder hasta fill real
+        "error": None,
+        "raw": getattr(result, "raw", None),
+        "token_id": token_id,
     }
 
 
@@ -634,19 +727,25 @@ async def spike_arb_loop() -> None:
         "live" if LIVE_MODE else "paper",
     )
 
-    # Fix bug #6: warning loud si LIVE_MODE — el executor live es STUB y
-    # todos los signals devuelven failed/cancelled. Sin warning el user
-    # piensa que opera real pero "no detecta nada".
+    # Fix bug #6 (transición): en LIVE_MODE ya wireamos clob_client real
+    # (place_limit_order_gtc + token_resolver). Sin embargo, el fill_price
+    # devuelto es PLACEHOLDER (=limit_price): el path real de fill llega vía
+    # WS user-channel (no atado todavía aquí). Mientras eso falte, el
+    # _dispatch_order persiste filled=False → status='cancelled' al TTL.
+    # Mantenemos el warning con tag "STUB" porque la parte de fill-tracking
+    # sigue siendo placeholder — el user debe estar al tanto.
     if LIVE_MODE:
         log.warning(
-            "spike_arb: LIVE_MODE detectado pero executor live es STUB. "
-            "Trades NO se mandan al CLOB. Ver docs/PRE_LIVE_AUDIT.md bug #6."
+            "spike_arb: LIVE_MODE detectado — orders posteadas al CLOB "
+            "(token_resolver + place_limit_gtc), pero fill-tracking todavía "
+            "STUB (placeholder fill_price). Ver docs/PRE_LIVE_AUDIT.md bug #6."
         )
         try:
             from src.copybot.notifier import send as _notif_send
             _notif_send(
-                "⚠️ *spike_arb* arranca en LIVE_MODE pero executor es STUB — "
-                "no opera real (bug #6 docs/PRE_LIVE_AUDIT.md)"
+                "*spike_arb* LIVE_MODE: wiring CLOB real, pero fill-tracking "
+                "todavía STUB (fill_price placeholder hasta WS user-channel). "
+                "bug #6 docs/PRE_LIVE_AUDIT.md"
             )
         except Exception:
             pass
