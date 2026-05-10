@@ -564,19 +564,125 @@ async def _paper_order_executor(signal: dict) -> dict:
 
 
 async def _live_order_executor(signal: dict) -> dict:
-    """Executor "live": stub — la integración real con CLOB requiere
-    resolver token_id desde el market. El mid_resolver del live debe
-    entregar token_id junto al mid, o el caller del run_loop debe
-    pasarlo al signal. Para evitar acoplamiento aquí, devolvemos
-    failed con motivo claro (mismo patrón que spike_arb).
+    """Executor "live": resuelve token_id + postea LIMIT BUY GTC al CLOB.
+
+    Long-horizon: TTL 1h. Markets duran días/semanas → el mid no se mueve
+    rápido y queremos que la orden viva un rato resting en el book.
+
+    Signal dict (mismo shape que el paper executor)::
+
+        {
+          "slug" | "market_slug":  str,
+          "side":         "Up" | "Down",
+          "outcome_index": 0 | 1,
+          "underlying":   str,
+          "entry_mid" | "limit_price": float,
+          "size_usdc" | "bet_usdc":    float,
+          "ttl_s":        int (default 3600),
+          "end_date_market": int (epoch, opcional — solo logging),
+        }
+
+    Devuelve::
+
+        {"ok": bool, "filled": bool, "order_id": str | None,
+         "fill_price": float | None, "token_id": str | None,
+         "error": str | None, "raw": dict | None}
     """
+    # Compatibilidad con dos shapes de signal (decision dict + run_loop signal).
+    slug = signal.get("market_slug") or signal.get("slug") or ""
+    side_label = signal.get("side") or ""
+    outcome_index = signal.get("outcome_index")
+    if outcome_index is None:
+        outcome_index = 0 if side_label == "Up" else 1
+    entry_mid = float(
+        signal.get("entry_mid")
+        if signal.get("entry_mid") is not None
+        else signal.get("limit_price") or 0.0
+    )
+    bet_usdc = float(
+        signal.get("bet_usdc")
+        if signal.get("bet_usdc") is not None
+        else signal.get("size_usdc") or 0.0
+    )
+    ttl_s = int(signal.get("ttl_s") or 3600)
+
+    if not slug or entry_mid <= 0 or bet_usdc <= 0:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": "invalid_signal", "raw": None,
+        }
+
+    # Imports lazy (mismo patrón spike_arb / adversarial).
+    try:
+        from src.polymarket.clob_client import place_limit_order_gtc
+    except Exception as e:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": f"clob_import: {e}", "raw": None,
+        }
+    try:
+        from src.polymarket.client import PolymarketClient
+        from src.polymarket.token_resolver import resolve_token_id
+    except Exception as e:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": f"resolver_import: {e}", "raw": None,
+        }
+
+    # Resolver token_id del side a comprar.
+    try:
+        async with PolymarketClient() as c:
+            token_id = await resolve_token_id(c, slug, int(outcome_index))
+    except Exception as e:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": f"resolve_token: {e}", "raw": None,
+        }
+    if not token_id:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": "token_id_not_found", "raw": None,
+        }
+
+    # Postear LIMIT BUY GTC al entry_mid.
+    try:
+        result = place_limit_order_gtc(
+            token_id=token_id,
+            side="BUY",
+            price=entry_mid,
+            size=bet_usdc / entry_mid if entry_mid > 0 else 0.0,
+            ttl_s=ttl_s,
+        )
+    except Exception as e:
+        return {
+            "ok": False, "order_id": None, "filled": False,
+            "fill_price": None, "error": f"limit_post_exception: {e}",
+            "token_id": token_id, "raw": None,
+        }
+
+    if not getattr(result, "ok", False):
+        return {
+            "ok": False, "order_id": getattr(result, "order_id", None),
+            "filled": False, "fill_price": None,
+            "error": getattr(result, "error", None) or "limit_post_failed",
+            "token_id": token_id,
+            "raw": getattr(result, "raw", None),
+        }
+
+    # GTC posteada: el server no garantiza fill inmediato. Reportamos
+    # filled=True solo si el response indica matched/filled (filled_size>0).
+    filled_size = float(getattr(result, "filled_size", 0) or 0)
+    filled = filled_size > 0
+    fill_price = float(getattr(result, "avg_price", entry_mid) or entry_mid)
+
     return {
-        "ok": False,
-        "order_id": None,
-        "filled": False,
-        "fill_price": None,
-        "error": "live executor pending market token_id wiring",
-        "raw": None,
+        "ok": True,
+        "order_id": getattr(result, "order_id", None),
+        "filled": filled,
+        "fill_price": fill_price if filled else None,
+        "token_id": token_id,
+        "error": None,
+        "raw": getattr(result, "raw", None),
     }
 
 
