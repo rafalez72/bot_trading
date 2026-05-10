@@ -148,27 +148,33 @@ def _classify_market(pt) -> str:
     return " · ".join(parts)
 
 
-def gain(amount: float, accumulated: float, pt=None) -> bool:
-    """Notif por cada trade cerrado con ganancia. Retorna True si se envió."""
+def gain(amount: float, accumulated: float, pt=None, bucket_label: str | None = None) -> bool:
+    """Notif por cada trade cerrado con ganancia. Retorna True si se envió.
+
+    `accumulated` y `bucket_label` permiten mostrar PnL separado por bucket
+    (Crypto / Sports). Si no se pasa bucket_label, se muestra como "Acumulado".
+    """
     if "gain" not in ENABLED_NOTIFICATIONS:
         return False
     detail = f"\n{_classify_market(pt)}" if pt is not None else ""
+    label = f"Acumulado {bucket_label}" if bucket_label else "Acumulado"
     return send(
         f"📈 *Ganancia*\n"
         f"Ganó: ${amount:.2f}{detail}\n"
-        f"Acumulado: ${accumulated:+.2f}"
+        f"{label}: ${accumulated:+.2f}"
     )
 
 
-def loss(amount: float, accumulated: float, pt=None) -> bool:
+def loss(amount: float, accumulated: float, pt=None, bucket_label: str | None = None) -> bool:
     """Notif por cada trade cerrado con pérdida. Retorna True si se envió."""
     if "loss" not in ENABLED_NOTIFICATIONS:
         return False
     detail = f"\n{_classify_market(pt)}" if pt is not None else ""
+    label = f"Acumulado {bucket_label}" if bucket_label else "Acumulado"
     return send(
         f"📉 *Pérdida*\n"
         f"Perdió: ${amount:.2f}{detail}\n"
-        f"Acumulado: ${accumulated:+.2f}"
+        f"{label}: ${accumulated:+.2f}"
     )
 
 

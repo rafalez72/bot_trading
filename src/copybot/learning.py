@@ -218,28 +218,49 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
     except Exception as e:
         log.exception("category update failed: %s", e)
 
-    # Notificación gain/loss simple por cada cierre
+    # Notificación gain/loss por cada cierre.
+    # 2026-05-10: el "Acumulado" se calcula POR BUCKET (crypto vs no-crypto)
+    # y respeta `bot_state.pnl_reset_at` para que el usuario pueda resetear
+    # el contador sin perder el histórico. Si nunca se reseteó, default 0
+    # (suma todo). El bucket del notif sigue al pt.source_wallet.
     try:
         from src.copybot.notifier import gain as notif_gain, loss as notif_loss
         pnl_amount = pt["pnl_usdc"] or 0
+        is_crypto_source = (wallet == "crypto_arb")
         with db() as c2:
+            reset_row = c2.execute(
+                "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+            ).fetchone()
+            try:
+                reset_at = int((reset_row["value"] if reset_row else "0") or "0")
+            except (TypeError, ValueError):
+                reset_at = 0
+            # source_wallet='crypto_arb' → bucket crypto, lo demás → bucket non-crypto
+            if is_crypto_source:
+                where_source = "source_wallet = 'crypto_arb'"
+            else:
+                where_source = "source_wallet != 'crypto_arb'"
             total_row = c2.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(pnl_usdc), 0) as p FROM paper_trades
                 WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')
-                """
+                  AND {where_source}
+                  AND COALESCE(exit_at, 0) >= ?
+                """,
+                (reset_at,),
             ).fetchone()
         accumulated = total_row["p"] or 0
+        bucket_label = "Crypto" if is_crypto_source else "Sports"
         log.info(
-            "notif.dispatch pid=%d pnl=%.2f acc=%.2f source=%s",
-            paper_trade_id, float(pnl_amount), float(accumulated),
-            (pt["source_wallet"] or "?")[:12],
+            "notif.dispatch pid=%d pnl=%.2f acc_%s=%.2f source=%s reset_at=%d",
+            paper_trade_id, float(pnl_amount), bucket_label.lower(),
+            float(accumulated), (pt["source_wallet"] or "?")[:12], reset_at,
         )
         if pnl_amount > 0:
-            sent = notif_gain(pnl_amount, accumulated, pt=pt)
+            sent = notif_gain(pnl_amount, accumulated, pt=pt, bucket_label=bucket_label)
             log.info("notif.gain.sent pid=%d sent=%s", paper_trade_id, sent)
         elif pnl_amount < 0:
-            sent = notif_loss(abs(pnl_amount), accumulated, pt=pt)
+            sent = notif_loss(abs(pnl_amount), accumulated, pt=pt, bucket_label=bucket_label)
             log.info("notif.loss.sent pid=%d sent=%s", paper_trade_id, sent)
         else:
             log.info("notif.skip_zero_pnl pid=%d", paper_trade_id)
