@@ -22,6 +22,7 @@ from src.config import (
     CLOB_API,
     LIVE_MAX_SLIPPAGE_PCT,
     LIVE_MIN_ORDERBOOK_DEPTH_USDC,
+    LIVE_ORDER_TYPE,
     LIVE_RETRY_PRICE_BUMP_PCT,
     POLYMARKET_API_KEY,
     POLYMARKET_API_PASSPHRASE,
@@ -391,8 +392,37 @@ def _resp_indicates_fill(resp: dict) -> bool:
     return False
 
 
-def _build_and_post(client, *, token_id, side, shares, price, condition_id=None):
-    """Helper: arma una orden FAK (IOC, permite partial fill) y la postea.
+def compute_limit_price(target_price: float, side: str, max_slippage_pct: float) -> float:
+    """Calcula el limit price para una orden LIMIT_FOK.
+
+    BUY:  limit = target * (1 + max_slippage_pct) → cap superior, jamás
+          pagamos más que esto.
+    SELL: limit = target * (1 - max_slippage_pct) → cap inferior, jamás
+          recibimos menos que esto.
+
+    Defensa anti-MEV/adversarial en thin orderbooks: si un sniper bot
+    sweepea liquidez antes de nuestro fill, el server cancela en vez de
+    ejecutar a precio peor.
+    """
+    if target_price <= 0:
+        return target_price
+    pct = max(0.0, float(max_slippage_pct))
+    if side.upper() == "BUY":
+        return target_price * (1.0 + pct)
+    return target_price * (1.0 - pct)
+
+
+def _build_and_post(
+    client, *, token_id, side, shares, price, condition_id=None,
+    order_type_kind: str = "FAK",
+):
+    """Helper: arma una orden y la postea.
+
+    `order_type_kind` controla el tipo enviado al server:
+      - "FAK" (default legacy): IOC con partial fill permitido. El bot maneja
+        retry si fill < 50%.
+      - "FOK" (limit fill-or-kill): la orden filla 100% al limit price o se
+        cancela. NO hay retry — caller decide si reintentar con bump.
 
     Devuelve (success, response_dict).
 
@@ -425,6 +455,7 @@ def _build_and_post(client, *, token_id, side, shares, price, condition_id=None)
     _outbox_log("attempt", {
         "token_id": token_id, "condition_id": condition_id,
         "side": side, "shares": shares, "price": price,
+        "order_type": order_type_kind,
     })
 
     try:
@@ -437,7 +468,10 @@ def _build_and_post(client, *, token_id, side, shares, price, condition_id=None)
         return False, {"errorMsg": f"create_order: {e}"}
 
     try:
-        order_type = getattr(OrderType, "FAK", None) or OrderType.FOK
+        if order_type_kind.upper() == "FOK":
+            order_type = OrderType.FOK
+        else:
+            order_type = getattr(OrderType, "FAK", None) or OrderType.FOK
         resp = client.post_order(signed, order_type)
         _outbox_log("post_ok", {"token_id": token_id, "resp": resp or {}})
         return True, (resp or {})
@@ -479,18 +513,39 @@ def place_market_order(
     dry_run: bool = False,
     skip_slippage_check: bool = False,
     condition_id: Optional[str] = None,  # para neg_risk/tick_size correctos
+    order_type: Optional[str] = None,  # "MARKET" | "LIMIT_FOK"
 ) -> OrderResult:
-    """Manda una orden IOC al CLOB con pre-check de slippage y retry.
+    """Manda una orden al CLOB con pre-check de slippage.
 
-    Flujo:
-      1. (dry_run) → loguea y devuelve fake ok
+    `order_type`:
+      - None / "LIMIT_FOK" (default): limit fill-or-kill a price = mid
+        ± max_slippage_pct. Si no hay liquidez completa al limit, el
+        server cancela. Defensa MEV/adversarial — jamás pagamos peor
+        que el cap. NO hay retry.
+      - "MARKET": legacy IOC (FAK) + retry con bump. Acepta partial fill
+        y permite slippage variable hasta el cap. Usar solo en books con
+        depth >> bet_size.
+
+    Default decidido por env var ``LIVE_ORDER_TYPE`` si caller pasa None.
+
+    Flujo (MARKET):
+      1. (dry_run) → loguea y devuelve fake ok basado en VWAP del book real.
       2. Pre-check del orderbook → VWAP esperada vs target. Si slippage > umbral, abort.
       3. Primera orden FAK al precio target.
-      4. Si no fillea (o fillea <50%), retry 1 vez con precio bumpeado
-         (BUY: target * (1 + retry_bump), SELL: target * (1 - retry_bump)).
+      4. Si no fillea (o fillea <50%), retry 1 vez con precio bumpeado.
+
+    Flujo (LIMIT_FOK):
+      1. (dry_run) → mismo dry-run realista que MARKET.
+      2. Pre-check del orderbook (depth + slippage VWAP teórico) — si falla, abort.
+      3. limit_price = compute_limit_price(price, side, max_slippage_pct).
+      4. Una sola orden FOK al limit. Si fillea → ok. Si no → cancelled.
 
     Devuelve OrderResult con filled_size = shares ejecutadas reales.
     """
+    # Resolver tipo de orden default desde env si no fue forzado por caller.
+    effective_order_type = (order_type or LIVE_ORDER_TYPE or "LIMIT_FOK").strip().upper()
+    if effective_order_type not in ("LIMIT_FOK", "MARKET"):
+        effective_order_type = "LIMIT_FOK"
     if dry_run:
         # NUEVO 2026-05-10: dry-run REALISTA. Antes devolvía midpoint
         # idealizado, lo que generó 86% win rate fake en simulación
@@ -569,6 +624,75 @@ def place_market_order(
             log.info("orden abortada por pre-check: %s", slip.get("error"))
             return OrderResult(ok=False, error=f"pre-check: {slip.get('error')}", raw=slip)
 
+    # --- Path LIMIT_FOK (default desde 2026-05-10) ---
+    # Una sola orden FOK al limit_price = mid ± max_slippage_pct.
+    # Si el server no puede fillear el 100% al limit, cancela. NO retry.
+    if effective_order_type == "LIMIT_FOK":
+        limit_price = compute_limit_price(price, side, LIVE_MAX_SLIPPAGE_PCT)
+        # Redondeamos al tick del market — un price fuera del tick_size hace
+        # que el server rechace con "invalid price".
+        tick_dec = 2 if tick_size in ("0.01",) else 3 if tick_size in ("0.001",) else 4
+        limit_price = round(limit_price, tick_dec)
+        # Re-cuantizamos shares con el limit_price (el producto shares*limit
+        # debe tener max 2 decimales).
+        fok_shares, limit_price = _quantize_amounts(size_usdc / limit_price, limit_price)
+        if fok_shares <= 0:
+            return OrderResult(
+                ok=False,
+                error=f"FOK size_usdc demasiado chico al limit (tick={tick_size}, limit={limit_price})",
+            )
+        log.info(
+            "LIMIT_FOK %s token=%s.. mid=%.4f limit=%.4f shares=%.4f size=%.2f USDC",
+            side, token_id[:12], price, limit_price, fok_shares, size_usdc,
+        )
+        success_fok, resp_fok = _build_and_post(
+            client, token_id=token_id, side=side, shares=fok_shares,
+            price=limit_price, condition_id=condition_id, order_type_kind="FOK",
+        )
+        if not success_fok:
+            return OrderResult(
+                ok=False,
+                error=resp_fok.get("errorMsg", "FOK post error"),
+                raw=resp_fok,
+            )
+        status_fok = resp_fok.get("status", "unknown")
+        order_id_fok = resp_fok.get("orderID") or resp_fok.get("orderId")
+        # FOK: server cancela atomicamente si no llena 100%. Detectamos
+        # fill vs no-fill via _resp_indicates_fill (mira tx_hash, status,
+        # making/taking amounts > 0). Si es un cancel sin fill →
+        # status='cancelled_fok' y ok=False sin retry.
+        making_fok = float(resp_fok.get("makingAmount", 0) or 0) or 0
+        taking_fok = float(resp_fok.get("takingAmount", 0) or 0) or 0
+        if not _resp_indicates_fill(resp_fok) or status_fok in ("unmatched", "cancelled"):
+            log.info(
+                "LIMIT_FOK no fillea (status=%s making=%s) → cancelado",
+                status_fok, making_fok,
+            )
+            return OrderResult(
+                ok=False,
+                order_id=order_id_fok,
+                status="cancelled_fok",
+                filled_size=0.0,
+                error=f"FOK no fillea al limit {limit_price:.4f}",
+                raw=resp_fok,
+            )
+        # Fill OK. takingAmount = shares recibidas (BUY) o USDC (SELL);
+        # makingAmount = lo dado. Para reportar filled_size en shares,
+        # usamos taking en BUY y making en SELL.
+        filled_shares = taking_fok if side.upper() == "BUY" else making_fok
+        if filled_shares <= 0:
+            filled_shares = fok_shares  # fallback al size pedido (FOK fillea full)
+        return OrderResult(
+            ok=True,
+            order_id=order_id_fok,
+            status=status_fok,
+            filled_size=filled_shares,
+            avg_price=limit_price,
+            tx_hash=resp_fok.get("transactionHash"),
+            raw=resp_fok,
+        )
+
+    # --- Path MARKET (legacy IOC con retry) ---
     # --- Intento 1: precio target ---
     success, resp = _build_and_post(
         client, token_id=token_id, side=side, shares=shares, price=price,
