@@ -407,16 +407,55 @@ def _evaluate_market(
 
 
 async def _open_arb_trade(market: dict, decision: dict) -> int | None:
-    """Abre el paper_trade vía tradebook.open_position. Devuelve pid o None."""
+    """Abre el paper_trade vía tradebook.open_position. Devuelve pid o None.
+
+    2026-05-10: paper realista. Antes usaba midpoint idealizado como
+    entry_price → paper +$269 hoy mientras live perdió $76 (orderbooks
+    thin del crypto-updown 5min). Ahora lee orderbook real vía
+    `estimate_slippage` y usa VWAP → si no hay liquidez, skip (mismo
+    comportamiento que tendría live). Esto hace paper PREDICTIVO del
+    live, no fantasía.
+    """
     cid = market.get("conditionId") or ""
     slug = market.get("slug") or ""
     end_ts = market["_end_ts"]
     src_id = f"crypto_arb:{slug}:{decision['side']}"
-    # Precio de entrada: usamos el midpoint (mejor proxy si no podemos
-    # leer orderbook real desde acá). Si midpoint es None, fallback al
-    # threshold (compramos asumiendo edge).
+
     mid = _market_midpoint(market.get("outcomePrices"), decision["outcome_index"])
-    entry_price = mid if mid is not None else 0.50
+    if mid is None:
+        metrics.skipped_open_failed += 1
+        log.info("crypto_arb.open_skipped slug=%s reason=no_mid", slug)
+        return None
+
+    # Pre-check orderbook real (también en paper). Si thin → abort, igual
+    # que live haría. Bet size en shares aproximado para target_size.
+    config = CryptoArbConfig.from_env()
+    try:
+        from src.polymarket.clob_client import estimate_slippage
+        token_id = (market.get("clobTokenIds") or [None, None])
+        if isinstance(token_id, list) and len(token_id) > decision["outcome_index"]:
+            token_id_str = token_id[decision["outcome_index"]]
+        else:
+            token_id_str = None
+        if token_id_str:
+            target_shares = config.bet_size_usdc / max(mid, 0.01)
+            slip = estimate_slippage(
+                token_id=str(token_id_str), side="BUY",
+                target_size_shares=target_shares, target_price=mid,
+            )
+            if not slip.get("ok"):
+                metrics.skipped_open_failed += 1
+                log.info(
+                    "crypto_arb.open_skipped slug=%s reason=orderbook_%s detail=%s",
+                    slug, slip.get("error", "?")[:30], slip.get("depth_usdc_top5"),
+                )
+                return None
+            entry_price = float(slip.get("vwap") or mid)
+        else:
+            entry_price = mid  # fallback si no hay token_id resoluble
+    except Exception as e:
+        log.debug("crypto_arb.estimate_slippage failed: %s — fallback midpoint", e)
+        entry_price = mid
     raw_payload = {
         "source": "crypto_arb",
         "slug": slug,
