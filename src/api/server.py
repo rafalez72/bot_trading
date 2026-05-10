@@ -377,7 +377,7 @@ def api_strategies_status() -> dict:
         """,
         (today_ts,),
     )
-    mm["enabled"] = os.getenv("MARKET_MAKER_ENABLED", "false").lower() == "true"
+    mm["enabled"] = os.getenv("MM_ENABLED", "false").lower() == "true"
 
     # 4. spike_arb — spike_arb_trades
     sa = _safe_query(
@@ -407,7 +407,7 @@ def api_strategies_status() -> dict:
         """,
         (today_ts,),
     )
-    ad["enabled"] = os.getenv("ADVERSARIAL_ASKS_ENABLED", "false").lower() == "true"
+    ad["enabled"] = os.getenv("ADVERSARIAL_ENABLED", "false").lower() == "true"
 
     # 6. long_horizon — long_horizon_trades
     lh = _safe_query(
@@ -437,7 +437,7 @@ def api_strategies_status() -> dict:
         """,
         (today_ts,),
     )
-    hd["enabled"] = os.getenv("CRYPTO_ARB_HEDGE_ENABLED", "false").lower() == "true"
+    hd["enabled"] = os.getenv("HEDGE_ENABLED", "false").lower() == "true"
 
     return {
         "_ts": int(_t.time()),
