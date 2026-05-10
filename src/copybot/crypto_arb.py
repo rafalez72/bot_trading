@@ -502,34 +502,51 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
     if not candidates:
         return 0
 
-    # Agrupamos por condition_id para batchear fetch (un fetch por cid)
-    by_cid: dict[str, list] = {}
+    # Agrupamos por slug (no por condition_id): gamma /markets?conditionId=X
+    # IGNORA el filtro tanto con closed=true como sin él, devolviendo markets
+    # arbitrarios (verificado con probes a Biden + Rhianna). Pero
+    # /markets?slug=Y&closed=true SÍ respeta el filtro y devuelve el market
+    # correcto. El slug está en el raw_payload de cada paper_trade.
+    from src.polymarket.client import GAMMA_API
+    by_slug: dict[str, list] = {}
     for r, _ in candidates:
-        by_cid.setdefault(r["condition_id"], []).append(r)
+        try:
+            raw = json.loads(r["raw"]) if r["raw"] else {}
+        except Exception:
+            raw = {}
+        slug = raw.get("slug") or ""
+        if not slug:
+            continue
+        by_slug.setdefault(slug, []).append(r)
 
     to_settle: list[tuple] = []
-    for cid, rs in by_cid.items():
-        # Bug de gamma API: cuando el market está closed, /markets?conditionId=X
-        # IGNORA el filtro y devuelve un market arbitrario. Pasamos `closed=true`
-        # explícito para forzar el filtro y validamos el cid del response. Si
-        # no matchea, gamma nos mintió → tratamos como aún no resuelto.
-        from src.polymarket.client import GAMMA_API
+    for slug, rs in by_slug.items():
         try:
             data = await client._get(
                 f"{GAMMA_API}/markets",
-                params={"conditionId": cid, "closed": "true", "limit": 1},
+                params={"slug": slug, "closed": "true", "limit": 1},
             )
         except Exception:
             continue
         m = data[0] if isinstance(data, list) and data else None
         if not m:
+            # Probemos sin closed=true por si está aún active.
+            try:
+                data2 = await client._get(
+                    f"{GAMMA_API}/markets",
+                    params={"slug": slug, "limit": 1},
+                )
+                m = data2[0] if isinstance(data2, list) and data2 else None
+            except Exception:
+                continue
+        if not m:
             continue
-        # Validación: el conditionId del response DEBE matchear el solicitado.
-        if (m.get("conditionId") or "").lower() != cid.lower():
+        # Validación: el slug del response DEBE matchear el solicitado.
+        if (m.get("slug") or "").lower() != slug.lower():
             log.debug(
-                "crypto_arb.settle: gamma devolvió cid distinto al pedido "
+                "crypto_arb.settle: gamma devolvió slug distinto al pedido "
                 "(%s vs %s) — saltando",
-                (m.get("conditionId") or "")[:14], cid[:14],
+                (m.get("slug") or "")[:30], slug[:30],
             )
             continue
         outcome_prices = m.get("outcomePrices")
