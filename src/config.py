@@ -298,7 +298,11 @@ DX_USE_ORDERBOOK_FILL = os.getenv("DX_USE_ORDERBOOK_FILL", "true").lower() == "t
 # - Bucket close mientras tenemos posición: settlement on-chain según resolución.
 #
 # Activación gated. NUNCA arrancar en LIVE sin paper validado 24h.
-MM_ENABLED = os.getenv("MM_ENABLED", "false").lower() == "true"
+# 2026-05-10: defaults paper-safe — si LIVE_MODE=false, activamos en paper
+# para validar señal (executor usa mocks, $0 riesgo). En live sigue default
+# false hasta validación explícita.
+_MM_DEFAULT = "false" if LIVE_MODE else "true"
+MM_ENABLED = os.getenv("MM_ENABLED", _MM_DEFAULT).lower() == "true"
 # spread_bps: 300 = 3% spread total. Si mid=0.50 → bid=0.485, ask=0.515.
 MM_SPREAD_BPS = int(os.getenv("MM_SPREAD_BPS", "300"))
 # USDC por side (bid + ask se postean por separado).
@@ -331,7 +335,9 @@ SPIKE_ARB_LIMIT_TTL_S = int(os.getenv("SPIKE_ARB_LIMIT_TTL_S", "60"))
 # pero ya cobramos. Default: ENABLED=false + SIGNAL_ONLY=true (solo loggea).
 # Implementación live requiere extender clob_client (split_position + GTC)
 # — ver docstring de src/copybot/adversarial_asks.py.
-ADVERSARIAL_ENABLED = os.getenv("ADVERSARIAL_ENABLED", "false").lower() == "true"
+# 2026-05-10: default paper-safe — paper activa (SIGNAL_ONLY=true mantiene $0 risk).
+_ADV_DEFAULT = "false" if LIVE_MODE else "true"
+ADVERSARIAL_ENABLED = os.getenv("ADVERSARIAL_ENABLED", _ADV_DEFAULT).lower() == "true"
 ADVERSARIAL_MAX_SECS_TO_CLOSE = float(os.getenv("ADVERSARIAL_MAX_SECS_TO_CLOSE", "60"))
 ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.85"))
 ADVERSARIAL_ASK_PRICE = float(os.getenv("ADVERSARIAL_ASK_PRICE", "0.05"))
