@@ -286,5 +286,22 @@ DX_GAS_PER_FILL_USDC = float(os.getenv("DX_GAS_PER_FILL_USDC", "0.02"))
 DX_FUNDING_UPDATE_HOURS = int(os.getenv("DX_FUNDING_UPDATE_HOURS", "1"))
 DX_USE_ORDERBOOK_FILL = os.getenv("DX_USE_ORDERBOOK_FILL", "true").lower() == "true"
 
+# ---------- Spike arbitrage (Nivel B, 2026-05-10) ----------
+# Detect movimiento brusco Binance spot → posicionar limit order en mid
+# Polymarket ANTES que ajuste. Si fillea, capturamos el delta. Si no
+# fillea en TTL, cancel.
+#
+# Diferencia vs CRYPTO_ARB: trigger absoluto simple (umbral % en window),
+# LIMIT orders only (no market) para evitar slippage en thin orderbooks,
+# defensa básica de TTL.
+#
+# Activación gated por SPIKE_ARB_ENABLED. Validar siempre en paper antes
+# de live — ver src/copybot/spike_arb.py.
+SPIKE_ARB_ENABLED = os.getenv("SPIKE_ARB_ENABLED", "false").lower() == "true"
+SPIKE_ARB_THRESHOLD_PCT = float(os.getenv("SPIKE_ARB_THRESHOLD_PCT", "0.4"))
+SPIKE_ARB_WINDOW_S = int(os.getenv("SPIKE_ARB_WINDOW_S", "30"))
+SPIKE_ARB_TARGET_USDC = float(os.getenv("SPIKE_ARB_TARGET_USDC", "3.0"))
+SPIKE_ARB_LIMIT_TTL_S = int(os.getenv("SPIKE_ARB_LIMIT_TTL_S", "60"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)
