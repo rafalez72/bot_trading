@@ -762,6 +762,49 @@ def settle_resolved() -> int:
     return settled
 
 
+def _get_mark_price(token_id: str) -> float | None:
+    """Devuelve mid (bid+ask)/2 actual para token_id, o None si falla.
+
+    Usado por `cleanup_phantom_positions` (Bug 10 fix) para estimar el
+    mark-to-market de trades que tienen `entry_tx_hash` (BUY ejecutado on-chain)
+    pero ya no aparecen en /positions — la posición fue vendida o redeemed
+    externamente y necesitamos un PnL realista en vez de pnl=0.
+
+    Best-effort: si el CLOB está caído o el orderbook está vacío devuelve None,
+    y el caller maneja el fallback (no-op recover).
+    """
+    try:
+        from src.polymarket.clob_client import get_client
+        client = get_client()
+        if client is None:
+            return None
+        ob = client.get_order_book(token_id)
+
+        def _entry(o):
+            if hasattr(o, "price"):
+                return float(o.price), float(o.size)
+            return float(o["price"]), float(o["size"])
+
+        if isinstance(ob, dict):
+            asks_raw = ob.get("asks") or []
+            bids_raw = ob.get("bids") or []
+        else:
+            asks_raw = ob.asks or []
+            bids_raw = ob.bids or []
+        asks = sorted([_entry(o) for o in asks_raw])
+        bids = sorted([_entry(o) for o in bids_raw], reverse=True)
+        best_ask = asks[0][0] if asks else None
+        best_bid = bids[0][0] if bids else None
+        if best_ask is not None and best_bid is not None:
+            return (best_ask + best_bid) / 2.0
+        # fallback: si solo hay un lado del book, devolvemos ese (subóptimo
+        # pero mejor que None — el caller puede igual hacer MTM aproximado).
+        return best_ask if best_ask is not None else best_bid
+    except Exception as e:
+        log.warning("_get_mark_price falló (token=%s..): %s", str(token_id)[:14], e)
+        return None
+
+
 def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
     """Detecta `live_trades` open cuyas posiciones ya no existen on-chain.
 
@@ -774,14 +817,22 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
     Solución: consulta `data-api/positions` para `POLYMARKET_FUNDER_ADDRESS`
     (la wallet del bot). Construye un set de `asset` (token_id) on-chain.
     Para cada live_trade open con `entry_at` >= `min_age_seconds` atrás:
-        si su `token_id` (o `asset`) NO está en ese set → marca como
-        `closed_external` con `pnl_usdc=0`, `exit_reason='phantom_cleanup'`.
+        - Si su token NO está on-chain Y NO tiene `entry_tx_hash` → phantom
+          puro (BUY que nunca se ejecutó). Marca `closed_external pnl_usdc=0
+          exit_reason='phantom_cleanup'`. Notif Telegram `live_phantom`.
+        - Si su token NO está on-chain PERO `entry_tx_hash IS NOT NULL` →
+          PHANTOM RECOVERED: la BUY sí ejecutó on-chain (hay tx) pero la
+          posición ya no está en /positions → fue cerrada externamente.
+          Compute MTM = (mid_actual - entry_price) * shares y graba como
+          `pnl_usdc` real con `exit_reason='phantom_recovered_external'`.
+          Esto evita ocultar pérdidas al kill switch (Bug 10 — 2026-05-10).
 
     Solo aplica a trades > min_age (default 2h) para evitar race con trades
     recién abiertos que aún no aparecen en /positions.
 
-    Devuelve cantidad de phantoms limpiados. Si la API falla, devuelve 0
-    (no toca nada — failsafe contra falsos positivos por error de red).
+    Devuelve cantidad de phantoms limpiados (pure + recovered). Si la API
+    falla, devuelve 0 (no toca nada — failsafe contra falsos positivos por
+    error de red).
     """
     # IMPORTANTE: leer del config (que ya hace dotenv-load), NO via os.getenv —
     # las vars de .env están montadas como archivo, no exportadas al shell del
@@ -795,10 +846,13 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
         # Incluye waiting_settlement además de open: trades parqueados por
         # sweep_stops también pueden quedar phantom on-chain (settled/redeemed
         # mientras el bot estaba apagado, etc.) y deben ser limpiados.
+        # Bug 10 (2026-05-10): selecciono entry_tx_hash + entry_shares para
+        # poder distinguir "phantom puro" (no tx) vs "trade real con tracking
+        # roto" (sí tx, pero ya no on-chain) y computar MTM en el segundo caso.
         rows = conn.execute(
             """
             SELECT id, source_wallet, condition_id, token_id, asset, entry_at,
-                   entry_price, entry_size_usdc
+                   entry_price, entry_size_usdc, entry_shares, entry_tx_hash
             FROM live_trades
             WHERE status IN ('open', 'waiting_settlement')
               AND dry_run=0 AND entry_at <= ?
@@ -858,102 +912,220 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
         if isinstance(t, str) and t:
             onchain_assets.add(t)
 
-    phantom_ids: list[int] = []
-    for r in rows:
-        # Token id en nuestro DB puede estar en token_id o en asset.
-        cand = (r["token_id"], r["asset"])
-        present = any(c and c in onchain_assets for c in cand)
-        if not present:
-            phantom_ids.append(r["id"])
+    # Bug 10 (2026-05-10): clasifico cada candidato en 3 categorías:
+    #  - pure_phantoms: token no on-chain Y no entry_tx_hash → BUY nunca
+    #    se ejecutó. USDC sigue en wallet, pnl=0 es correcto. Notif `live_phantom`.
+    #  - recovered_with_tx: token no on-chain PERO entry_tx_hash NOT NULL →
+    #    BUY sí ejecutó on-chain pero la posición ya no está → fue cerrada
+    #    externamente (sell manual / redeem / etc.). Es trade REAL con pérdida
+    #    real. Compute MTM con mid actual; pnl=(mid-entry)*shares.
+    #  - on_chain_present: rows cuyo token SÍ está en /positions → trade real
+    #    aún abierto. NO los tocamos (no es phantom). El risk loop los maneja.
 
-    if not phantom_ids:
+    # Pre-fetch slugs batch para los rows candidatos (evita 1 query DB por trade)
+    candidate_cids: list[str] = []
+    for r in rows:
+        cand = (r["token_id"], r["asset"])
+        if not any(c and c in onchain_assets for c in cand):
+            candidate_cids.append(r["condition_id"])
+    slug_map: dict[str, str | None] = {}
+    if candidate_cids:
+        with db() as _conn:
+            placeholders_cid = ",".join("?" * len(candidate_cids))
+            srows = _conn.execute(
+                f"SELECT condition_id, slug FROM markets WHERE condition_id IN ({placeholders_cid})",
+                candidate_cids,
+            ).fetchall()
+            for s in srows:
+                slug_map[s["condition_id"]] = s["slug"]
+
+    pure_phantoms: list[dict] = []
+    recovered_with_tx: list[dict] = []
+    for r in rows:
+        cand = (r["token_id"], r["asset"])
+        in_onchain = any(c and c in onchain_assets for c in cand)
+        if in_onchain:
+            # Trade real con shares todavía on-chain → no es phantom, risk
+            # loop lo maneja. No-op acá.
+            continue
+        has_tx = bool(r["entry_tx_hash"])
+        detail = {
+            "id": r["id"],
+            "source_wallet": r["source_wallet"],
+            "condition_id": r["condition_id"],
+            "token_id": r["token_id"],
+            "asset": r["asset"],
+            "entry_price": float(r["entry_price"] or 0),
+            "entry_shares": float(r["entry_shares"] or 0),
+            "entry_size_usdc": float(r["entry_size_usdc"] or 0),
+            "entry_tx_hash": r["entry_tx_hash"],
+            "slug": slug_map.get(r["condition_id"]),
+        }
+        if has_tx:
+            recovered_with_tx.append(detail)
+        else:
+            pure_phantoms.append(detail)
+
+    if not pure_phantoms and not recovered_with_tx:
         return 0
 
-    # Snapshot per-trade ANTES del UPDATE para tener datos para Telegram
-    # (size, slug, wallet). Hacemos una sola query batch.
-    phantom_details: list[dict] = []
-    with db() as conn:
-        placeholders_q = ",".join("?" * len(phantom_ids))
-        det_rows = conn.execute(
-            f"""
-            SELECT lt.id, lt.entry_size_usdc, lt.source_wallet, lt.condition_id,
-                   m.slug
-            FROM live_trades lt
-            LEFT JOIN markets m ON m.condition_id = lt.condition_id
-            WHERE lt.id IN ({placeholders_q})
-            """,
-            phantom_ids,
-        ).fetchall()
-        for r in det_rows:
-            phantom_details.append({
-                "id": r["id"],
-                "size_usdc": float(r["entry_size_usdc"] or 0),
-                "source_wallet": r["source_wallet"],
-                "slug": r["slug"],
-            })
-
     now_ts = int(time.time())
+    pure_ids = [d["id"] for d in pure_phantoms]
+
+    # Para recovered: necesitamos MTM por trade (cada uno tiene token_id
+    # distinto). Resolvemos antes del tx() para no bloquear DB durante
+    # llamadas HTTP al CLOB.
+    recovered_with_mtm: list[dict] = []
+    for d in recovered_with_tx:
+        tok = d["token_id"] or d["asset"]
+        mid = _get_mark_price(tok) if tok else None
+        if mid is None or mid <= 0:
+            # No pudimos resolver mid → fallback: dejamos el trade open con
+            # un flag en learning_events. NO marcamos como closed_external
+            # (eso ocultaría más pérdida). El risk loop / próximo cleanup
+            # podrá reintentar cuando el CLOB esté arriba.
+            log.warning(
+                "cleanup_phantom: trade #%d tiene tx_hash pero no pude "
+                "resolver mark price (CLOB caído?). Dejo open, reintento "
+                "en próximo cycle.",
+                d["id"],
+            )
+            d["mtm_pnl"] = None
+            d["mid"] = None
+        else:
+            shares = d["entry_shares"]
+            entry_p = d["entry_price"]
+            d["mid"] = mid
+            d["mtm_pnl"] = shares * (mid - entry_p)
+        recovered_with_mtm.append(d)
+
+    # Filtro: separamos los que sí podemos cerrar con MTM de los que se
+    # quedan open (CLOB caído).
+    recovered_closable = [d for d in recovered_with_mtm if d.get("mtm_pnl") is not None]
+    recovered_open_kept = [d for d in recovered_with_mtm if d.get("mtm_pnl") is None]
+
     with tx() as conn:
-        placeholders = ",".join("?" * len(phantom_ids))
-        conn.execute(
-            f"""
-            UPDATE live_trades
-            SET status='closed_external',
-                exit_at=?,
-                exit_price=entry_price,
-                exit_shares=entry_shares,
-                pnl_usdc=0,
-                exit_reason='phantom_cleanup'
-            WHERE id IN ({placeholders}) AND status IN ('open', 'waiting_settlement')
-            """,
-            [now_ts] + phantom_ids,
-        )
-        conn.execute(
-            """
-            INSERT INTO learning_events
-                (wallet, event_type, before_value, after_value, delta, trigger, metric_snapshot)
-            VALUES ('(system)', 'phantom_cleanup', NULL, NULL, NULL, ?, ?)
-            """,
-            (
-                f"Cleanup auto: {len(phantom_ids)} live_trades open ya no existen on-chain",
-                json.dumps({"ids": phantom_ids, "onchain_count": len(onchain_assets)}),
-            ),
-        )
+        # Caso C (phantom puro): mismo path histórico. pnl=0, closed_external.
+        if pure_ids:
+            placeholders = ",".join("?" * len(pure_ids))
+            conn.execute(
+                f"""
+                UPDATE live_trades
+                SET status='closed_external',
+                    exit_at=?,
+                    exit_price=entry_price,
+                    exit_shares=entry_shares,
+                    pnl_usdc=0,
+                    exit_reason='phantom_cleanup'
+                WHERE id IN ({placeholders}) AND status IN ('open', 'waiting_settlement')
+                """,
+                [now_ts] + pure_ids,
+            )
+
+        # Caso B (recovered con tx + MTM): cerrar con pnl real para que kill
+        # switch y Telegram vean la pérdida real. exit_reason específico para
+        # auditoría: el user puede grepear `phantom_recovered_external` y
+        # entender que fue una pérdida estimada vía MTM, no un fill normal.
+        for d in recovered_closable:
+            conn.execute(
+                """
+                UPDATE live_trades
+                SET status='closed_external',
+                    exit_at=?,
+                    exit_price=?,
+                    exit_shares=entry_shares,
+                    pnl_usdc=?,
+                    exit_reason='phantom_recovered_external'
+                WHERE id=? AND status IN ('open', 'waiting_settlement')
+                """,
+                (now_ts, d["mid"], d["mtm_pnl"], d["id"]),
+            )
+
+        total_changed = len(pure_ids) + len(recovered_closable)
+        if total_changed:
+            conn.execute(
+                """
+                INSERT INTO learning_events
+                    (wallet, event_type, before_value, after_value, delta, trigger, metric_snapshot)
+                VALUES ('(system)', 'phantom_cleanup', NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    (
+                        f"Cleanup auto: {len(pure_ids)} phantom puros + "
+                        f"{len(recovered_closable)} recovered con MTM "
+                        f"(+{len(recovered_open_kept)} dejados open por CLOB caído)"
+                    ),
+                    json.dumps({
+                        "pure_ids": pure_ids,
+                        "recovered_ids": [d["id"] for d in recovered_closable],
+                        "kept_open_ids": [d["id"] for d in recovered_open_kept],
+                        "onchain_count": len(onchain_assets),
+                    }),
+                ),
+            )
 
     log.warning(
-        "cleanup_phantom: marcados %d live_trades como closed_external "
-        "(no existen en /positions del proxy). on-chain assets count=%d",
-        len(phantom_ids), len(onchain_assets),
+        "cleanup_phantom: %d pure phantoms + %d recovered con MTM + %d kept "
+        "open (CLOB down). on-chain assets count=%d",
+        len(pure_ids), len(recovered_closable), len(recovered_open_kept),
+        len(onchain_assets),
     )
 
-    # CRÍTICO (2026-05-10): NOTIF Telegram por cada phantom. Antes esto era
-    # silente y el usuario perdió $76 sin enterarse de 29/50 trades. Para
-    # bursts grandes (>5 phantoms) mandamos un solo summary; para pocos,
-    # individual para que el user pueda ir a verificarlos en polymarket.com.
+    # NOTIF Telegram:
+    #  - Pure phantoms: usa `live_phantom` (per-trade si <=5, summary si >5).
+    #    Mensaje original "FANTASMA / no settled on-chain".
+    #  - Recovered con MTM: notif distinta "PHANTOM RECOVERED" con MTM real
+    #    para que el user sepa que hay una pérdida real (no era phantom).
     try:
-        from src.copybot.notifier import live_phantom
-        if len(phantom_details) <= 5:
-            for d in phantom_details:
+        from src.copybot.notifier import live_phantom, send
+        if pure_phantoms:
+            if len(pure_phantoms) <= 5:
+                for d in pure_phantoms:
+                    try:
+                        live_phantom(
+                            trade_id=d["id"],
+                            size_usdc=d["entry_size_usdc"],
+                            market_slug=d["slug"],
+                            source_wallet=d["source_wallet"],
+                        )
+                    except Exception:
+                        pass
+            else:
+                total_size = sum(d["entry_size_usdc"] for d in pure_phantoms)
                 try:
                     live_phantom(
-                        trade_id=d["id"],
-                        size_usdc=d["size_usdc"],
-                        market_slug=d["slug"],
-                        source_wallet=d["source_wallet"],
+                        n_phantoms=len(pure_phantoms),
+                        size_usdc=total_size,
                     )
                 except Exception:
                     pass
-        else:
-            # batch summary: total capital atado
-            total_size = sum(d["size_usdc"] for d in phantom_details)
+
+        for d in recovered_closable:
             try:
-                live_phantom(
-                    n_phantoms=len(phantom_details),
-                    size_usdc=total_size,
+                pnl = d["mtm_pnl"] or 0.0
+                slug_part = f"\nMercado: {d['slug']}" if d.get("slug") else ""
+                send(
+                    f"⚠️ *PHANTOM RECOVERED*\n"
+                    f"Trade #{d['id']}: detectaba phantom pero hay tx_hash "
+                    f"on-chain (BUY ejecutó).\n"
+                    f"mark-to-market: ${pnl:+.2f}\n"
+                    f"Status: closed_external (pérdida real grabada)"
+                    f"{slug_part}"
+                )
+            except Exception:
+                pass
+
+        for d in recovered_open_kept:
+            # CLOB caído: aviso pero NO cerramos. Próximo cleanup reintentará.
+            try:
+                send(
+                    f"⚠️ *PHANTOM PENDING*\n"
+                    f"Trade #{d['id']}: tiene tx_hash pero CLOB caído — no pude "
+                    f"calcular MTM.\nDejo open, reintento próximo cycle."
                 )
             except Exception:
                 pass
     except Exception:
         pass
 
-    return len(phantom_ids)
+    return len(pure_ids) + len(recovered_closable)
