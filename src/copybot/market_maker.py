@@ -136,26 +136,31 @@ def place_limit_order(
 ) -> LimitOrderResult:
     """Postea una limit order GTC en el CLOB.
 
-    TODO(market_maker): integrar con `src.polymarket.clob_client`. Hoy el
-    helper `place_market_order` solo soporta MARKET / LIMIT_FOK (ambos
-    IOC). Para MM necesitamos GTC: la orden se queda en el book hasta
-    que matchee o la cancelemos.
+    LIVE_MODE: delega a `src.polymarket.clob_client.place_limit_order_gtc`
+    (extension agregada en commit d83d0d8). GTC sin expiry — el MM cancela
+    manualmente en `cancel_order` cuando re-cotiza.
 
-    En LIMIT_FOK la orden se cancela atómicamente si no fillea 100% al
-    instante → useless para MM. Hay que extender clob_client con
-    `OrderType.GTC` y devolver el `order_id` para tracking.
-
-    Hasta entonces este stub devuelve un fake order_id determinístico.
-
-    LIVE_MODE: si está activo, levanta NotImplementedError loud — silent
-    failure en LIVE es peor que crash (ver docs/PRE_LIVE_AUDIT.md bug #5).
+    Paper mode: stub determinístico con fake order_id (mismo formato que
+    antes para no romper tests existentes ni el reconciliation logic).
     """
     from src.config import LIVE_MODE
     if LIVE_MODE:
-        raise NotImplementedError(
-            "market_maker.place_limit_order: stub no implementado para LIVE_MODE. "
-            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.place_limit_order_gtc."
+        from src.polymarket.clob_client import place_limit_order_gtc
+        # Mapeo: nuestro size_usdc (USDC notional) → kwarg `size` del SDK
+        # extension. ttl_s=None → expiration=0 (GTC sin expiry, MM cancela
+        # manualmente al re-cotizar). condition_id=None → no overrides de
+        # neg_risk/tick_size (caller no los conoce a este nivel).
+        result = place_limit_order_gtc(
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size_usdc,
+            ttl_s=None,
+            condition_id=None,
         )
+        if not result.ok:
+            return LimitOrderResult(ok=False, error=result.error)
+        return LimitOrderResult(ok=True, order_id=result.order_id)
     fake_id = f"STUB-{token_id[:10]}-{side}-{int(price * 10000)}"
     log.debug(
         "[MM-STUB] place_limit_order token=%s.. side=%s price=%.4f size=%.2f → %s",
@@ -167,18 +172,20 @@ def place_limit_order(
 def cancel_order(order_id: str) -> bool:
     """Cancela una limit order viva.
 
-    TODO(market_maker): integrar `client.cancel_order(order_id)` del SDK
-    py-clob-client-v2. El SDK lo soporta — solo hay que wrappearlo con
-    el manejo de error estándar (return bool, log on failure).
+    LIVE_MODE: delega a `src.polymarket.clob_client.cancel_order` (devuelve
+    True si el server confirma cancel; False si la orden ya estaba fillada,
+    cancelada, o el SDK tiró excepción). El call propio del MM siempre
+    sobrescribe el status local a 'cancelled' independiente del bool —
+    porque si el server dice "no_canceled: already_filled", igual queremos
+    dejar de cotizar al precio viejo (`_handle_fills` lo recupera vía la
+    tabla con status='filled' cuando llegue el fill por data-api).
 
-    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
+    Paper mode: True siempre (no hay book real).
     """
     from src.config import LIVE_MODE
     if LIVE_MODE:
-        raise NotImplementedError(
-            "market_maker.cancel_order: stub no implementado para LIVE_MODE. "
-            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.cancel_order."
-        )
+        from src.polymarket.clob_client import cancel_order as clob_cancel
+        return clob_cancel(order_id)
     log.debug("[MM-STUB] cancel_order id=%s", order_id)
     return True
 
@@ -186,21 +193,17 @@ def cancel_order(order_id: str) -> bool:
 def get_open_orders() -> list[dict]:
     """Lista órdenes vivas del CLOB para el funder de la cuenta.
 
-    TODO(market_maker): integrar `client.get_orders()` del SDK. Devuelve
-    items {orderId, market, side, price, size, status}. Por ahora
-    leemos de la tabla `mm_orders` con status='open' como fuente de verdad
-    interna — está bien para el skeleton, pero en producción hay que
-    reconciliar contra el server (la orden puede haber sido cancelada
-    en el book sin que nuestro DB lo sepa).
+    LIVE_MODE: delega a `src.polymarket.clob_client.get_open_orders` (sin
+    filtro por token_id → todas las del funder). Útil al startup para
+    reconciliar el state interno con lo que el server tiene como verdad.
 
-    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
+    Paper mode: lee de la tabla `mm_orders` con status='open' como fuente
+    de verdad interna.
     """
     from src.config import LIVE_MODE
     if LIVE_MODE:
-        raise NotImplementedError(
-            "market_maker.get_open_orders: stub no implementado para LIVE_MODE. "
-            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.get_orders()."
-        )
+        from src.polymarket.clob_client import get_open_orders as clob_open
+        return clob_open(token_id=None)
     _ensure_schema()
     rows: list[dict] = []
     try:
@@ -226,22 +229,16 @@ def get_open_orders() -> list[dict]:
 def get_fills_since(since_ts: int) -> list[dict]:
     """Devuelve fills detectados desde `since_ts` (epoch seconds).
 
-    TODO(market_maker): integrar polling de `data-api/trades?user=funder`
-    o el WS `activity:trades` filtrado por funder address. Los fills
-    contra nuestras limit orders aparecen ahí con counterparty=funder.
+    LIVE_MODE: delega a `src.polymarket.clob_client.get_fills_since` que
+    hace 1) SDK `get_trades(after=ts)` y 2) fallback a data-api directo
+    con el funder address. Filtra client-side por timestamp.
 
-    Por ahora devuelve []: el caller debe asumir que el fill detection
-    no está conectado y los reconciles vienen via la tabla `mm_orders`
-    cuando manualmente se marca status='filled'. NO usar en producción.
-
-    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
+    Paper mode: [] (no hay fills reales — los tests inyectan vía fills_fn).
     """
     from src.config import LIVE_MODE
     if LIVE_MODE:
-        raise NotImplementedError(
-            "market_maker.get_fills_since: stub no implementado para LIVE_MODE. "
-            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con data-api/trades?user=funder."
-        )
+        from src.polymarket.clob_client import get_fills_since as clob_fills
+        return clob_fills(since_ts)
     log.debug("[MM-STUB] get_fills_since since=%d → []", since_ts)
     return []
 
@@ -383,6 +380,39 @@ class MarketMaker:
         Gamma. Por ahora devuelve [] como fail-safe.
         """
         return []
+
+    async def _resolve_market_tokens(self, market: dict) -> Optional[dict]:
+        """Resuelve {yes_token_id, no_token_id} desde el slug del market.
+
+        Helper para que el caller que arma candidatos enriquezca cada item
+        con los token_ids reales. Outcome 0 = YES, 1 = NO (convención
+        Polymarket binarios). Fail-soft: si el resolver no está disponible
+        o tira, devuelve None — el caller debe skipear ese candidate.
+
+        Import dinámico por dos razones:
+          1. token_resolver puede no existir aún (otro agent lo crea en
+             paralelo) — el ImportError no debe romper el módulo entero.
+          2. PolymarketClient es async-only y queremos pagar la creación
+             de la conexión solo cuando MM está habilitado.
+        """
+        slug = market.get("slug")
+        if not slug:
+            return None
+        try:
+            from src.polymarket.token_resolver import resolve_token_id
+            from src.polymarket.client import PolymarketClient
+        except ImportError:
+            log.debug("token_resolver no disponible (deferred dep)")
+            return None
+        try:
+            async with PolymarketClient() as c:
+                yes_id = await resolve_token_id(c, slug, 0)
+                no_id = await resolve_token_id(c, slug, 1)
+                if yes_id and no_id:
+                    return {"yes_token_id": yes_id, "no_token_id": no_id}
+        except Exception:
+            log.exception("token resolver failed for slug=%s", slug)
+        return None
 
     # ---- Core lifecycle ----
 
