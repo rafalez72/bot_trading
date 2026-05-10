@@ -513,9 +513,20 @@ def close_position(
             (actual_exit_price, timestamp, order.order_id, order.tx_hash,
              actual_exit_shares, fee_usdc, net_pnl, status, reason, trade_id),
         )
+        # PnL acumulado respeta bot_state.pnl_reset_at (mismo mecanismo que
+        # learning.on_paper_trade_closed). Si nunca se reseteó → suma todo.
+        _reset_row = conn.execute(
+            "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+        ).fetchone()
+        try:
+            _reset_at = int(float((_reset_row["value"] if _reset_row else "0") or "0"))
+        except (TypeError, ValueError):
+            _reset_at = 0
         accum = conn.execute(
             "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
-            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss') "
+            "AND COALESCE(exit_at, 0) >= ?",
+            (_reset_at,),
         ).fetchone()["a"]
         slug_row = conn.execute(
             "SELECT slug FROM markets WHERE condition_id=?", (condition_id,)
@@ -588,9 +599,20 @@ def force_close(live_trade_id: int, exit_price: float, *, reason: str) -> None:
             (actual_price, order.order_id, order.tx_hash, actual_shares,
              fee, net, status, reason, live_trade_id),
         )
+        # PnL acumulado respeta bot_state.pnl_reset_at (mismo mecanismo que
+        # learning.on_paper_trade_closed). Si nunca se reseteó → suma todo.
+        _reset_row = conn.execute(
+            "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+        ).fetchone()
+        try:
+            _reset_at = int(float((_reset_row["value"] if _reset_row else "0") or "0"))
+        except (TypeError, ValueError):
+            _reset_at = 0
         accum = conn.execute(
             "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
-            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss') "
+            "AND COALESCE(exit_at, 0) >= ?",
+            (_reset_at,),
         ).fetchone()["a"]
         slug_row = conn.execute(
             "SELECT slug FROM markets WHERE condition_id=?", (condition_id,)
@@ -659,9 +681,20 @@ def settle_resolved() -> int:
             """,
             to_settle,
         )
+        # PnL acumulado respeta bot_state.pnl_reset_at (mismo mecanismo que
+        # learning.on_paper_trade_closed). Si nunca se reseteó → suma todo.
+        _reset_row = conn.execute(
+            "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+        ).fetchone()
+        try:
+            _reset_at = int(float((_reset_row["value"] if _reset_row else "0") or "0"))
+        except (TypeError, ValueError):
+            _reset_at = 0
         accum = conn.execute(
             "SELECT COALESCE(SUM(pnl_usdc),0) as a FROM live_trades "
-            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+            "WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss') "
+            "AND COALESCE(exit_at, 0) >= ?",
+            (_reset_at,),
         ).fetchone()["a"]
     settled = len(to_settle)
 
