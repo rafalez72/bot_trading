@@ -32,6 +32,7 @@ from src.config import (
     LIVE_DRY_RUN,
     LIVE_DRY_SLIPPAGE_PCT,
     LIVE_MIN_EXPECTED_PNL_USDC,
+    LIVE_ORDER_TYPE,
     MAX_ENTRIES_PER_WALLET_MARKET,
     MAX_PER_MARKET_PCT,
     MAX_WALLET_24H_PCT,
@@ -387,6 +388,12 @@ def open_position(
     # check de `order.ok` y del phantom guard. Si el wrapper tira excepción
     # (network, SDK bug, etc.), tratamos como `order_exception` y retornamos
     # sin tocar la DB. Audit trail al outbox para análisis posterior.
+    #
+    # 2026-05-10 (N1 anti-MEV): pasamos `order_type=LIVE_ORDER_TYPE` explícito.
+    # Default es "LIMIT_FOK" (defensa MEV/adversarial fills — el fill se cancela
+    # si el server no puede llenar 100% al limit, jamás pagamos peor que el cap).
+    # Si el operador setea LIVE_ORDER_TYPE=MARKET en env, mantiene flow legacy
+    # (FAK + retry con bump). Esta wiring hace la elección visible y testeable.
     try:
         order = place_market_order(
             token_id=token_id,
@@ -395,6 +402,7 @@ def open_position(
             price=price,
             dry_run=LIVE_DRY_RUN,
             condition_id=condition_id,
+            order_type=LIVE_ORDER_TYPE,
         )
     except Exception as e:
         log.exception(
