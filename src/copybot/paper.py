@@ -235,33 +235,41 @@ def open_position(
                 )
             return None, "stale_trade"
 
-        sub = conn.execute(
-            "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
-            (source_wallet,),
-        ).fetchone()
-        if not sub:
-            return None, "no_subscription"
-        if sub["status"] != "active":
-            return None, "inactive"
-        # Usar `is None` y NO `or` — un sizing_mult=0 (drop residual) con `or`
-        # se convertía a 1.0, dejando wallets dropped operando como zombies.
-        sm = sub["sizing_mult"]
-        sizing = 1.0 if sm is None else float(sm)
-        if sizing <= EPSILON:
-            return None, "inactive"
+        # crypto_arb es una source_wallet sintética del bot N2 (no una wallet
+        # real de Polymarket), no necesita entry en copy_subscriptions ni
+        # wallet_clusters. Skip los 2 checks que dependen de eso.
+        if source_wallet != "crypto_arb":
+            sub = conn.execute(
+                "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
+                (source_wallet,),
+            ).fetchone()
+            if not sub:
+                return None, "no_subscription"
+            if sub["status"] != "active":
+                return None, "inactive"
+            # Usar `is None` y NO `or` — un sizing_mult=0 (drop residual) con `or`
+            # se convertía a 1.0, dejando wallets dropped operando como zombies.
+            sm = sub["sizing_mult"]
+            sizing = 1.0 if sm is None else float(sm)
+            if sizing <= EPSILON:
+                return None, "inactive"
 
-        # Cluster check: si el cluster del wallet está blocked, no abrir
-        cs = conn.execute(
-            """
-            SELECT cp.status, cp.avg_win_rate, cp.pnl_usdc, cp.n_trades
-            FROM wallet_clusters wc
-            JOIN cluster_perf cp ON cp.cluster_id = wc.cluster_id
-            WHERE wc.wallet=?
-            """,
-            (source_wallet,),
-        ).fetchone()
-        if cs and cs["status"] == "blocked":
-            return None, "cluster_blocked"
+            # Cluster check: si el cluster del wallet está blocked, no abrir
+            cs = conn.execute(
+                """
+                SELECT cp.status, cp.avg_win_rate, cp.pnl_usdc, cp.n_trades
+                FROM wallet_clusters wc
+                JOIN cluster_perf cp ON cp.cluster_id = wc.cluster_id
+                WHERE wc.wallet=?
+                """,
+                (source_wallet,),
+            ).fetchone()
+            if cs and cs["status"] == "blocked":
+                return None, "cluster_blocked"
+        else:
+            # crypto_arb: sizing fijo 1.0, sin cluster check.
+            sizing = 1.0
+            cs = None
         # Si el cluster está penalizado, achicamos el sizing a la mitad
         if cs and cs["status"] == "penalized":
             sizing = sizing * 0.5
