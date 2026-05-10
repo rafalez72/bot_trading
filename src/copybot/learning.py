@@ -232,7 +232,10 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
                 "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
             ).fetchone()
             try:
-                reset_at = int((reset_row["value"] if reset_row else "0") or "0")
+                # EXTRACT(EPOCH FROM NOW()) en PG devuelve double precision con
+                # decimales. int(str_decimal) lanza ValueError → caía a 0 y
+                # mostraba PnL acumulado completo en lugar del post-reset.
+                reset_at = int(float((reset_row["value"] if reset_row else "0") or "0"))
             except (TypeError, ValueError):
                 reset_at = 0
             # IMPORTANTE: usar TRADES_TABLE_NOTIF (paper_trades en paper,
