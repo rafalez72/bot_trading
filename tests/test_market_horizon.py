@@ -102,14 +102,18 @@ def _iso(ts: int) -> str:
 
 
 def test_market_too_short_rechaza(isolated_db, monkeypatch):
-    """end_date dentro de 5 min → reject market_too_short."""
+    """end_date dentro de 2 min → reject market_too_short.
+
+    Default actualizado 2026-05-10: MARKET_HORIZON_MIN_SECS bajado a 300s.
+    Test usa 120s (< threshold) para garantizar reject independiente del default.
+    """
     monkeypatch.setattr(paper, "MAX_TRADE_AGE_SECONDS", 10**9)
     _seed_subscription()
     now = int(time.time())
     _insert_market(
         condition_id="0xshort",
         slug="some-news-event-2026",
-        end_date=_iso(now + 300),  # 5 min
+        end_date=_iso(now + 120),  # 2 min < threshold 300s
     )
     pid, reason = paper.open_position(
         source_wallet="0xtrader",

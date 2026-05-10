@@ -41,8 +41,12 @@ STOP_LOSS_HORIZON_BUCKETS_S = os.getenv("STOP_LOSS_HORIZON_BUCKETS_S", "1800,720
 
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.80"))
 MAX_PER_MARKET_PCT = float(os.getenv("MAX_PER_MARKET_PCT", "0.20"))
-MIN_MARKET_LIQUIDITY_USDC = float(os.getenv("MIN_MARKET_LIQUIDITY_USDC", "5000"))
-MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "10000"))
+# 2026-05-10: bajados de 5000/10000 → 2000/3000 para no filtrar sports
+# live + esports. Wallets top operan markets con liq $2-10k (in-play). Si
+# .env tiene override explícito a 5000/10000 (legacy), ese gana — usar
+# endpoint admin para override via DB sin tocar .env.
+MIN_MARKET_LIQUIDITY_USDC = float(os.getenv("MIN_MARKET_LIQUIDITY_USDC", "2000"))
+MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "3000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
@@ -96,7 +100,7 @@ MIN_TIME_TO_EXPIRY_SECONDS = min(_min_exp_user, 300)  # cap 5min
 # spreads que cierran <30min). Con 10min, hay tiempo suficiente para que
 # SL=20% se mueva por tendencia antes de settle. Se exenta a `crypto_arb`
 # que está diseñado para markets ultra-cortos (5min).
-MARKET_HORIZON_MIN_SECS = int(os.getenv("MARKET_HORIZON_MIN_SECS", "600"))
+MARKET_HORIZON_MIN_SECS = int(os.getenv("MARKET_HORIZON_MIN_SECS", "300"))
 
 # Bloqueo de categorías ultra-cortas (esports live, crypto-updown 5/15min, sport
 # in-play). Default ON: a corto plazo el bot pierde plata copiando wallets que

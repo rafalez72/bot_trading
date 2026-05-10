@@ -66,6 +66,29 @@ def api_kill_switch_status() -> dict:
     return kill_switch_status()
 
 
+@app.get("/api/admin/thresholds")
+def api_thresholds_list() -> dict:
+    """Runtime values de thresholds críticos + source (db/env/default).
+    Permite diagnosticar discrepancias entre defaults code y overrides .env.
+    """
+    from src.copybot.threshold_overrides import list_overrides
+    return list_overrides()
+
+
+@app.post("/api/admin/thresholds/{name}")
+def api_thresholds_set(name: str, value: float | None = Query(None)) -> dict:
+    """Setea override DB (value=null limpia, vuelve a env/default).
+
+    Bypasea .env (que en Lenovo no es editable remotamente). Override DB
+    gana sobre env. Útil para tuneo en runtime sin restart.
+    """
+    from src.copybot.threshold_overrides import set_override
+    try:
+        return set_override(name, value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/admin/version")
 def api_version() -> dict:
     """Retorna commit SHA y timestamp del build Docker actual.

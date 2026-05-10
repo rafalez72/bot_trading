@@ -493,7 +493,9 @@ def run_pre_open_checks(conn, ctx: TradeValidationContext):
             slug = None
 
     # 6) market_too_short (Feature A) — skip crypto_arb
+    # Threshold dinámico (override DB via /api/admin/thresholds) → env → default code.
     if not synthetic and m is not None:
+        from src.copybot.threshold_overrides import get_market_horizon_min_secs
         try:
             end_date_raw = m["end_date"]
         except (KeyError, IndexError):
@@ -501,8 +503,9 @@ def run_pre_open_checks(conn, ctx: TradeValidationContext):
         end_ts = _parse_end_date_to_epoch(end_date_raw)
         if end_ts is not None:
             horizon_left = end_ts - int(time.time())
-            if horizon_left < MARKET_HORIZON_MIN_SECS:
-                _maybe_log(ctx, "market_too_short", horizon_left_s=horizon_left)
+            horizon_min = get_market_horizon_min_secs()
+            if horizon_left < horizon_min:
+                _maybe_log(ctx, "market_too_short", horizon_left_s=horizon_left, min=horizon_min)
                 return None, "market_too_short"
 
     # 7) ultrashort_market (Feature E) — skip crypto_arb
@@ -529,16 +532,23 @@ def run_pre_open_checks(conn, ctx: TradeValidationContext):
                 return None, "expires_too_soon"
 
     # 9-11) low_liquidity / low_volume / category_blocked — skip crypto_arb
+    # Thresholds dinámicos (override DB via /api/admin/thresholds) → env → default.
     cat = None
     if m:
         liq = m["liquidity"]
         vol = m["volume"]
         if not synthetic:
-            if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
-                _maybe_log(ctx, "low_liquidity", liquidity=liq, min=MIN_MARKET_LIQUIDITY_USDC)
+            from src.copybot.threshold_overrides import (
+                get_min_market_liquidity_usdc,
+                get_min_market_volume_usdc,
+            )
+            min_liq = get_min_market_liquidity_usdc()
+            min_vol = get_min_market_volume_usdc()
+            if liq is not None and liq < min_liq:
+                _maybe_log(ctx, "low_liquidity", liquidity=liq, min=min_liq)
                 return None, "low_liquidity"
-            if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
-                _maybe_log(ctx, "low_volume", volume=vol, min=MIN_MARKET_VOLUME_USDC)
+            if vol is not None and vol < min_vol:
+                _maybe_log(ctx, "low_volume", volume=vol, min=min_vol)
                 return None, "low_volume"
         cat = m["category"]
         if not synthetic and cat and cat != "(sin categoría)":
