@@ -391,6 +391,27 @@ def open_position(
                     detail=json.dumps({"error": str(order.error)[:200]}) if order.error else None)
         return None, "order_unmatched"
 
+    # Guard adicional: en LIVE real, una orden ok=True debe tener al menos
+    # un tx_hash o filled_size > 0. Si no, es un "phantom success" del SDK
+    # (response degenerada) — NO insertar live_trade zombi: queda en estado
+    # 'open' con entry_tx_hash=NULL y risk.sweep_stops loopearía intentando
+    # cerrarlo. Devolvemos como rechazo para que el reconciler decida si
+    # luego aparece on-chain.
+    if not LIVE_DRY_RUN:
+        has_evidence = bool(order.tx_hash) or (order.filled_size or 0) > 0
+        if not has_evidence:
+            log.warning(
+                "BUY ok=True sin evidencia de fill (tx_hash=%r filled=%r) — "
+                "NO inserto live_trade. cid=%s.. price=%.3f",
+                order.tx_hash, order.filled_size, condition_id[:10], price,
+            )
+            _log_reject(
+                source_wallet, condition_id, outcome_index, "BUY", price,
+                "phantom_ok_no_fill",
+                detail=json.dumps({"order_id": order.order_id, "status": order.status}),
+            )
+            return None, "phantom_ok_no_fill"
+
     actual_price = order.avg_price or price
     # Slippage pesimista para dry-run: el CLOB simulado nos devuelve el mid,
     # pero un fill real en BUY pagaría más. Ajustamos para que el PnL

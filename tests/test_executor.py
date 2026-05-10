@@ -299,3 +299,102 @@ def test_force_close_no_op_when_already_closed(isolated_db):
     with patch("src.polymarket.clob_client.place_market_order") as mock_order:
         executor.force_close(trade_id, exit_price=0.7, reason="should_be_skipped")
         assert mock_order.call_count == 0
+
+
+# ---------- open_position: no zombie INSERT ----------
+
+def test_open_position_does_not_insert_when_order_unmatched(isolated_db):
+    """Si place_market_order devuelve ok=False, NO debe haber row en live_trades.
+
+    Bug original: el flow insertaba el row antes del check de ok, dejando
+    trades zombi con status='open' y entry_tx_hash=NULL. risk.sweep_stops
+    los detectaba e intentaba cerrarlos en bucle infinito.
+    """
+    _seed_subscription()
+
+    fake_failed_order = OrderResult(
+        ok=False,
+        error="invalid amounts: maker_amount excede 2 decimales",
+        raw={"errorMsg": "400 Bad Request"},
+    )
+
+    # Snapshot del count antes del intento
+    with db() as conn:
+        before = conn.execute("SELECT COUNT(*) AS n FROM live_trades").fetchone()["n"]
+
+    with patch(
+        "src.polymarket.clob_client.place_market_order",
+        return_value=fake_failed_order,
+    ), patch(
+        "src.polymarket.clob_client.get_token_id",
+        return_value="tok-mock-12345",
+    ):
+        live_id, reject = executor.open_position(
+            source_wallet="0xtrader",
+            source_trade_id="trade-failed-1",
+            condition_id="0xcid",
+            outcome="YES",
+            outcome_index=0,
+            price=0.347,
+            timestamp=int(time.time()),
+            raw={"asset": "tok-mock-12345"},
+        )
+
+    # Caller debe ver el rechazo
+    assert live_id is None
+    assert reject == "order_unmatched"
+
+    # Y no debe haber ningún row nuevo en live_trades
+    with db() as conn:
+        after = conn.execute("SELECT COUNT(*) AS n FROM live_trades").fetchone()["n"]
+    assert after == before, (
+        f"Esperaba 0 inserts en live_trades; antes={before} despues={after}. "
+        "Si esto falla, hay un INSERT antes del check de order.ok → trades zombi."
+    )
+
+
+def test_open_position_does_not_insert_when_order_phantom_ok(isolated_db, monkeypatch):
+    """En LIVE (no dry-run), si la SDK devuelve ok=True pero sin tx_hash NI
+    filled_size > 0, debe rechazar como 'phantom_ok_no_fill' y NO insertar.
+    """
+    # Forzar LIVE_MODE en executor (no dry-run) para que dispare el guard.
+    monkeypatch.setattr(executor, "LIVE_DRY_RUN", False)
+
+    _seed_subscription()
+
+    phantom_order = OrderResult(
+        ok=True,
+        order_id="order-zombie",
+        status="matched",
+        filled_size=0.0,   # 0 fill
+        avg_price=0.347,
+        tx_hash=None,      # sin tx
+    )
+
+    with db() as conn:
+        before = conn.execute("SELECT COUNT(*) AS n FROM live_trades").fetchone()["n"]
+
+    with patch(
+        "src.polymarket.clob_client.place_market_order",
+        return_value=phantom_order,
+    ), patch(
+        "src.polymarket.clob_client.get_token_id",
+        return_value="tok-mock-12345",
+    ):
+        live_id, reject = executor.open_position(
+            source_wallet="0xtrader",
+            source_trade_id="trade-phantom-1",
+            condition_id="0xcid",
+            outcome="YES",
+            outcome_index=0,
+            price=0.347,
+            timestamp=int(time.time()),
+            raw={"asset": "tok-mock-12345"},
+        )
+
+    assert live_id is None
+    assert reject == "phantom_ok_no_fill"
+
+    with db() as conn:
+        after = conn.execute("SELECT COUNT(*) AS n FROM live_trades").fetchone()["n"]
+    assert after == before
