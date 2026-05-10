@@ -509,14 +509,29 @@ async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
 
     to_settle: list[tuple] = []
     for cid, rs in by_cid.items():
+        # Bug de gamma API: cuando el market está closed, /markets?conditionId=X
+        # IGNORA el filtro y devuelve un market arbitrario. Pasamos `closed=true`
+        # explícito para forzar el filtro y validamos el cid del response. Si
+        # no matchea, gamma nos mintió → tratamos como aún no resuelto.
+        from src.polymarket.client import GAMMA_API
         try:
-            m = await client.get_market(cid)
+            data = await client._get(
+                f"{GAMMA_API}/markets",
+                params={"conditionId": cid, "closed": "true", "limit": 1},
+            )
         except Exception:
             continue
+        m = data[0] if isinstance(data, list) and data else None
         if not m:
             continue
-        # Polymarket markets pueden mostrar `closed=true` o `outcomePrices`
-        # como [1.0, 0.0]/["1","0"] indicando resolución.
+        # Validación: el conditionId del response DEBE matchear el solicitado.
+        if (m.get("conditionId") or "").lower() != cid.lower():
+            log.debug(
+                "crypto_arb.settle: gamma devolvió cid distinto al pedido "
+                "(%s vs %s) — saltando",
+                (m.get("conditionId") or "")[:14], cid[:14],
+            )
+            continue
         outcome_prices = m.get("outcomePrices")
         # outcomePrices viene como list o JSON string en gamma
         if isinstance(outcome_prices, list):
