@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 from src.db.schema import db, tx
 
@@ -41,6 +42,19 @@ EXPLORATION_BONUS = 2.0   # constante c en UCB1
 # histórico alto pero sin actividad reciente. Aplica DESPUÉS de UCB1.
 INACTIVITY_HOURS = 24
 INACTIVITY_DECAY = 0.7
+
+# Kelly fraccional (opt-in). Si KELLY_SIZING_ENABLED=true, después del UCB
+# rebalance, sobrescribimos new_sizings[w] con el bet_size derivado de Kelly
+# fraccional 15% sobre stats del wallet últimos 30d. Default OFF (research dice
+# que full Kelly da drawdown 50-80%; conservative 15% Kelly recomendado por
+# pros). Solo afecta wallets con >= MIN_PULLS_FOR_REBALANCE closes.
+KELLY_SIZING_ENABLED = os.getenv("KELLY_SIZING_ENABLED", "false").lower() == "true"
+KELLY_FRACTION_PCT = float(os.getenv("KELLY_FRACTION_PCT", "0.15"))
+KELLY_LOOKBACK_DAYS = int(os.getenv("KELLY_LOOKBACK_DAYS", "30"))
+# Bankroll asumido para convertir Kelly bet → sizing_mult (relative). Si el
+# usuario quiere absolute USDC, debe leer kelly_sizing.fractional_bet_size
+# directamente desde el executor. Acá usamos un proxy: bet/bankroll → mult.
+KELLY_BANKROLL_USDC = float(os.getenv("KELLY_BANKROLL_USDC", "100.0"))
 
 # Floor de samples antes de aplicar size_up/size_down vía UCB:
 # con n_pulls < MIN_PULLS_FOR_REBALANCE el rebalance es ruido — un solo trade
@@ -80,6 +94,37 @@ def _refresh_arm(conn, wallet: str) -> None:
         """,
         (wallet, n, sum_reward),
     )
+
+
+def _kelly_stats_for_wallet(conn, wallet: str, lookback_days: int = KELLY_LOOKBACK_DAYS) -> tuple[float, float, float, int]:
+    """Devuelve (win_rate, avg_win, avg_loss, n) últimos `lookback_days` días.
+
+    avg_loss es magnitud positiva. Si n=0 o no hay edge calculable, devuelve ceros.
+    """
+    from src.copybot.tradebook import TABLE as TRADES_TABLE
+    r = conn.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN pnl_usdc < 0 THEN 1 ELSE 0 END) AS losses,
+            COALESCE(AVG(CASE WHEN pnl_usdc > 0 THEN pnl_usdc END), 0) AS avg_win,
+            COALESCE(AVG(CASE WHEN pnl_usdc < 0 THEN -pnl_usdc END), 0) AS avg_loss,
+            COUNT(*) AS n
+        FROM {TRADES_TABLE}
+        WHERE source_wallet = ?
+          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+          AND entry_at >= (CAST(strftime('%s','now') AS INTEGER) - ?)
+        """,
+        (wallet, lookback_days * 86400),
+    ).fetchone()
+    if not r:
+        return (0.0, 0.0, 0.0, 0)
+    n = int(r["n"] or 0)
+    wins = int(r["wins"] or 0)
+    if n <= 0:
+        return (0.0, 0.0, 0.0, 0)
+    wr = wins / n
+    return (wr, float(r["avg_win"] or 0.0), float(r["avg_loss"] or 0.0), n)
 
 
 def recompute_sizings() -> dict:
@@ -173,6 +218,29 @@ def recompute_sizings() -> dict:
                 periods = max(1, min(periods, 6))  # cap a 6 períodos para no overflow
                 decay_factor = INACTIVITY_DECAY ** periods
                 new_sizings[w] = max(SIZING_MIN, new_sizings[w] * decay_factor)
+
+        # Kelly fraccional override (opt-in via env). Para cada wallet con
+        # suficientes closes, computamos bet_size con Kelly 15% y lo convertimos
+        # a sizing_mult relativo (bet / bankroll_proxy). Wallets sin edge → 0.0.
+        # Capa al rango [SIZING_MIN, SIZING_MAX] como el resto del flujo.
+        if KELLY_SIZING_ENABLED:
+            from src.copybot.kelly_sizing import fractional_bet_size
+            for w in list(new_sizings.keys()):
+                wr, avg_win, avg_loss, n_kelly = _kelly_stats_for_wallet(conn, w)
+                if n_kelly < MIN_PULLS_FOR_REBALANCE:
+                    continue
+                bet = fractional_bet_size(
+                    bankroll_usdc=KELLY_BANKROLL_USDC,
+                    win_rate=wr,
+                    avg_win=avg_win,
+                    avg_loss=avg_loss,
+                    kelly_fraction_pct=KELLY_FRACTION_PCT,
+                )
+                if bet <= 0.0:
+                    new_sizings[w] = SIZING_MIN
+                else:
+                    mult = bet / KELLY_BANKROLL_USDC * (SIZING_MAX)  # scale a rango
+                    new_sizings[w] = max(SIZING_MIN, min(SIZING_MAX, mult))
 
         # Persistir y registrar cambios significativos.
         # Política de "muestra suficiente": con n < MIN_PULLS_FOR_REBALANCE
