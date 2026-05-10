@@ -286,6 +286,26 @@ DX_GAS_PER_FILL_USDC = float(os.getenv("DX_GAS_PER_FILL_USDC", "0.02"))
 DX_FUNDING_UPDATE_HOURS = int(os.getenv("DX_FUNDING_UPDATE_HOURS", "1"))
 DX_USE_ORDERBOOK_FILL = os.getenv("DX_USE_ORDERBOOK_FILL", "true").lower() == "true"
 
+# ---------- Market making (Nivel 3, 2026-05-10) ----------
+# En vez de tomar liquidez (copy-trades), POSTEAMOS bid+ask en buckets calientes
+# con spread fijo. Capturamos spread cuando dos contrapartes opuestas matchean
+# nuestras órdenes en el mismo bucket.
+#
+# Riesgos:
+# - Adverse selection: si el mid se mueve fuerte, una pata fillea contra info
+#   stale → pérdida. Por eso recalculamos y cancelamos cuando mid se mueve
+#   >50bps (ver MarketMaker._should_recalc).
+# - Bucket close mientras tenemos posición: settlement on-chain según resolución.
+#
+# Activación gated. NUNCA arrancar en LIVE sin paper validado 24h.
+MM_ENABLED = os.getenv("MM_ENABLED", "false").lower() == "true"
+# spread_bps: 300 = 3% spread total. Si mid=0.50 → bid=0.485, ask=0.515.
+MM_SPREAD_BPS = int(os.getenv("MM_SPREAD_BPS", "300"))
+# USDC por side (bid + ask se postean por separado).
+MM_BET_PER_SIDE_USDC = float(os.getenv("MM_BET_PER_SIDE_USDC", "2.0"))
+# Cap de pares (bid+ask) concurrentes para limitar exposición total.
+MM_MAX_CONCURRENT_PAIRS = int(os.getenv("MM_MAX_CONCURRENT_PAIRS", "5"))
+
 # ---------- Spike arbitrage (Nivel B, 2026-05-10) ----------
 # Detect movimiento brusco Binance spot → posicionar limit order en mid
 # Polymarket ANTES que ajuste. Si fillea, capturamos el delta. Si no
