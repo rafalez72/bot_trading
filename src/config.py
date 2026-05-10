@@ -337,5 +337,23 @@ ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.85
 ADVERSARIAL_ASK_PRICE = float(os.getenv("ADVERSARIAL_ASK_PRICE", "0.05"))
 ADVERSARIAL_SIZE_USDC = float(os.getenv("ADVERSARIAL_SIZE_USDC", "2.0"))
 
+# ---------- Long-horizon crypto arbitrage (Nivel 2 pivot, 2026-05-10) ----------
+# Pivot del crypto-arb 5min (orderbooks $1-5k → slippage 50-90% destructivo)
+# hacia mercados crypto LONG-HORIZON con liquidez $30k-$500k:
+# bitcoin-100k-by-end-2026, eth-reaches-X-this-week, etc. Edge: cuando spot
+# se mueve fuerte (>=2% / 1h) el mid Polymarket lagea horas/días. Posteamos
+# LIMIT BUY al mid actual y mantenemos hasta que se ajuste (o resolution).
+#
+# Filtros: liquidez >= $30k, end_date > +1 día, slug regex que matchea
+# (btc|eth|sol|xrp|bnb|doge).*-(2026|2027|monthly|weekly|by-).
+# Loop interval 5min — markets long-horizon no necesitan polling agresivo.
+# Activación gated por LONG_HORIZON_ENABLED. Validar siempre en paper antes
+# de live — ver src/copybot/long_horizon_arb.py.
+LONG_HORIZON_ENABLED = os.getenv("LONG_HORIZON_ENABLED", "false").lower() == "true"
+LONG_HORIZON_MIN_LIQ_USDC = float(os.getenv("LONG_HORIZON_MIN_LIQ_USDC", "30000"))
+LONG_HORIZON_MIN_EDGE_PCT = float(os.getenv("LONG_HORIZON_MIN_EDGE_PCT", "5"))
+LONG_HORIZON_BET_USDC = float(os.getenv("LONG_HORIZON_BET_USDC", "10"))
+LONG_HORIZON_CHECK_INTERVAL_S = int(os.getenv("LONG_HORIZON_CHECK_INTERVAL_S", "300"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)
