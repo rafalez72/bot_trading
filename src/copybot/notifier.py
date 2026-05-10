@@ -148,24 +148,24 @@ def _classify_market(pt) -> str:
     return " · ".join(parts)
 
 
-def gain(amount: float, accumulated: float, pt=None) -> None:
-    """Notif por cada trade cerrado con ganancia."""
+def gain(amount: float, accumulated: float, pt=None) -> bool:
+    """Notif por cada trade cerrado con ganancia. Retorna True si se envió."""
     if "gain" not in ENABLED_NOTIFICATIONS:
-        return
+        return False
     detail = f"\n{_classify_market(pt)}" if pt is not None else ""
-    send(
+    return send(
         f"📈 *Ganancia*\n"
         f"Ganó: ${amount:.2f}{detail}\n"
         f"Acumulado: ${accumulated:+.2f}"
     )
 
 
-def loss(amount: float, accumulated: float, pt=None) -> None:
-    """Notif por cada trade cerrado con pérdida."""
+def loss(amount: float, accumulated: float, pt=None) -> bool:
+    """Notif por cada trade cerrado con pérdida. Retorna True si se envió."""
     if "loss" not in ENABLED_NOTIFICATIONS:
-        return
+        return False
     detail = f"\n{_classify_market(pt)}" if pt is not None else ""
-    send(
+    return send(
         f"📉 *Pérdida*\n"
         f"Perdió: ${amount:.2f}{detail}\n"
         f"Acumulado: ${accumulated:+.2f}"

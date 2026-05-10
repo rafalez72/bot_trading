@@ -222,12 +222,21 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
                 """
             ).fetchone()
         accumulated = total_row["p"] or 0
+        log.info(
+            "notif.dispatch pid=%d pnl=%.2f acc=%.2f source=%s",
+            paper_trade_id, float(pnl_amount), float(accumulated),
+            (pt["source_wallet"] or "?")[:12],
+        )
         if pnl_amount > 0:
-            notif_gain(pnl_amount, accumulated, pt=pt)
+            sent = notif_gain(pnl_amount, accumulated, pt=pt)
+            log.info("notif.gain.sent pid=%d sent=%s", paper_trade_id, sent)
         elif pnl_amount < 0:
-            notif_loss(abs(pnl_amount), accumulated, pt=pt)
+            sent = notif_loss(abs(pnl_amount), accumulated, pt=pt)
+            log.info("notif.loss.sent pid=%d sent=%s", paper_trade_id, sent)
+        else:
+            log.info("notif.skip_zero_pnl pid=%d", paper_trade_id)
     except Exception as e:
-        log.warning("gain/loss notif failed: %s", e)
+        log.exception("gain/loss notif failed: %s", e)
 
     # 3) Bandit recompute (afuera de tx)
     try:
