@@ -46,6 +46,19 @@ MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "10000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
+# ---------- Kill switch HARD 3-layer (2026-05-10) ----------
+# Tres layers complementarios al DAILY_KILL_SWITCH_PCT (que es % capital
+# rolling-24h). Estos son CAPS HARD adicionales y se evalúan en orden:
+#   1) Daily $ cap   (DAILY_LOSS_CAP_USDC):       suma pnl del día UTC
+#   2) Consecutive   (MAX_CONSECUTIVE_LOSSES):    racha de N losses seguidas
+#   3) Drawdown      (MAX_DRAWDOWN_PCT):          peak-to-trough capital
+# Cada layer dispara con motivo explícito (notif Telegram detallada).
+# Default $10 = 10% del capital paper default ($100). Si el cap del bot es
+# menor, ajustar acorde.
+DAILY_LOSS_CAP_USDC = float(os.getenv("DAILY_LOSS_CAP_USDC", "10.0"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.20"))
+
 # Trailing stop: cuando la posición está +TRAIL_ACTIVATION_PCT en ganancia,
 # se activa el trailing. Si el precio cae TRAIL_DROP_PCT desde el peak,
 # se fuerza el cierre. Esto deja correr los wins grandes en vez de cortarlos
@@ -177,6 +190,18 @@ LIVE_MIN_ORDERBOOK_DEPTH_USDC = float(
 # Bump de precio para el retry de IOC. Si la primera orden no fillea,
 # re-intentamos con price * (1 + X) en BUY (peor para nosotros, mejor chance).
 LIVE_RETRY_PRICE_BUMP_PCT = float(os.getenv("LIVE_RETRY_PRICE_BUMP_PCT", "0.01"))  # 1%
+
+# Tipo de orden default para placement live. Opciones:
+#   LIMIT_FOK (default): fill-or-kill limit a precio = mid ± max_slippage_pct.
+#       Si no hay liquidez completa al limit → la orden se cancela (no fill).
+#       Defensa anti-MEV/adversarial: en thin orderbooks el slippage real
+#       puede ser 5-10x el VWAP teórico — el limit garantiza que NUNCA
+#       paguemos peor que el cap.
+#   MARKET: legacy IOC con retry (FAK). Vulnerable a slippage extremo en
+#       books thin. Solo usar para markets con depth >> bet size y como
+#       opt-in explícito.
+# Default LIMIT_FOK desde 2026-05-10 tras research sobre MEV/adversarial fills.
+LIVE_ORDER_TYPE = os.getenv("LIVE_ORDER_TYPE", "LIMIT_FOK").strip().upper()
 
 # Slippage pesimista para simulaciones dry-run en modo live. El CLOB devuelve
 # avg_price = price (mid optimista) cuando dry_run=True, lo que infla el PnL.

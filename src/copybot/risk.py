@@ -17,9 +17,12 @@ import httpx
 from src.config import (
     BOT_CAPITAL_USDC,
     DAILY_KILL_SWITCH_PCT,
+    DAILY_LOSS_CAP_USDC,
     DATA_API,
     LIVE_CAPITAL_USDC,
     LIVE_MODE,
+    MAX_CONSECUTIVE_LOSSES,
+    MAX_DRAWDOWN_PCT,
     STOP_LOSS_HORIZON_BUCKETS_S,
     STOP_LOSS_PCT,
     STOP_LOSS_PCT_LONG,
@@ -116,6 +119,215 @@ def kill_switch_status() -> dict:
 RESET_GRACE_SECONDS = 5  # ventana post-reset donde no reactivamos (race protection)
 
 
+# ---------------- Kill switch HARD: 3 layers ----------------
+# Cada layer es una guarda independiente y se evalúa en orden tras el
+# legacy DAILY_KILL_SWITCH_PCT. Si CUALQUIERA dispara, kill switch active.
+# Layers:
+#   1. daily_loss_cap     — SUM(pnl) desde 00:00 UTC <= -DAILY_LOSS_CAP_USDC
+#   2. consecutive_losses — últimos N trades cerrados son LOSS (status closed_loss/settled_loss)
+#   3. drawdown           — capital actual vs peak observado < -MAX_DRAWDOWN_PCT
+
+
+def _utc_midnight_epoch(now_ts: int) -> int:
+    """Devuelve el epoch UTC del último 00:00:00 (start del día actual UTC)."""
+    return now_ts - (now_ts % 86400)
+
+
+def _check_daily_loss_cap(now_ts: int, reset_at: int) -> tuple[bool, dict]:
+    """Layer 1: SUM(pnl) desde max(00:00 UTC, reset_at) <= -DAILY_LOSS_CAP_USDC.
+
+    Devuelve (triggered, ctx). `ctx` lleva valores (pnl, threshold) para la
+    notif. `reset_at` actúa como high-water mark: tras un reset manual los
+    losses pre-reset no cuentan más, igual que el layer legacy.
+    """
+    since = max(_utc_midnight_epoch(now_ts), reset_at)
+    sql = f"""
+        SELECT COALESCE(SUM(pnl_usdc), 0) AS pnl,
+               COUNT(*) AS n
+        FROM {TRADES_TABLE}
+        WHERE exit_at >= ?
+          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+    """
+    with db() as conn:
+        r = conn.execute(sql, (since,)).fetchone()
+    pnl = float(r["pnl"] or 0.0)
+    threshold = -float(DAILY_LOSS_CAP_USDC)
+    triggered = pnl <= threshold
+    return triggered, {
+        "layer": "daily_loss_cap",
+        "pnl": pnl,
+        "threshold": threshold,
+        "n": int(r["n"] or 0),
+        "since": since,
+    }
+
+
+def _check_consecutive_losses(now_ts: int, reset_at: int) -> tuple[bool, dict]:
+    """Layer 2: últimos MAX_CONSECUTIVE_LOSSES trades cerrados son LOSS.
+
+    Toma los N trades cerrados más recientes (post-reset) ordenados por
+    exit_at desc; si todos son LOSS dispara. `reset_at` filtra trades viejos
+    para que un reset manual limpie la racha.
+    """
+    n = max(1, int(MAX_CONSECUTIVE_LOSSES))
+    sql = f"""
+        SELECT id, status
+        FROM {TRADES_TABLE}
+        WHERE exit_at >= ?
+          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+        ORDER BY exit_at DESC, id DESC
+        LIMIT ?
+    """
+    with db() as conn:
+        rows = conn.execute(sql, (reset_at, n)).fetchall()
+    if len(rows) < n:
+        return False, {
+            "layer": "consecutive_losses",
+            "streak": 0,
+            "needed": n,
+            "ids": [],
+        }
+    losing = {"closed_loss", "settled_loss"}
+    all_loss = all(r["status"] in losing for r in rows)
+    ids = [int(r["id"]) for r in rows]
+    return all_loss, {
+        "layer": "consecutive_losses",
+        "streak": n if all_loss else 0,
+        "needed": n,
+        "ids": ids,
+    }
+
+
+def _peak_balance() -> float:
+    """Lee el peak balance persistido en bot_state. 0.0 si nunca se seteó."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM bot_state WHERE key='peak_balance_usdc'"
+        ).fetchone()
+    if not r:
+        return 0.0
+    try:
+        return float(r["value"])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _set_peak_balance(value: float) -> None:
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES ('peak_balance_usdc', ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = datetime('now')
+            """,
+            (f"{value:.6f}",),
+        )
+
+
+def _check_drawdown(now_ts: int, reset_at: int) -> tuple[bool, dict]:
+    """Layer 3: peak-to-trough drawdown del capital efectivo.
+
+    current_balance = EFFECTIVE_CAPITAL_USDC + SUM(pnl realizado post-reset).
+    peak_balance se persiste y se actualiza solo hacia arriba (high-water mark
+    monotónico). Se inicializa al cap efectivo en el primer call. Si
+    (current - peak) / peak < -MAX_DRAWDOWN_PCT → dispara.
+    """
+    sql = f"""
+        SELECT COALESCE(SUM(pnl_usdc), 0) AS pnl
+        FROM {TRADES_TABLE}
+        WHERE exit_at >= ?
+          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+    """
+    with db() as conn:
+        r = conn.execute(sql, (reset_at,)).fetchone()
+    realized = float(r["pnl"] or 0.0)
+    current = float(EFFECTIVE_CAPITAL_USDC) + realized
+
+    peak = _peak_balance()
+    if peak <= 0.0:
+        # Init: arrancamos en el cap efectivo, salvo que el balance ya esté arriba.
+        peak = max(float(EFFECTIVE_CAPITAL_USDC), current)
+        _set_peak_balance(peak)
+    elif current > peak:
+        peak = current
+        _set_peak_balance(peak)
+
+    dd_pct = (current - peak) / peak if peak > 0 else 0.0
+    triggered = dd_pct <= -float(MAX_DRAWDOWN_PCT)
+    return triggered, {
+        "layer": "drawdown",
+        "peak": peak,
+        "current": current,
+        "dd_pct": dd_pct,
+        "threshold_pct": -float(MAX_DRAWDOWN_PCT),
+    }
+
+
+def _format_layer_reason(ctx: dict) -> str:
+    """Mensaje conciso por layer para guardar en bot_state.kill_switch_reason."""
+    layer = ctx.get("layer", "?")
+    if layer == "daily_loss_cap":
+        return (
+            f"daily_loss_cap: PnL UTC ${ctx['pnl']:+.2f} "
+            f"<= ${ctx['threshold']:.2f} (n={ctx['n']})"
+        )
+    if layer == "consecutive_losses":
+        ids = ctx.get("ids", [])
+        ids_str = (
+            f"{ids[-1]}..{ids[0]}" if len(ids) >= 2 else (str(ids[0]) if ids else "?")
+        )
+        return (
+            f"consecutive_losses: {ctx['streak']} LOSS seguidos "
+            f"(ids {ids_str})"
+        )
+    if layer == "drawdown":
+        return (
+            f"drawdown: ${ctx['current']:.2f} vs peak ${ctx['peak']:.2f} "
+            f"({ctx['dd_pct']*100:+.1f}%)"
+        )
+    return f"{layer}: triggered"
+
+
+def _notify_layer(ctx: dict, reason: str) -> None:
+    """Notif Telegram extendida con detalle del layer disparado.
+
+    Reusa `kill_switch_activated(reason, pnl_24h)` del notifier existente —
+    como ya emite "⛔ KILL SWITCH ACTIVADO\\nMotivo: <reason>", incluimos el
+    detalle estructurado dentro del `reason` para no tocar el notifier.
+    """
+    layer = ctx.get("layer", "?")
+    pnl_24h = float(ctx.get("pnl", 0.0))
+    detail = reason
+    if layer == "consecutive_losses":
+        ids = ctx.get("ids", [])
+        ids_block = ", ".join(str(i) for i in reversed(ids)) if ids else "?"
+        detail = (
+            f"layer={layer}\n"
+            f"{ctx['streak']} trades consecutivos LOSS\n"
+            f"Trades: ids {ids_block}"
+        )
+    elif layer == "daily_loss_cap":
+        detail = (
+            f"layer={layer}\n"
+            f"PnL día UTC: ${ctx['pnl']:+.2f}\n"
+            f"Cap: ${-ctx['threshold']:.2f} (n trades={ctx['n']})"
+        )
+    elif layer == "drawdown":
+        detail = (
+            f"layer={layer}\n"
+            f"Balance: ${ctx['current']:.2f} (peak ${ctx['peak']:.2f})\n"
+            f"Drawdown: {ctx['dd_pct']*100:+.1f}% "
+            f"(cap {ctx['threshold_pct']*100:.0f}%)"
+        )
+    try:
+        from src.copybot.notifier import kill_switch_activated
+        kill_switch_activated(detail, pnl_24h)
+    except Exception as e:
+        log.warning("notifier failed (%s): %s", layer, e)
+
+
 def check_kill_switch() -> bool:
     """Recalcula. Devuelve True si quedó (o sigue) activo.
 
@@ -172,6 +384,23 @@ def check_kill_switch() -> bool:
             except Exception as e:
                 log.warning("notifier failed: %s", e)
         return True
+
+    # ----- Hard 3-layer kill switch -----
+    # Evaluación en orden estable. Cualquier layer que dispare → kill on.
+    # El reset_at sigue actuando como high-water mark (mismo grace window).
+    if now_ts - reset_at > RESET_GRACE_SECONDS:
+        for checker in (
+            _check_daily_loss_cap,
+            _check_consecutive_losses,
+            _check_drawdown,
+        ):
+            triggered, ctx = checker(now_ts, reset_at)
+            if triggered:
+                reason = _format_layer_reason(ctx)
+                _set_kill(True, reason)
+                if not prev_active:
+                    _notify_layer(ctx, reason)
+                return True
 
     # Auto-recovery: pnl recuperado. Si estaba activo, desactivar.
     # _set_kill(False, ...) actualiza también el reset_at para que la
