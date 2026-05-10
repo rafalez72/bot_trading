@@ -244,7 +244,13 @@ async def _safe_process_wallet(
 
 
 def _maybe_send_daily_summary() -> None:
-    """Si pasaron >=24h del último envío, manda resumen y graba ts."""
+    """Si pasaron >=24h del último envío, manda resumen y graba ts.
+
+    Incluye datos LIVE además de paper (incidente 2026-05-10: en LIVE el bot
+    perdió $76 en 50 trades sin avisar al user). El resumen consolida ambos
+    para que el user tenga un control de daño claro independientemente de las
+    notifs por trade.
+    """
     import time as _t
     with db() as conn:
         r = conn.execute(
@@ -257,14 +263,60 @@ def _maybe_send_daily_summary() -> None:
     try:
         from src.copybot.learning import summary as ls
         from src.copybot.notifier import daily_summary
+        from src.copybot.tradebook import MODE as TRADEBOOK_MODE
         s = ls()
+
+        # Para LIVE: calcular pnl_today + wins/losses + open con drawdown
+        # desde live_trades. summary() solo devuelve paper_trades.
+        pnl_today = s["today"]["pnl_usdc"]
+        wins = s["today"]["wins"]
+        losses = s["today"]["losses"]
+        open_n = s["paper"]["open"]
+        capital_used = s["capital"]["in_open_positions_usdc"]
+        capital_total = s["capital"]["total_usdc"]
+        drawdown_pct: float | None = None
+
+        if TRADEBOOK_MODE.startswith("live"):
+            from src.config import LIVE_CAPITAL_USDC
+            day_start = now - 86400
+            with db() as conn:
+                live_today = conn.execute(
+                    """
+                    SELECT
+                      COALESCE(SUM(pnl_usdc), 0) as pnl,
+                      SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) as w,
+                      SUM(CASE WHEN pnl_usdc <= 0 THEN 1 ELSE 0 END) as l
+                    FROM live_trades
+                    WHERE exit_at >= ? AND status IN
+                      ('closed_win','closed_loss','settled_win','settled_loss',
+                       'closed_external')
+                    """,
+                    (day_start,),
+                ).fetchone()
+                live_open_row = conn.execute(
+                    """
+                    SELECT COUNT(*) as n,
+                           COALESCE(SUM(entry_size_usdc), 0) as v
+                    FROM live_trades WHERE status='open'
+                    """,
+                ).fetchone()
+            pnl_today = (live_today["pnl"] or 0)
+            wins = (live_today["w"] or 0)
+            losses = (live_today["l"] or 0)
+            open_n = live_open_row["n"] or 0
+            capital_used = float(live_open_row["v"] or 0)
+            capital_total = LIVE_CAPITAL_USDC
+            if capital_total > 0:
+                drawdown_pct = max(0.0, -pnl_today) / capital_total * 100.0
+
         daily_summary(
-            pnl_today=s["today"]["pnl_usdc"],
-            wins=s["today"]["wins"],
-            losses=s["today"]["losses"],
-            open_positions=s["paper"]["open"],
-            capital_used=s["capital"]["in_open_positions_usdc"],
-            capital_total=s["capital"]["total_usdc"],
+            pnl_today=pnl_today,
+            wins=wins,
+            losses=losses,
+            open_positions=open_n,
+            capital_used=capital_used,
+            capital_total=capital_total,
+            drawdown_pct=drawdown_pct,
             active_traders=s["copying"]["active"],
             dropped_traders=s["copying"]["dropped"],
         )

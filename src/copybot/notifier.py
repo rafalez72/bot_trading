@@ -47,6 +47,7 @@ ENABLED_NOTIFICATIONS = {
     "hl_close",  # cierres del bot HL paralelo (dry-run)
     "dx_close",  # cierres del bot dYdX v4 paralelo (dry-run)
     "live_phantom",  # cierres "fantasma" (closed_external por cleanup on-chain)
+    "daily_summary",  # resumen 24h con PnL y métricas
 }
 
 
@@ -219,9 +220,45 @@ def big_take_profit(*args, **kwargs) -> None:
         pass
 
 
-def daily_summary(**kwargs) -> None:
-    if "daily_summary" in ENABLED_NOTIFICATIONS:
-        pass
+def daily_summary(
+    *,
+    pnl_today: float = 0.0,
+    wins: int = 0,
+    losses: int = 0,
+    open_positions: int = 0,
+    capital_used: float = 0.0,
+    capital_total: float = 0.0,
+    drawdown_pct: float | None = None,
+    active_traders: int | None = None,
+    dropped_traders: int | None = None,
+    **_extra,
+) -> bool:
+    """Resumen diario rolling 24h. Devuelve True si se envió.
+
+    Datos críticos: PnL, wins/losses, capital usado vs total, drawdown.
+    Pensado para que el usuario tenga un control de daño claro aunque
+    no esté revisando trades individuales.
+    """
+    if "daily_summary" not in ENABLED_NOTIFICATIONS:
+        return False
+    total = wins + losses
+    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+    cap_pct = (capital_used / capital_total * 100.0) if capital_total > 0 else 0.0
+    dd_str = f"{drawdown_pct:.1f}%" if drawdown_pct is not None else "n/a"
+    sign = "🟢" if pnl_today >= 0 else "🔴"
+    txt = (
+        f"📊 *Resumen 24h*\n"
+        f"Trades: {total} ({wins}W / {losses}L · {win_rate:.0f}%)\n"
+        f"PnL: {sign} ${pnl_today:+.2f}\n"
+        f"Capital: ${capital_used:.2f} / ${capital_total:.2f} ({cap_pct:.0f}%)\n"
+        f"Posiciones abiertas: {open_positions}\n"
+        f"Drawdown: {dd_str}"
+    )
+    if active_traders is not None:
+        txt += f"\nTraders activos: {active_traders}"
+        if dropped_traders is not None:
+            txt += f" · droppeados: {dropped_traders}"
+    return send(txt, silent=True)
 
 
 # ---------- Live trading (Fase 5) ----------
