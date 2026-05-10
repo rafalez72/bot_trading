@@ -51,8 +51,18 @@ from src.config import (
     HEDGE_MAX_FUNDING_RATE,
     HEDGE_MIN_EDGE,
 )
+from src.config import DB_PATH
 from src.copybot.crypto_arb_signals import edge_vs_mid, get_min_edge
-from src.copybot.tradebook import MODE as TRADEBOOK_MODE, open_position
+from src.copybot.tradebook import (
+    MODE as TRADEBOOK_MODE,
+    TABLE as TRADEBOOK_TABLE,
+    open_position,
+)
+
+# Outbox para rows de hedge_trades que no se pudieron persistir (DB locked
+# o exception transitoria). Drena en el próximo startup vía
+# :func:`drain_hedge_outbox`. Mismo pattern que executor.LIVE_OUTBOX_PATH.
+HEDGE_OUTBOX_PATH = DB_PATH.parent / "hedge_trades_outbox.jsonl"
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +154,7 @@ CREATE TABLE IF NOT EXISTS hedge_trades (
     symbol             TEXT,
     side               TEXT,
     poly_trade_id      INTEGER,
+    poly_trade_table   TEXT,
     perp_order_id      TEXT,
     perp_qty           REAL,
     perp_entry_price   REAL,
@@ -167,6 +178,7 @@ CREATE TABLE IF NOT EXISTS hedge_trades (
     symbol             TEXT,
     side               TEXT,
     poly_trade_id      BIGINT,
+    poly_trade_table   TEXT,
     perp_order_id      TEXT,
     perp_qty           DOUBLE PRECISION,
     perp_entry_price   DOUBLE PRECISION,
@@ -189,12 +201,21 @@ _TABLE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_hedge_opened_at ON hedge_trades(opened_at DESC)",
 ]
 
+# Migración idempotente: ``poly_trade_table`` se agregó después del primer
+# release del schema. ALTER TABLE ... ADD COLUMN IF NOT EXISTS es soportado
+# por SQLite ≥3.35 y Postgres ≥9.6 — ambos casos cubiertos.
+_MIGRATIONS = [
+    "ALTER TABLE hedge_trades ADD COLUMN poly_trade_table TEXT",
+]
+
 
 def init_table() -> None:
     """Crea la tabla ``hedge_trades`` + índices si no existen.
 
     Idempotente. Compatible SQLite + Postgres (el wrapper traduce
-    INTEGER PRIMARY KEY AUTOINCREMENT → BIGSERIAL).
+    INTEGER PRIMARY KEY AUTOINCREMENT → BIGSERIAL). También aplica
+    migraciones aditivas (ALTER TABLE ADD COLUMN) ignorando errores de
+    "columna ya existe" para mantener la idempotencia.
     """
     try:
         from src.db.schema import db, BACKEND
@@ -203,6 +224,21 @@ def init_table() -> None:
             conn.execute(ddl)
             for ix in _TABLE_INDEXES:
                 conn.execute(ix)
+            # Migraciones: best-effort. Si la columna ya existe, el motor
+            # tira error que ignoramos (idempotencia). Cualquier otro error
+            # también se traga porque rompe el arranque del loop sino, y
+            # el resto del schema ya está OK.
+            for stmt in _MIGRATIONS:
+                try:
+                    conn.execute(stmt)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "duplicate column" in msg or "already exists" in msg:
+                        continue
+                    log.debug(
+                        "crypto_arb_hedge.init_table migration skipped: %s (%s)",
+                        stmt, e,
+                    )
     except Exception:
         log.exception("crypto_arb_hedge.init_table failed")
 
@@ -579,6 +615,7 @@ class CryptoArbHedge:
             "symbol": decision["symbol"],
             "side": decision["outcome"],
             "poly_trade_id": poly_pid,
+            "poly_trade_table": TRADEBOOK_TABLE,
             "perp_order_id": perp_resp.get("order_id"),
             "perp_qty": perp_qty,
             "perp_entry_price": perp_resp.get("avg_price"),
@@ -594,17 +631,18 @@ class CryptoArbHedge:
                 cur = conn.execute(
                     """
                     INSERT INTO hedge_trades
-                        (bucket_slug, symbol, side, poly_trade_id,
+                        (bucket_slug, symbol, side, poly_trade_id, poly_trade_table,
                          perp_order_id, perp_qty, perp_entry_price,
                          spot_at_entry, edge_at_open, status,
                          opened_at, raw)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         bucket_slug,
                         decision["symbol"],
                         decision["outcome"],
                         poly_pid,
+                        TRADEBOOK_TABLE,
                         perp_resp.get("order_id"),
                         perp_qty,
                         perp_resp.get("avg_price"),
@@ -617,12 +655,23 @@ class CryptoArbHedge:
                 )
                 # SQLite expone lastrowid; PG wrapper también.
                 record["id"] = getattr(cur, "lastrowid", None)
-        except Exception:
+        except Exception as e:
+            # Fallback outbox — si la pierna perp ya está abierta on-chain,
+            # NO podemos perder este row (la position queda "huérfana" sin
+            # tracking). Escribimos a disco para que el próximo startup la
+            # recupere/concilie.
             log.exception(
-                "crypto_arb_hedge.persist_failed slug=%s — row no se grabó",
+                "crypto_arb_hedge.persist_failed slug=%s — escribiendo a outbox",
                 bucket_slug,
             )
             record["id"] = None
+            try:
+                _write_hedge_outbox(record, error=str(e)[:300])
+            except Exception:
+                log.exception(
+                    "crypto_arb_hedge.outbox_write_failed slug=%s — "
+                    "exposure SIN tracking!", bucket_slug,
+                )
         return record
 
     async def close_perp_for_hedge(
@@ -697,8 +746,311 @@ class CryptoArbHedge:
         except Exception:
             log.exception("crypto_arb_hedge.close_perp persist failed hedge_id=%d", hedge_id)
 
+        # Notif Telegram (fix bug #4): close_perp_for_hedge era silente —
+        # solo metrics, ningún notif al user. Ahora gain/loss con acumulado
+        # strategy-specific (sum pnl_total de hedge_trades closed).
+        try:
+            _notify_hedge_closed(
+                hedge_id=hedge_id, symbol=symbol, pnl_total=total_pnl,
+            )
+        except Exception:
+            log.exception(
+                "crypto_arb_hedge.close_perp notif failed hedge_id=%d", hedge_id,
+            )
+
         self.metrics.closes_ok += 1
         return True, perp_resp
+
+
+# --- Outbox (persistencia anti-locked DB) ---
+
+def _write_hedge_outbox(record: dict, *, error: str | None = None) -> None:
+    """Escribe un record al outbox JSONL (best-effort, atómico por línea).
+
+    Llamado cuando el INSERT a ``hedge_trades`` falla. El record incluye
+    suficiente info para que ``drain_hedge_outbox()`` lo reinserte al
+    startup. Notifica vía Telegram porque significa que hay una posición
+    perp abierta on-chain sin tracking en DB → urgente.
+    """
+    payload = {
+        "queued_at": int(time.time()),
+        "last_error": error,
+        "record": record,
+    }
+    HEDGE_OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HEDGE_OUTBOX_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, separators=(",", ":"), default=str) + "\n")
+    try:
+        from src.copybot.notifier import send
+        send(
+            f"⚠️ *HEDGE OUTBOX*: hedge_trades INSERT falló. "
+            f"slug=`{record.get('bucket_slug','?')[:30]}` "
+            f"perp_oid=`{(record.get('perp_order_id') or 'none')[:14]}` "
+            f"poly_pid=`{record.get('poly_trade_id','?')}` "
+            f"— exposure perp posible sin tracking, revisar!"
+        )
+    except Exception:
+        pass
+
+
+def drain_hedge_outbox() -> int:
+    """Drena ``HEDGE_OUTBOX_PATH`` al startup. Idempotente por (slug, perp_order_id).
+
+    Reinserta cada record en ``hedge_trades`` si todavía no existe. Las
+    líneas que vuelven a fallar quedan en el outbox para el próximo intento.
+
+    Devuelve cantidad de rows drenados (insertados o ya presentes).
+    """
+    if not HEDGE_OUTBOX_PATH.exists():
+        return 0
+    try:
+        with open(HEDGE_OUTBOX_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("drain_hedge_outbox: no se pudo leer %s: %s", HEDGE_OUTBOX_PATH, e)
+        return 0
+
+    drained = 0
+    failed: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            rec = entry.get("record") if isinstance(entry, dict) else None
+            if not rec:
+                continue
+            try:
+                from src.db.schema import db, tx
+                # Dedupe: si ya existe row con mismo perp_order_id, skip.
+                perp_oid = rec.get("perp_order_id")
+                if perp_oid:
+                    with db() as conn:
+                        dup = conn.execute(
+                            "SELECT id FROM hedge_trades WHERE perp_order_id=?",
+                            (perp_oid,),
+                        ).fetchone()
+                        if dup:
+                            drained += 1
+                            continue
+                with tx() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO hedge_trades
+                            (bucket_slug, symbol, side, poly_trade_id, poly_trade_table,
+                             perp_order_id, perp_qty, perp_entry_price,
+                             spot_at_entry, edge_at_open, status, opened_at, raw)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            rec.get("bucket_slug"),
+                            rec.get("symbol"),
+                            rec.get("side"),
+                            rec.get("poly_trade_id"),
+                            rec.get("poly_trade_table"),
+                            rec.get("perp_order_id"),
+                            rec.get("perp_qty"),
+                            rec.get("perp_entry_price"),
+                            rec.get("spot_at_entry"),
+                            rec.get("edge_at_open"),
+                            rec.get("status") or "open",
+                            rec.get("opened_at") or int(time.time()),
+                            json.dumps(rec.get("raw") or {}, separators=(",", ":"), default=str),
+                        ),
+                    )
+                drained += 1
+            except Exception as e:
+                log.warning(
+                    "drain_hedge_outbox: INSERT aún falla (slug=%s): %s",
+                    rec.get("bucket_slug"), e,
+                )
+                failed.append(line)
+        except json.JSONDecodeError:
+            continue
+
+    try:
+        if failed:
+            tmp = HEDGE_OUTBOX_PATH.with_suffix(".jsonl.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(failed) + "\n")
+            tmp.replace(HEDGE_OUTBOX_PATH)
+        else:
+            HEDGE_OUTBOX_PATH.unlink()
+    except Exception as e:
+        log.warning("drain_hedge_outbox: cleanup outbox failed: %s", e)
+
+    if drained:
+        log.warning(
+            "drain_hedge_outbox: %d hedge_trades drenados al startup (de %d)",
+            drained, len(lines),
+        )
+    return drained
+
+
+# --- Recovery de orphans ---
+
+async def recover_orphan_perps(
+    perp_client_factory: Callable[[], Any] | None = None,
+    *,
+    notifier: Callable[[str], None] | None = None,
+) -> int:
+    """Recovery de hedge_trades con status='leg_failed' y perp_order_id seteado.
+
+    Caso de uso:
+      - Runner abrió poly OK + perp OK, pero crasheo antes de marcar status='open'.
+      - O bien: persist falló y la pierna perp quedó abierta on-chain.
+
+    Procedimiento:
+      1. Query rows ``status='leg_failed' AND perp_order_id IS NOT NULL``.
+      2. Para cada → ``perp_client.get_position(symbol)``: si qty != 0 → close.
+      3. Update ``status='recovered'`` (ya no es leg_failed, lo cerramos).
+      4. Notif Telegram urgente.
+
+    Args:
+        perp_client_factory: callable que devuelve un context-manager
+            ``BinancePerpClient``-like. Default: ``lambda: BinancePerpClient()``.
+            Inyectable para tests (mock client).
+        notifier: callable sync para notificar (default: ``notifier.send``).
+
+    Devuelve cantidad de orphans recuperados (cerrados o sin position abierta).
+    """
+    try:
+        from src.db.schema import db, tx
+    except Exception:
+        log.exception("recover_orphan_perps: no se pudo importar schema")
+        return 0
+
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, perp_order_id, perp_qty, bucket_slug
+                FROM hedge_trades
+                WHERE status='leg_failed' AND perp_order_id IS NOT NULL
+                """,
+            ).fetchall()
+    except Exception:
+        log.exception("recover_orphan_perps: query failed")
+        return 0
+
+    if not rows:
+        return 0
+
+    log.warning(
+        "recover_orphan_perps: %d orphans candidatos a recuperar", len(rows),
+    )
+
+    if perp_client_factory is None:
+        def perp_client_factory():  # noqa: E306
+            return BinancePerpClient()
+
+    if notifier is None:
+        try:
+            from src.copybot.notifier import send as _send
+            notifier = _send
+        except Exception:
+            notifier = lambda _t: None  # noqa: E731
+
+    recovered = 0
+    for r in rows:
+        hedge_id = r["id"] if hasattr(r, "__getitem__") else r[0]
+        symbol = r["symbol"] if hasattr(r, "__getitem__") else r[1]
+        perp_oid = r["perp_order_id"] if hasattr(r, "__getitem__") else r[2]
+        perp_qty_db = r["perp_qty"] if hasattr(r, "__getitem__") else r[3]
+        slug = r["bucket_slug"] if hasattr(r, "__getitem__") else r[4]
+
+        try:
+            async with perp_client_factory() as client:
+                pos = await client.get_position(symbol, position_side="SHORT")
+                qty = abs(float(pos.get("qty") or 0.0))
+                if qty > 1e-9:
+                    log.warning(
+                        "recover_orphan_perps: closing orphan hedge_id=%s symbol=%s qty=%.6f",
+                        hedge_id, symbol, qty,
+                    )
+                    await client.close_position(
+                        symbol=symbol, position_side="SHORT", quantity=qty,
+                    )
+                else:
+                    log.info(
+                        "recover_orphan_perps: hedge_id=%s symbol=%s sin position "
+                        "abierta on-chain — solo update status", hedge_id, symbol,
+                    )
+        except Exception:
+            log.exception(
+                "recover_orphan_perps: fail closing hedge_id=%s — dejo status='leg_failed'",
+                hedge_id,
+            )
+            continue
+
+        try:
+            with tx() as conn:
+                conn.execute(
+                    "UPDATE hedge_trades SET status='recovered', closed_at=? WHERE id=?",
+                    (int(time.time()), hedge_id),
+                )
+            recovered += 1
+            try:
+                notifier(
+                    f"🚨 *HEDGE RECOVERY*: orphan perp cerrado. "
+                    f"slug=`{(slug or '?')[:30]}` symbol=`{symbol}` "
+                    f"qty=`{perp_qty_db}` hedge_id=`{hedge_id}`"
+                )
+            except Exception:
+                pass
+        except Exception:
+            log.exception(
+                "recover_orphan_perps: update status failed hedge_id=%s",
+                hedge_id,
+            )
+
+    if recovered:
+        log.warning(
+            "recover_orphan_perps: %d orphans recuperados (de %d)",
+            recovered, len(rows),
+        )
+    return recovered
+
+
+# --- Notif coverage (fix bug #4): hedge close helper ---
+
+def _accumulated_hedge_pnl() -> float:
+    """Suma pnl_total_usdc de hedge_trades closed."""
+    try:
+        from src.db.schema import db
+        with db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(SUM(pnl_total_usdc), 0) AS s FROM hedge_trades "
+                "WHERE status='closed' AND pnl_total_usdc IS NOT NULL"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            return float(row["s"] or 0.0)
+    except Exception:
+        log.exception("crypto_arb_hedge._accumulated_hedge_pnl failed")
+        return 0.0
+
+
+def _notify_hedge_closed(
+    *, hedge_id: int, symbol: str, pnl_total: float,
+) -> None:
+    """Dispara notif Telegram al cerrar un hedge_trade (fix bug #4)."""
+    if abs(pnl_total) < 1e-9:
+        return
+    from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+    accumulated = _accumulated_hedge_pnl()
+    pt = {
+        "raw": {
+            "slug": (symbol or "").lower(),
+            "title": f"hedge {symbol} #{hedge_id}",
+        },
+    }
+    if pnl_total > 0:
+        notif_gain(pnl_total, accumulated, pt=pt, bucket_label="hedge")
+    else:
+        notif_loss(abs(pnl_total), accumulated, pt=pt, bucket_label="hedge")
 
 
 # --- Helpers ---
@@ -716,22 +1068,119 @@ def _client_order_id(slug: str, action: str) -> str:
     return cid[:36]
 
 
+# --- Detector wiring (bug #7) ---
+
+# Pre-close window: solo evaluamos buckets que cierran en próximos 180s.
+# El edge del lag aparece sobre todo en los últimos 1-3 min del bucket 5min.
+_PRE_CLOSE_WINDOW_S = 180.0
+_MIN_BUCKET_AGE_S = 60.0
+_SPOT_HISTORY_CAP = 360  # ~6 min × 1 msg/s
+
+
+def _hedge_match_to_symbol(slug_prefix: str) -> str | None:
+    """Mapa slug-prefix → symbol Binance. Reusa el dict de crypto_arb (readonly)."""
+    try:
+        from src.copybot.crypto_arb import SLUG_PREFIX_TO_SYMBOL
+        return SLUG_PREFIX_TO_SYMBOL.get(slug_prefix)
+    except Exception:
+        return None
+
+
+def _hedge_evaluate_setup(
+    market: dict,
+    config: HedgeConfig,
+    spot_history: dict[str, list[tuple[int, float]]],
+    binance_ws: Any,
+) -> dict | None:
+    """Evalúa un market y devuelve setup dict listo para ``evaluate_and_open``.
+
+    Usa ``edge_vs_mid`` con el threshold del hedge (más bajo que crypto_arb
+    puro porque el delta-hedge anula el riesgo direccional). Devuelve None
+    si skip (fuera de ventana, sin spot history, edge insuficiente, etc.).
+    """
+    from src.copybot.crypto_arb import _market_midpoint  # readonly import
+
+    now = int(time.time())
+    end_ts = market.get("_end_ts")
+    if not end_ts:
+        return None
+    secs_to_close = end_ts - now
+    if secs_to_close <= 0 or secs_to_close > _PRE_CLOSE_WINDOW_S:
+        return None
+
+    symbol = _hedge_match_to_symbol(market.get("_slug_prefix", ""))
+    if not symbol or symbol not in config.symbols:
+        return None
+
+    last = binance_ws.get_price(symbol)
+    if last is None:
+        return None
+    cur_price, _ = last
+
+    bucket_start_ts = end_ts - 300
+    if (now - bucket_start_ts) < _MIN_BUCKET_AGE_S:
+        return None
+
+    history = spot_history.get(symbol) or []
+    start_price = None
+    for ts_ms, p in history:
+        if abs((ts_ms // 1000) - bucket_start_ts) < 10:
+            start_price = p
+            break
+    if start_price is None:
+        return None
+
+    move_pct = (cur_price / start_price - 1.0) * 100.0
+    mid_up = _market_midpoint(market.get("outcomePrices"), 0)
+    if mid_up is None:
+        return None
+
+    edge, side_label, _p_up = edge_vs_mid(
+        spot_move_pct=move_pct,
+        secs_left=float(secs_to_close),
+        symbol=symbol,
+        mid_up=mid_up,
+        threshold=config.min_edge,
+    )
+    if side_label is None or edge < config.min_edge:
+        return None
+
+    outcome_index = 0 if side_label == "Up" else 1
+    mid_for_side = mid_up if outcome_index == 0 else (1.0 - mid_up)
+
+    return {
+        "bucket_slug": market.get("slug") or "",
+        "condition_id": market.get("conditionId") or "",
+        "outcome": side_label,
+        "outcome_index": outcome_index,
+        "symbol": symbol,
+        "spot_now": cur_price,
+        "secs_to_close": float(secs_to_close),
+        "spot_move_pct": move_pct,
+        "mid_up": mid_up,
+        "mid_for_side": mid_for_side,
+        "end_ts": end_ts,
+    }
+
+
 # --- Loop entrypoint (live wiring) ---
 
 async def crypto_arb_hedge_loop() -> None:
-    """Loop principal del orchestrator.
+    """Loop principal del orchestrator delta-hedged.
 
     Diseño:
-    - Reusa la detección de signals de ``crypto_arb`` (no la duplicamos).
-    - Cada ciclo: pre-checks de margen + funding rate, luego para cada market
-      activo en ventana de pre-close evalúa edge y dispara open atómico.
-    - Settlement post bucket-end: cierre del perp + actualización
-      hedge_trades.
+    - Mantenemos un ``BinanceTickerWS`` con history de spot prices para los
+      símbolos hedgeables (mismo set que crypto_arb).
+    - Cada ``check_interval_s``: listamos markets crypto-updown vía
+      ``PolymarketClient`` y para cada uno en ventana de pre-close evaluamos
+      edge contra el mid Polymarket; si edge ≥ HEDGE_MIN_EDGE → dispatch a
+      ``CryptoArbHedge.evaluate_and_open`` (que abre Polymarket + Binance
+      perp SHORT atómicamente).
 
-    NOTA: este loop es un wireframe. La integración detallada con
-    ``crypto_arb._list_active_updown_markets`` + ``_evaluate_market`` se hace
-    en el deploy step. Acá dejamos el skeleton para que ``runner.py`` lo
-    arranque vía ``asyncio.create_task`` cuando ``HEDGE_ENABLED=true``.
+    Recovery al startup:
+    - ``drain_hedge_outbox()``: rows que no se persistieron antes del crash.
+    - ``recover_orphan_perps()``: cierra cualquier SHORT que quedó on-chain
+      sin tracking en DB.
     """
     config = HedgeConfig.from_env()
     if not config.enabled:
@@ -745,8 +1194,28 @@ async def crypto_arb_hedge_loop() -> None:
         config.max_funding_rate, ",".join(config.symbols), TRADEBOOK_MODE,
     )
 
-    # Crear tabla on-demand. No queremos modificar src/db/schema.py.
+    # Crear tabla on-demand + migraciones. No queremos modificar src/db/schema.py.
     init_table()
+
+    # Recovery: primero drenamos outbox (rows pendientes), después buscamos
+    # orphan perps (positions abiertas sin tracking en DB). Ambos no-op si
+    # no hay nada que recuperar.
+    try:
+        n_out = drain_hedge_outbox()
+        if n_out:
+            log.warning("crypto_arb_hedge: drenados %d rows del outbox", n_out)
+    except Exception:
+        log.exception("crypto_arb_hedge: drain_hedge_outbox failed (continuando)")
+
+    if os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET"):
+        try:
+            n_rec = await recover_orphan_perps()
+            if n_rec:
+                log.warning(
+                    "crypto_arb_hedge: recuperados %d orphan perps", n_rec,
+                )
+        except Exception:
+            log.exception("crypto_arb_hedge: recover_orphan_perps failed (continuando)")
 
     # Setup hedge mode + leverage por símbolo (idempotente). Si la cuenta no
     # tiene credenciales (paper), saltamos esta fase silenciosamente.
@@ -767,12 +1236,78 @@ async def crypto_arb_hedge_loop() -> None:
 
     orch = CryptoArbHedge(config=config)
 
-    # El detalle del loop (detección signals + dispatch a evaluate_and_open)
-    # se conecta cuando HEDGE_ENABLED se ponga true en deploy. Por ahora,
-    # mantenemos el orchestrator listo y el sleep esperando la integración.
-    while config.enabled:
-        orch.metrics.cycles += 1
-        await asyncio.sleep(config.check_interval_s)
+    # Imports readonly del detector — reusamos infra de crypto_arb sin tocar
+    # ese módulo (otros agents lo están modificando en paralelo).
+    from src.binance.websocket import BinanceTickerWS
+    from src.polymarket.client import PolymarketClient
+    from src.copybot.crypto_arb import _list_active_updown_markets
+
+    # History de spot por símbolo. Cap para evitar leak.
+    spot_history: dict[str, list[tuple[int, float]]] = {s: [] for s in config.symbols}
+
+    async def _on_tick(symbol: str, price: float, ts_ms: int) -> None:
+        h = spot_history.setdefault(symbol, [])
+        h.append((ts_ms, price))
+        if len(h) > _SPOT_HISTORY_CAP:
+            del h[: len(h) - _SPOT_HISTORY_CAP]
+
+    binance_ws = BinanceTickerWS(symbols=config.symbols, on_tick=_on_tick)
+    binance_task = asyncio.create_task(binance_ws.run(), name="hedge-binance-ws")
+
+    # Warmup: necesitamos al menos _MIN_BUCKET_AGE_S de muestras para poder
+    # leer el spot al inicio del bucket de 5min.
+    log.info(
+        "crypto_arb_hedge: warmup %ss para acumular spot history…",
+        _MIN_BUCKET_AGE_S,
+    )
+    await asyncio.sleep(_MIN_BUCKET_AGE_S + 5)
+
+    try:
+        async with PolymarketClient() as client:
+            while True:
+                orch.metrics.cycles += 1
+                try:
+                    markets = await asyncio.wait_for(
+                        _list_active_updown_markets(client), timeout=30,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("crypto_arb_hedge: list markets timeout — sigo")
+                    markets = []
+                except Exception:
+                    log.exception("crypto_arb_hedge: list markets error")
+                    markets = []
+
+                for m in markets:
+                    setup = _hedge_evaluate_setup(m, config, spot_history, binance_ws)
+                    if not setup:
+                        continue
+                    try:
+                        record, err = await orch.evaluate_and_open(**setup)
+                        if record:
+                            log.info(
+                                "crypto_arb_hedge.cycle_open slug=%s",
+                                setup["bucket_slug"],
+                            )
+                        elif err:
+                            log.debug(
+                                "crypto_arb_hedge.cycle_skip slug=%s err=%s",
+                                setup["bucket_slug"], err,
+                            )
+                    except Exception:
+                        log.exception(
+                            "crypto_arb_hedge.evaluate_and_open exception slug=%s",
+                            setup.get("bucket_slug"),
+                        )
+
+                await asyncio.sleep(config.check_interval_s)
+    finally:
+        binance_ws.stop()
+        binance_task.cancel()
+        try:
+            await binance_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        log.info("crypto_arb_hedge: loop terminado")
 
 
 __all__ = [
@@ -780,4 +1315,7 @@ __all__ = [
     "HedgeConfig",
     "init_table",
     "crypto_arb_hedge_loop",
+    "recover_orphan_perps",
+    "drain_hedge_outbox",
+    "HEDGE_OUTBOX_PATH",
 ]

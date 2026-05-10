@@ -146,7 +146,16 @@ def place_limit_order(
     `OrderType.GTC` y devolver el `order_id` para tracking.
 
     Hasta entonces este stub devuelve un fake order_id determinístico.
+
+    LIVE_MODE: si está activo, levanta NotImplementedError loud — silent
+    failure en LIVE es peor que crash (ver docs/PRE_LIVE_AUDIT.md bug #5).
     """
+    from src.config import LIVE_MODE
+    if LIVE_MODE:
+        raise NotImplementedError(
+            "market_maker.place_limit_order: stub no implementado para LIVE_MODE. "
+            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.place_limit_order_gtc."
+        )
     fake_id = f"STUB-{token_id[:10]}-{side}-{int(price * 10000)}"
     log.debug(
         "[MM-STUB] place_limit_order token=%s.. side=%s price=%.4f size=%.2f → %s",
@@ -161,7 +170,15 @@ def cancel_order(order_id: str) -> bool:
     TODO(market_maker): integrar `client.cancel_order(order_id)` del SDK
     py-clob-client-v2. El SDK lo soporta — solo hay que wrappearlo con
     el manejo de error estándar (return bool, log on failure).
+
+    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
     """
+    from src.config import LIVE_MODE
+    if LIVE_MODE:
+        raise NotImplementedError(
+            "market_maker.cancel_order: stub no implementado para LIVE_MODE. "
+            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.cancel_order."
+        )
     log.debug("[MM-STUB] cancel_order id=%s", order_id)
     return True
 
@@ -175,7 +192,15 @@ def get_open_orders() -> list[dict]:
     interna — está bien para el skeleton, pero en producción hay que
     reconciliar contra el server (la orden puede haber sido cancelada
     en el book sin que nuestro DB lo sepa).
+
+    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
     """
+    from src.config import LIVE_MODE
+    if LIVE_MODE:
+        raise NotImplementedError(
+            "market_maker.get_open_orders: stub no implementado para LIVE_MODE. "
+            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con clob_client.get_orders()."
+        )
     _ensure_schema()
     rows: list[dict] = []
     try:
@@ -208,7 +233,15 @@ def get_fills_since(since_ts: int) -> list[dict]:
     Por ahora devuelve []: el caller debe asumir que el fill detection
     no está conectado y los reconciles vienen via la tabla `mm_orders`
     cuando manualmente se marca status='filled'. NO usar en producción.
+
+    LIVE_MODE: raise NotImplementedError (silent fail en live = peor).
     """
+    from src.config import LIVE_MODE
+    if LIVE_MODE:
+        raise NotImplementedError(
+            "market_maker.get_fills_since: stub no implementado para LIVE_MODE. "
+            "Ver docs/PRE_LIVE_AUDIT.md bug #5. Wire-up con data-api/trades?user=funder."
+        )
     log.debug("[MM-STUB] get_fills_since since=%d → []", since_ts)
     return []
 
@@ -544,6 +577,11 @@ class MarketMaker:
 
         Calcula PnL para cada mm_order filled de ese cid y lo persiste.
         Devuelve {n_settled, pnl_usdc_total}.
+
+        Notif Telegram: si el PnL neto del bucket es != 0, llamamos a
+        notifier.gain/loss con el acumulado strategy-specific (SUM pnl_usdc
+        de mm_orders status='settled') para que el user se entere de cierres
+        — antes era silente (ver docs/PRE_LIVE_AUDIT.md bug #4).
         """
         _ensure_schema()
         n_settled = 0
@@ -581,7 +619,61 @@ class MarketMaker:
         # Limpiamos el state (ya no estamos cotizando ese cid).
         self._pairs.pop(condition_id, None)
 
+        # Notif Telegram (fix bug #4): mm cierre era silente — disparamos
+        # gain/loss con el acumulado strategy-specific (sum pnl_usdc settled).
+        if n_settled > 0 and abs(pnl_total) > 1e-9:
+            try:
+                _notify_mm_settled(
+                    condition_id=condition_id, pnl=pnl_total,
+                )
+            except Exception:
+                log.exception("settle_bucket notif failed cid=%s", condition_id[:10])
+
         return {"n_settled": n_settled, "pnl_usdc_total": pnl_total}
+
+
+def _accumulated_mm_pnl() -> float:
+    """Devuelve la suma de pnl_usdc de mm_orders status='settled'.
+
+    Útil para que el notif del MM muestre un "Acumulado MM" propio de la
+    strategy, no contaminado con el acumulado de N1 copybot.
+    """
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usdc), 0) AS s FROM mm_orders "
+                "WHERE status='settled' AND pnl_usdc IS NOT NULL"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            return float(row["s"] or 0.0)
+    except Exception:
+        log.exception("_accumulated_mm_pnl failed")
+        return 0.0
+
+
+def _notify_mm_settled(*, condition_id: str, pnl: float) -> None:
+    """Dispara notif Telegram para cierre de bucket MM.
+
+    Fix bug #4: cierres de market_maker eran silentes hasta hoy. Ahora
+    llamamos a notifier.gain/loss con un pt={'raw': ...} para que
+    classify_market clasifique correctamente.
+    """
+    from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+    accumulated = _accumulated_mm_pnl()
+    # pt sintético: pasamos condition_id como slug para que classify_market
+    # lo pueda categorizar (matchea pattern crypto si aplica).
+    pt = {
+        "raw": {
+            "slug": condition_id,
+            "title": f"MM bucket {condition_id[:12]}",
+        },
+    }
+    if pnl > 0:
+        notif_gain(pnl, accumulated, pt=pt, bucket_label="MM")
+    elif pnl < 0:
+        notif_loss(abs(pnl), accumulated, pt=pt, bucket_label="MM")
 
 
 # --------------------------------------------------------------------------- #

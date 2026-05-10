@@ -248,13 +248,37 @@ def record_signal(
         return None
 
 
+def _accumulated_adv_pnl() -> float:
+    """Suma pnl_usdc de adversarial_orders cerradas."""
+    try:
+        from src.db.schema import db
+        with db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usdc), 0) AS s FROM adversarial_orders "
+                "WHERE pnl_usdc IS NOT NULL"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            return float(row["s"] or 0.0)
+    except Exception:
+        log.exception("adversarial_asks._accumulated_adv_pnl failed")
+        return 0.0
+
+
 def update_settlement(
     *, order_id_db: int, status: str,
     fill_price: Optional[float] = None,
     pnl_usdc: Optional[float] = None,
     filled_at: Optional[int] = None,
+    bucket_slug: Optional[str] = None,
 ) -> bool:
-    """Actualiza una row tras fill/settle/cancel."""
+    """Actualiza una row tras fill/settle/cancel.
+
+    Fix bug #4: cierres adversarial eran silentes — ahora si llega pnl_usdc
+    y status indica close (filled/settled_*/expired_nofill), disparamos
+    notif Telegram con acumulado strategy-specific.
+    """
     init_schema()
     try:
         from src.db.schema import tx
@@ -270,10 +294,36 @@ def update_settlement(
                 """,
                 (status, fill_price, pnl_usdc, filled_at, int(order_id_db)),
             )
-        return True
     except Exception as e:
         log.warning("adversarial_asks.update_settlement failed: %s", e)
         return False
+
+    # Notif Telegram fix bug #4. Solo disparamos en estados que indican
+    # cierre y con pnl_usdc concreto != 0.
+    close_states = {
+        STATUS_FILLED, STATUS_SETTLED_WIN, STATUS_SETTLED_LOSS,
+        STATUS_EXPIRED_NOFILL,
+    }
+    if status in close_states and pnl_usdc is not None and abs(pnl_usdc) > 1e-9:
+        try:
+            from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+            accumulated = _accumulated_adv_pnl()
+            pt = {
+                "raw": {
+                    "slug": (bucket_slug or "").lower() or "adversarial",
+                    "title": f"adversarial ask {bucket_slug or ''}".strip(),
+                },
+            }
+            if pnl_usdc > 0:
+                notif_gain(pnl_usdc, accumulated, pt=pt, bucket_label="adversarial")
+            else:
+                notif_loss(abs(pnl_usdc), accumulated, pt=pt, bucket_label="adversarial")
+        except Exception:
+            log.exception(
+                "adversarial_asks.update_settlement notif failed id=%s",
+                order_id_db,
+            )
+    return True
 
 
 # --- Lógica de detección de loser side ---

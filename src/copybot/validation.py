@@ -61,6 +61,223 @@ from src.copybot._slug_expiry import parse_slug_expiry
 log = logging.getLogger(__name__)
 EPSILON = 1e-6
 
+
+# ---------------------------------------------------------------------------
+# Cross-strategy capital + PnL helpers (bugs 1+2+3 del PRE_LIVE_AUDIT)
+# ---------------------------------------------------------------------------
+#
+# Pre 2026-05-10: capital_full, kill_switch y notif "Acumulado" miraban SOLO
+# la tabla activa de tradebook (paper_trades o live_trades). Las 5 strategies
+# nuevas tienen tablas separadas (mm_orders, spike_arb_trades,
+# adversarial_orders, long_horizon_trades, hedge_trades) — invisibles a los
+# guards globales. Riesgo de over-allocation 4×–10× del cap y kill switch
+# ciego.
+#
+# Estos helpers son single source of truth: misma config usada por
+# validation.run_pre_open_checks, risk.check_kill_switch y
+# learning.on_paper_trade_closed.
+#
+# Backward compat: fail-soft — si una tabla no existe (strategy nueva no
+# inicializada todavía), su CONTRIB es 0, no error.
+#
+# Performance: UNION ALL en una sola query (no N round-trips).
+
+# (table_name, size_col_or_None, pnl_col, exit_col)
+# - size_col: columna que representa USDC comprometido en una posición abierta.
+#   None ⇒ no contribuye a capital_in_use (caso hedge_trades: su poly leg ya
+#   se contabiliza en paper/live_trades vía tradebook.open_position, así que
+#   evitamos doble conteo).
+# - pnl_col: columna del realized PnL del trade cerrado. Para hedge_trades
+#   usamos pnl_perp_usdc (NO pnl_total_usdc) porque el poly leg ya entra en
+#   paper/live_trades.pnl_usdc — sumarlo de nuevo doble-contaría.
+# - exit_col: timestamp (epoch s) en el que el row alcanzó estado terminal.
+#   Lo usamos para ventanas "hoy UTC" / "desde reset_at" y para consecutive
+#   losses. Algunas tablas no exponen un closed_at propio (mm_orders /
+#   adversarial_orders) — fallback a filled_at.
+_CROSS_TABLE_SPECS: tuple[tuple[str, str | None, str, str], ...] = (
+    ("paper_trades",          "entry_size_usdc", "pnl_usdc",      "exit_at"),
+    ("live_trades",           "entry_size_usdc", "pnl_usdc",      "exit_at"),
+    ("mm_orders",             "size_usdc",       "pnl_usdc",      "filled_at"),
+    ("spike_arb_trades",      "size_usdc",       "pnl_usdc",      "closed_at"),
+    ("adversarial_orders",    "size_usdc",       "pnl_usdc",      "filled_at"),
+    ("long_horizon_trades",   "bet_usdc",        "pnl_usdc",      "closed_at"),
+    ("hedge_trades",          None,              "pnl_perp_usdc", "closed_at"),
+)
+
+
+def _table_exists(conn, name: str) -> bool:
+    """Devuelve True si la tabla existe en el backend activo.
+
+    Backend-aware: SQLite usa sqlite_master, Postgres usa information_schema.
+    Fail-soft: si la query rompe (DB no inicializada en tests), devuelve False.
+    """
+    try:
+        from src.db.schema import BACKEND
+    except Exception:
+        BACKEND = "sqlite"
+    try:
+        if BACKEND == "postgres":
+            r = conn.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name=?",
+                (name,),
+            ).fetchone()
+        else:
+            r = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+def _available_specs(
+    conn,
+    *,
+    require_size: bool = False,
+) -> list[tuple[str, str | None, str, str]]:
+    """Lista de specs cuyas tablas existen en la DB activa.
+
+    `require_size=True` ⇒ solo specs con `size_col is not None` (capital_full).
+    """
+    out = []
+    for spec in _CROSS_TABLE_SPECS:
+        table, size_col, _pnl, _exit = spec
+        if require_size and size_col is None:
+            continue
+        if _table_exists(conn, table):
+            out.append(spec)
+    return out
+
+
+def _total_capital_in_use(conn) -> float:
+    """SUM de USDC comprometido en posiciones abiertas a través de TODAS las
+    tablas relevantes (5 strategies nuevas + paper/live).
+
+    Fail-soft por tabla: si una tabla no existe (strategy no inicializada
+    todavía), contribuye 0. Performance: UNION ALL en una sola query.
+
+    hedge_trades NO contribuye porque su poly leg ya está en paper/live_trades.
+    """
+    specs = _available_specs(conn, require_size=True)
+    if not specs:
+        return 0.0
+    parts = []
+    for table, size_col, _pnl, _exit in specs:
+        parts.append(
+            f"SELECT COALESCE(SUM({size_col}), 0) AS v "
+            f"FROM {table} WHERE status='open'"
+        )
+    sql = "SELECT COALESCE(SUM(v), 0) AS total FROM (" + " UNION ALL ".join(parts) + ") AS u"
+    try:
+        r = conn.execute(sql).fetchone()
+        return float(r["total"] or 0.0) if r else 0.0
+    except Exception as e:
+        log.warning("_total_capital_in_use failed: %s", e)
+        return 0.0
+
+
+# Statuses considerados "terminal cerrado" para SUM(pnl) cross-table.
+# - paper/live_trades: status semántico ('closed_win', 'closed_loss',
+#   'settled_win', 'settled_loss').
+# - strategy tables: usan 'closed', 'filled' u otros. Como NO tienen el
+#   sufijo _win/_loss, filtramos por "pnl_usdc IS NOT NULL" como proxy de
+#   "ya cerrado con PnL realizado".
+_CLASSIC_CLOSED = ("closed_win", "closed_loss", "settled_win", "settled_loss")
+
+
+def _is_classic_trades_table(table: str) -> bool:
+    return table in ("paper_trades", "live_trades")
+
+
+def _total_pnl_since(conn, since_ts: int) -> float:
+    """SUM(pnl_usdc-equivalent) cross-tables desde `since_ts`.
+
+    Útil para layer1 (daily_loss_cap), drawdown y notif "Acumulado". Usa
+    UNION ALL con normalización: cada tabla expone su pnl_col propio
+    (pnl_usdc o pnl_perp_usdc en hedge) como una columna unificada `pnl`,
+    filtrando por exit_col >= since_ts.
+    """
+    specs = _available_specs(conn)
+    if not specs:
+        return 0.0
+    parts = []
+    params: list[Any] = []
+    for table, _size, pnl_col, exit_col in specs:
+        if _is_classic_trades_table(table):
+            status_clause = "status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+        else:
+            # Strategy tables: terminal = pnl already realized + exit_col set.
+            status_clause = f"{pnl_col} IS NOT NULL AND {exit_col} IS NOT NULL"
+        parts.append(
+            f"SELECT COALESCE({pnl_col}, 0) AS pnl "
+            f"FROM {table} WHERE COALESCE({exit_col}, 0) >= ? AND {status_clause}"
+        )
+        params.append(since_ts)
+    sql = "SELECT COALESCE(SUM(pnl), 0) AS total FROM (" + " UNION ALL ".join(parts) + ") AS u"
+    try:
+        r = conn.execute(sql, tuple(params)).fetchone()
+        return float(r["total"] or 0.0) if r else 0.0
+    except Exception as e:
+        log.warning("_total_pnl_since failed: %s", e)
+        return 0.0
+
+
+def _recent_closed_cross_tables(conn, since_ts: int, limit: int) -> list[dict]:
+    """Últimos `limit` trades cerrados (ordenados por exit DESC) cross-tables.
+
+    Cada item: {table, id, exit_ts, pnl, is_loss}. Para consecutive_losses
+    layer2: tomamos los últimos N items, definimos LOSS por:
+      - paper/live_trades: status ∈ closed_loss/settled_loss
+      - strategy tables  : pnl < 0 (terminal por construcción de la query)
+    """
+    specs = _available_specs(conn)
+    if not specs:
+        return []
+    parts = []
+    params: list[Any] = []
+    for table, _size, pnl_col, exit_col in specs:
+        if _is_classic_trades_table(table):
+            status_clause = "status IN ('closed_win','closed_loss','settled_win','settled_loss')"
+            is_loss_expr = "CASE WHEN status IN ('closed_loss','settled_loss') THEN 1 ELSE 0 END"
+        else:
+            status_clause = f"{pnl_col} IS NOT NULL AND {exit_col} IS NOT NULL"
+            is_loss_expr = f"CASE WHEN COALESCE({pnl_col},0) < 0 THEN 1 ELSE 0 END"
+        parts.append(
+            f"SELECT '{table}' AS tbl, id AS id, "
+            f"COALESCE({exit_col}, 0) AS exit_ts, "
+            f"COALESCE({pnl_col}, 0) AS pnl, "
+            f"{is_loss_expr} AS is_loss "
+            f"FROM {table} WHERE COALESCE({exit_col}, 0) >= ? AND {status_clause}"
+        )
+        params.append(since_ts)
+    sql = (
+        "SELECT tbl, id, exit_ts, pnl, is_loss FROM ("
+        + " UNION ALL ".join(parts)
+        + ") AS u ORDER BY exit_ts DESC, id DESC LIMIT ?"
+    )
+    params.append(limit)
+    try:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    except Exception as e:
+        log.warning("_recent_closed_cross_tables failed: %s", e)
+        return []
+    out = []
+    for r in rows:
+        try:
+            out.append({
+                "table": r["tbl"],
+                "id": int(r["id"]),
+                "exit_ts": int(r["exit_ts"] or 0),
+                "pnl": float(r["pnl"] or 0.0),
+                "is_loss": bool(r["is_loss"]),
+            })
+        except Exception:
+            continue
+    return out
+
 # Source sintético del bot N2 (crypto temporal arb). No tiene entry en
 # copy_subscriptions, opera markets ultracortos por design, y usa su
 # propio modelo de filtrado (edge probabilístico) — exempt de varios
@@ -408,10 +625,13 @@ def run_pre_open_checks(conn, ctx: TradeValidationContext):
                    size_usdc=size_usdc, cap=per_market_cap)
         return None, "market_concentration"
 
-    # 18) capital_full (cap global)
-    global_open = conn.execute(
-        f"SELECT COALESCE(SUM(entry_size_usdc), 0) as v FROM {ctx.trades_table} WHERE status='open'"
-    ).fetchone()["v"]
+    # 18) capital_full (cap global) — cross-strategies.
+    # Pre-fix solo miraba ctx.trades_table → 5 strategies (mm/spike/adv/lh/hedge)
+    # invisibles → over-allocation 4×–10×. Ahora _total_capital_in_use suma
+    # entry_size_usdc / size_usdc / bet_usdc de TODAS las tablas con
+    # status='open' (helper en este mismo módulo, fail-soft si una tabla aún
+    # no existe).
+    global_open = _total_capital_in_use(conn)
     if global_open + size_usdc > ctx.capital_usdc + EPSILON:
         _maybe_log(ctx, "capital_full", open_usdc=global_open,
                    size_usdc=size_usdc, cap=ctx.capital_usdc)

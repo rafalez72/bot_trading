@@ -626,6 +626,66 @@ def settlement_action(
             "pnl_usdc_factor": None}
 
 
+# --- Notif coverage (fix bug #4): settle helper ---
+
+def _accumulated_lh_pnl() -> float:
+    """Suma pnl_usdc de long_horizon_trades cerradas."""
+    try:
+        from src.db.schema import db
+        with db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usdc), 0) AS s FROM long_horizon_trades "
+                "WHERE pnl_usdc IS NOT NULL"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            return float(row["s"] or 0.0)
+    except Exception:
+        log.exception("long_horizon_arb._accumulated_lh_pnl failed")
+        return 0.0
+
+
+def settle_trade(
+    trade_id: Optional[int], *, pnl_usdc: float,
+    market_slug: Optional[str] = None,
+    underlying: Optional[str] = None,
+    status: str = "settled",
+) -> None:
+    """Persiste cierre + dispara notif Telegram.
+
+    Fix bug #4: cierres de long_horizon eran silentes — el user no se
+    enteraba de wins/losses al settle_resolved o early_exit. Ahora
+    llamamos notifier.gain/loss con pt sintético para classify_market.
+
+    Este helper se debe invocar desde el path real de settle/early_exit
+    cuando se complete el wire-up del live executor. Por ahora también
+    callable desde tests.
+    """
+    if trade_id is not None:
+        _update_trade(
+            trade_id, status=status,
+            fields={"pnl_usdc": float(pnl_usdc), "closed_at": int(time.time())},
+        )
+    if abs(pnl_usdc) < 1e-9:
+        return
+    try:
+        from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+        accumulated = _accumulated_lh_pnl()
+        pt = {
+            "raw": {
+                "slug": (market_slug or "").lower() or (underlying or "lh").lower(),
+                "title": f"long_horizon {underlying or ''} {market_slug or ''}".strip(),
+            },
+        }
+        if pnl_usdc > 0:
+            notif_gain(pnl_usdc, accumulated, pt=pt, bucket_label="long-horizon")
+        else:
+            notif_loss(abs(pnl_usdc), accumulated, pt=pt, bucket_label="long-horizon")
+    except Exception:
+        log.exception("long_horizon_arb.settle_trade notif failed id=%s", trade_id)
+
+
 # --- Core: LongHorizonArb (testable, no red) ---
 
 class LongHorizonArb:
@@ -809,6 +869,23 @@ async def long_horizon_loop() -> None:
         config.check_interval_s, config.min_liq_usdc, config.min_edge_pct,
         config.bet_usdc, "live" if LIVE_MODE else "paper",
     )
+
+    # Fix bug #6: warning loud si LIVE_MODE — el executor live es STUB y
+    # devuelve failed con motivo claro. El user debe saber al startup que
+    # NO se opera real hasta wirear token_id resolver.
+    if LIVE_MODE:
+        log.warning(
+            "long_horizon_arb: LIVE_MODE detectado pero executor live es STUB. "
+            "Trades NO se mandan al CLOB. Ver docs/PRE_LIVE_AUDIT.md bug #6."
+        )
+        try:
+            from src.copybot.notifier import send as _notif_send
+            _notif_send(
+                "⚠️ *long_horizon_arb* arranca en LIVE_MODE pero executor es STUB — "
+                "no opera real (bug #6 docs/PRE_LIVE_AUDIT.md)"
+            )
+        except Exception:
+            pass
 
     # Spot history por símbolo: (ts_ms, price). Cap ~7200 (~2h, 1msg/s).
     spot_history: dict[str, list[tuple[int, float]]] = {

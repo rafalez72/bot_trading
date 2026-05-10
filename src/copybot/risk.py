@@ -139,25 +139,30 @@ def _check_daily_loss_cap(now_ts: int, reset_at: int) -> tuple[bool, dict]:
     Devuelve (triggered, ctx). `ctx` lleva valores (pnl, threshold) para la
     notif. `reset_at` actúa como high-water mark: tras un reset manual los
     losses pre-reset no cuentan más, igual que el layer legacy.
+
+    Cross-tables (fix 2026-05-10, bug 2 PRE_LIVE_AUDIT): pre-fix solo veía
+    TRADES_TABLE → 5 strategies ciegas al kill switch. Ahora suma pnl_usdc /
+    pnl_perp_usdc de mm_orders, spike_arb_trades, adversarial_orders,
+    long_horizon_trades, hedge_trades (single source of truth en
+    validation._total_pnl_since).
     """
+    from src.copybot.validation import _total_pnl_since, _recent_closed_cross_tables
+
     since = max(_utc_midnight_epoch(now_ts), reset_at)
-    sql = f"""
-        SELECT COALESCE(SUM(pnl_usdc), 0) AS pnl,
-               COUNT(*) AS n
-        FROM {TRADES_TABLE}
-        WHERE exit_at >= ?
-          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-    """
     with db() as conn:
-        r = conn.execute(sql, (since,)).fetchone()
-    pnl = float(r["pnl"] or 0.0)
+        pnl = _total_pnl_since(conn, since)
+        # n: contamos cross-table también para la notif. Usamos
+        # _recent_closed_cross_tables con limit alto = total trades en la
+        # ventana. Cheaper alternative: una query COUNT(*) UNION pero
+        # mantenemos un solo path para no fragmentar.
+        recent = _recent_closed_cross_tables(conn, since, limit=10_000)
     threshold = -float(DAILY_LOSS_CAP_USDC)
     triggered = pnl <= threshold
     return triggered, {
         "layer": "daily_loss_cap",
         "pnl": pnl,
         "threshold": threshold,
-        "n": int(r["n"] or 0),
+        "n": len(recent),
         "since": since,
     }
 
@@ -168,18 +173,17 @@ def _check_consecutive_losses(now_ts: int, reset_at: int) -> tuple[bool, dict]:
     Toma los N trades cerrados más recientes (post-reset) ordenados por
     exit_at desc; si todos son LOSS dispara. `reset_at` filtra trades viejos
     para que un reset manual limpie la racha.
+
+    Cross-tables (fix 2026-05-10, bug 2 PRE_LIVE_AUDIT): ordena trades por
+    exit_at DESC de TODAS las tablas. Para strategy tables (mm/spike/adv/
+    lh/hedge) un trade es LOSS si pnl < 0 (no tienen status _win/_loss). El
+    merge sort lo hace SQL via UNION ALL.
     """
+    from src.copybot.validation import _recent_closed_cross_tables
+
     n = max(1, int(MAX_CONSECUTIVE_LOSSES))
-    sql = f"""
-        SELECT id, status
-        FROM {TRADES_TABLE}
-        WHERE exit_at >= ?
-          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-        ORDER BY exit_at DESC, id DESC
-        LIMIT ?
-    """
     with db() as conn:
-        rows = conn.execute(sql, (reset_at, n)).fetchall()
+        rows = _recent_closed_cross_tables(conn, reset_at, limit=n)
     if len(rows) < n:
         return False, {
             "layer": "consecutive_losses",
@@ -187,8 +191,7 @@ def _check_consecutive_losses(now_ts: int, reset_at: int) -> tuple[bool, dict]:
             "needed": n,
             "ids": [],
         }
-    losing = {"closed_loss", "settled_loss"}
-    all_loss = all(r["status"] in losing for r in rows)
+    all_loss = all(r["is_loss"] for r in rows)
     ids = [int(r["id"]) for r in rows]
     return all_loss, {
         "layer": "consecutive_losses",
@@ -233,16 +236,14 @@ def _check_drawdown(now_ts: int, reset_at: int) -> tuple[bool, dict]:
     peak_balance se persiste y se actualiza solo hacia arriba (high-water mark
     monotónico). Se inicializa al cap efectivo en el primer call. Si
     (current - peak) / peak < -MAX_DRAWDOWN_PCT → dispara.
+
+    Cross-tables (fix 2026-05-10, bug 2 PRE_LIVE_AUDIT): SUM(pnl) usa el
+    helper unificado que cubre las 5 strategy tables.
     """
-    sql = f"""
-        SELECT COALESCE(SUM(pnl_usdc), 0) AS pnl
-        FROM {TRADES_TABLE}
-        WHERE exit_at >= ?
-          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-    """
+    from src.copybot.validation import _total_pnl_since
+
     with db() as conn:
-        r = conn.execute(sql, (reset_at,)).fetchone()
-    realized = float(r["pnl"] or 0.0)
+        realized = _total_pnl_since(conn, reset_at)
     current = float(EFFECTIVE_CAPITAL_USDC) + realized
 
     peak = _peak_balance()
@@ -344,20 +345,17 @@ def check_kill_switch() -> bool:
     (ej. wins compensan), desactiva automáticamente. Antes era manual-only,
     pero combinado con un race del reset_at quedaba atascado.
     """
+    from src.copybot.validation import _total_pnl_since
+
     now_ts = int(time.time())
     rolling_24h = now_ts - 86400
     reset_at = _reset_at()
     since = max(rolling_24h, reset_at)
-    sql = f"""
-        SELECT COALESCE(SUM(pnl_usdc), 0) as pnl,
-               COUNT(*) as n
-        FROM {TRADES_TABLE}
-        WHERE exit_at >= ?
-          AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-    """
+    # Cross-tables (fix 2026-05-10, bug 2 PRE_LIVE_AUDIT): el legacy layer
+    # pre-fix solo veía TRADES_TABLE. Ahora suma pnl de las 5 strategy tables
+    # via single source of truth en validation._total_pnl_since.
     with db() as conn:
-        r = conn.execute(sql, (since,)).fetchone()
-    pnl = r["pnl"] or 0
+        pnl = _total_pnl_since(conn, since)
     threshold = -EFFECTIVE_CAPITAL_USDC * DAILY_KILL_SWITCH_PCT
     prev_active = kill_switch_status()["active"]
 

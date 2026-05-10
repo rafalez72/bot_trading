@@ -487,6 +487,65 @@ def _update_status(
         log.exception("spike_arb.update_status failed id=%s", trade_id)
 
 
+# --- Notif coverage (fix bug #4): settle helper ---
+
+def _accumulated_spike_pnl() -> float:
+    """Suma de pnl_usdc de spike_arb_trades cerradas (status settled_*)."""
+    try:
+        from src.db.schema import db
+        with db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usdc), 0) AS s FROM spike_arb_trades "
+                "WHERE pnl_usdc IS NOT NULL"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            return float(row["s"] or 0.0)
+    except Exception:
+        log.exception("spike_arb._accumulated_spike_pnl failed")
+        return 0.0
+
+
+def settle_trade(
+    trade_id: Optional[int], *, pnl_usdc: float,
+    symbol: Optional[str] = None,
+    bucket_slug: Optional[str] = None,
+    status: str = "settled",
+) -> None:
+    """Cierra un spike_arb_trade y dispara notif Telegram.
+
+    Fix bug #4: el path de close de spike_arb era silente — el user no se
+    enteraba de gains/losses. Ahora llamamos notifier.gain/loss con un
+    pt sintético + acumulado strategy-specific.
+
+    TODO: este helper se debe llamar desde el path de settle real cuando se
+    wire el live executor (hoy stub). Para tests, se puede llamar directo.
+    """
+    if trade_id is not None:
+        _update_status(
+            trade_id, status=status,
+            fields={"pnl_usdc": float(pnl_usdc), "closed_at": int(time.time())},
+        )
+    if abs(pnl_usdc) < 1e-9:
+        return
+    try:
+        from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+        accumulated = _accumulated_spike_pnl()
+        pt = {
+            "raw": {
+                "slug": (bucket_slug or "").lower() or (symbol or "spike").lower(),
+                "title": f"spike_arb {symbol or ''}".strip(),
+            },
+        }
+        if pnl_usdc > 0:
+            notif_gain(pnl_usdc, accumulated, pt=pt, bucket_label="spike")
+        else:
+            notif_loss(abs(pnl_usdc), accumulated, pt=pt, bucket_label="spike")
+    except Exception:
+        log.exception("spike_arb.settle_trade notif failed id=%s", trade_id)
+
+
 # --- Live order executor (paper / live) ---
 
 async def _paper_order_executor(signal: dict) -> dict:
@@ -574,6 +633,23 @@ async def spike_arb_loop() -> None:
         config.limit_ttl_s, config.max_mid_target,
         "live" if LIVE_MODE else "paper",
     )
+
+    # Fix bug #6: warning loud si LIVE_MODE — el executor live es STUB y
+    # todos los signals devuelven failed/cancelled. Sin warning el user
+    # piensa que opera real pero "no detecta nada".
+    if LIVE_MODE:
+        log.warning(
+            "spike_arb: LIVE_MODE detectado pero executor live es STUB. "
+            "Trades NO se mandan al CLOB. Ver docs/PRE_LIVE_AUDIT.md bug #6."
+        )
+        try:
+            from src.copybot.notifier import send as _notif_send
+            _notif_send(
+                "⚠️ *spike_arb* arranca en LIVE_MODE pero executor es STUB — "
+                "no opera real (bug #6 docs/PRE_LIVE_AUDIT.md)"
+            )
+        except Exception:
+            pass
 
     executor = _live_order_executor if LIVE_MODE else _paper_order_executor
 
