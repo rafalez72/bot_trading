@@ -432,7 +432,17 @@ async def _open_arb_trade(market: dict, decision: dict) -> int | None:
     config = CryptoArbConfig.from_env()
     try:
         from src.polymarket.clob_client import estimate_slippage
-        token_id = (market.get("clobTokenIds") or [None, None])
+        # gamma devuelve clobTokenIds como JSON string, no list. Parsear si es str.
+        ct_raw = market.get("clobTokenIds")
+        if isinstance(ct_raw, str):
+            try:
+                token_id = json.loads(ct_raw)
+            except Exception:
+                token_id = None
+        elif isinstance(ct_raw, list):
+            token_id = ct_raw
+        else:
+            token_id = None
         if isinstance(token_id, list) and len(token_id) > decision["outcome_index"]:
             token_id_str = token_id[decision["outcome_index"]]
         else:
