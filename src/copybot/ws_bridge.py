@@ -285,7 +285,7 @@ def _make_handle_trade(
                         TRADEBOOK_MODE, pid,
                     )
                 else:
-                    ws_metrics.on_skip(reason)
+                    ws_metrics.on_skip(reason, wallet=wallet_lc, cid=cid)
                     if reason and reason != "duplicate":
                         log.info(
                             "ws.buy_skipped wallet=%s cid=%s.. reason=%s",

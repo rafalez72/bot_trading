@@ -76,6 +76,10 @@ class _Metrics:
         self.skipped_duplicate = 0     # open_position devolvió reason='duplicate'
         self.skipped_other = 0         # open_position devolvió otro reason
         self.bad_payload = 0           # payload sin txh/cid/side válido
+        # Diag: contador por reason + últimos N rejects para debugging.
+        # In-memory only — al restart se pierde. Persistencia fuera de scope.
+        self.reject_reasons: dict[str, int] = {}
+        self._recent_rejects: deque = deque(maxlen=50)
         # Gauges
         self.watched_wallets = 0
         # Timestamps de la última actividad (epoch s)
@@ -153,12 +157,21 @@ class _Metrics:
             self.closed_sells += 1
             self.last_sell_at = time.time()
 
-    def on_skip(self, reason: str | None) -> None:
+    def on_skip(self, reason: str | None, wallet: str | None = None, cid: str | None = None) -> None:
         with self._lock:
             if reason == "duplicate":
                 self.skipped_duplicate += 1
             else:
                 self.skipped_other += 1
+            # Diag: track top reasons + últimos rejects
+            key = reason or "unknown"
+            self.reject_reasons[key] = self.reject_reasons.get(key, 0) + 1
+            self._recent_rejects.append({
+                "ts": time.time(),
+                "reason": key,
+                "wallet": (wallet or "")[:12],
+                "cid": (cid or "")[:12],
+            })
 
     def on_bad_payload(self) -> None:
         with self._lock:
@@ -208,6 +221,8 @@ class _Metrics:
                     "skipped_duplicate": self.skipped_duplicate,
                     "skipped_other": self.skipped_other,
                     "bad_payload": self.bad_payload,
+                    "reject_reasons": dict(self.reject_reasons),
+                    "recent_rejects": list(self._recent_rejects)[-10:],
                 },
                 "last_msg": {
                     "msg_at": self.last_msg_at,
