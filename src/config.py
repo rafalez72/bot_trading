@@ -164,6 +164,16 @@ LIVE_MIN_EXPECTED_PNL_USDC = float(os.getenv("LIVE_MIN_EXPECTED_PNL_USDC", "0.50
 # no mandamos la orden (no vale el slippage).
 LIVE_MAX_SLIPPAGE_PCT = float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03"))  # 3%
 
+# Profundidad mínima del orderbook (suma de los primeros 5 niveles del book
+# del side relevante, en USDC notional). Markets crypto-updown thin
+# (~$50-100 por nivel) generaron pérdidas garantizadas por slippage incluso
+# con LIVE_MAX_SLIPPAGE_PCT=4%. Bloquear cualquier market con orderbook total
+# < $500 elimina la mayoría de esos casos sin necesidad de excludes por slug.
+# 2026-05-10: agregado tras pérdida $76 en primera sesión LIVE.
+LIVE_MIN_ORDERBOOK_DEPTH_USDC = float(
+    os.getenv("LIVE_MIN_ORDERBOOK_DEPTH_USDC", "500")
+)
+
 # Bump de precio para el retry de IOC. Si la primera orden no fillea,
 # re-intentamos con price * (1 + X) en BUY (peor para nosotros, mejor chance).
 LIVE_RETRY_PRICE_BUMP_PCT = float(os.getenv("LIVE_RETRY_PRICE_BUMP_PCT", "0.01"))  # 1%

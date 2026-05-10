@@ -27,14 +27,18 @@ def _fake_client_returning_orderbook(orderbook: dict):
     return client
 
 
-def test_dry_run_uses_real_orderbook_vwap_not_midpoint():
+def test_dry_run_uses_real_orderbook_vwap_not_midpoint(monkeypatch):
     """En dry_run, place_market_order debe leer el orderbook real
     (estimate_slippage) y devolver avg_price=VWAP del book, NO el target.
 
     Pre-2026-05-10: dry_run devolvía avg_price=price (midpoint), inflando los
     PnL simulados. La diferencia entre dry-run y live causó que el user
     perdiera $76 confiando en una simulación que no era predictiva.
+
+    Desactivamos el min-depth check para esta prueba — solo verifica que el
+    fill simulado use VWAP del book, no el midpoint.
     """
+    monkeypatch.setattr(clob_client, "LIVE_MIN_ORDERBOOK_DEPTH_USDC", 0.0)
     # Book: para BUY caminamos asks. 5 shares @ 0.5, 10 shares @ 0.505.
     # Si pedimos 10 shares: VWAP = (5*0.5 + 5*0.505)/10 = 0.5025 (slippage 0.5%)
     # Sub LIVE_MAX_SLIPPAGE_PCT=3% → pasa, podemos ver el VWAP en avg_price.
@@ -64,11 +68,13 @@ def test_dry_run_uses_real_orderbook_vwap_not_midpoint():
     )
 
 
-def test_dry_run_aborts_when_no_liquidity():
+def test_dry_run_aborts_when_no_liquidity(monkeypatch):
     """Si dry_run lee el orderbook y no alcanza la liquidez al target shares,
     debe devolver ok=False igual que el path de live. Sin esto, dry-run
     aprobaría trades que en live se rechazan, perpetuando la disonancia.
     """
+    # Desactivar el depth check para que el test sea sobre liquidez, no depth
+    monkeypatch.setattr(clob_client, "LIVE_MIN_ORDERBOOK_DEPTH_USDC", 0.0)
     # Book con SOLO 2 shares disponibles, pidiendo 10 → liquidez insuficiente
     insuf = {
         "asks": [{"price": "0.5", "size": "2"}],

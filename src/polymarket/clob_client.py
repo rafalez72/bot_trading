@@ -21,6 +21,7 @@ from typing import Optional
 from src.config import (
     CLOB_API,
     LIVE_MAX_SLIPPAGE_PCT,
+    LIVE_MIN_ORDERBOOK_DEPTH_USDC,
     LIVE_RETRY_PRICE_BUMP_PCT,
     POLYMARKET_API_KEY,
     POLYMARKET_API_PASSPHRASE,
@@ -215,6 +216,22 @@ def estimate_slippage(
     book = asks if side.upper() == "BUY" else bids
     if not book:
         return {"ok": False, "error": "orderbook vacio"}
+
+    # Min orderbook depth check (2026-05-10): suma USDC notional de los
+    # primeros 5 niveles del book del side relevante. Si es < threshold,
+    # market es demasiado thin para operar — slippage real será catastrófico
+    # incluso aunque el VWAP teórico cumpla LIVE_MAX_SLIPPAGE_PCT.
+    if LIVE_MIN_ORDERBOOK_DEPTH_USDC > 0:
+        depth_usdc = sum(p * s for p, s in book[:5])
+        if depth_usdc < LIVE_MIN_ORDERBOOK_DEPTH_USDC:
+            return {
+                "ok": False,
+                "error": (
+                    f"orderbook_too_thin (top5={depth_usdc:.0f} USDC < "
+                    f"{LIVE_MIN_ORDERBOOK_DEPTH_USDC:.0f})"
+                ),
+                "depth_usdc_top5": depth_usdc,
+            }
 
     accum_shares = 0.0
     accum_value = 0.0
