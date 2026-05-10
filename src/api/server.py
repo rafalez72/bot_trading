@@ -48,6 +48,23 @@ def api_select(top: int = Query(10, ge=1, le=50)) -> dict:
     return select_traders(top_n=top)
 
 
+@app.post("/api/admin/kill-switch/reset")
+def api_kill_switch_reset(rebaseline_peak: bool = Query(True)) -> dict:
+    """Reset manual del kill switch + rebaseline peak balance al capital
+    efectivo actual (default true). Sin rebaseline, drawdown legacy puede
+    reactivar el kill switch al instante.
+    """
+    from src.copybot.risk import reset_kill_switch, kill_switch_status
+    reset_kill_switch(rebaseline_peak=rebaseline_peak)
+    return {"ok": True, "status": kill_switch_status(), "rebaseline_peak": rebaseline_peak}
+
+
+@app.get("/api/admin/kill-switch/status")
+def api_kill_switch_status() -> dict:
+    from src.copybot.risk import kill_switch_status
+    return kill_switch_status()
+
+
 @app.get("/api/learning/events")
 def api_learning(limit: int = Query(100, ge=1, le=500)) -> list[dict]:
     return recent_events(limit=limit)

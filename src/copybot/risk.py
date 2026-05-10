@@ -412,8 +412,22 @@ def check_kill_switch() -> bool:
     return False
 
 
-def reset_kill_switch() -> None:
+def reset_kill_switch(rebaseline_peak: bool = True) -> None:
+    """Manual reset. Por default re-baseline `peak_balance_usdc` al
+    capital efectivo actual.
+
+    Sin rebaseline_peak: si el peak legacy es muy alto (ej. $855) y el
+    capital actual es $150, drawdown -82% reactiva el kill switch al
+    instante después del reset. Rebaseline = peak = capital efectivo →
+    arranca con 0% drawdown.
+    """
     _set_kill(False, "manual reset")
+    if rebaseline_peak:
+        _set_peak_balance(float(EFFECTIVE_CAPITAL_USDC))
+        log.info(
+            "reset_kill_switch: peak rebaselined to $%.2f",
+            float(EFFECTIVE_CAPITAL_USDC),
+        )
     try:
         from src.copybot.notifier import kill_switch_deactivated
         kill_switch_deactivated()
