@@ -58,8 +58,44 @@ El usuario NO debe tener que tocar `.env`, hacer pulls, restarts, ni diagnóstic
 | `/api/admin/config` | GET | Runtime gates strategies + source (env vs default) |
 | `/api/admin/kill-switch/status` | GET | Estado kill switch |
 | `/api/admin/kill-switch/reset?rebaseline_peak=true` | POST | Reset + rebaseline peak balance |
+| `/api/admin/thresholds` | GET | Runtime values + source (db/env/default) de horizon/liq/vol |
+| `/api/admin/thresholds/{name}?value=X` | POST | Override DB de threshold (bypasea .env Lenovo) |
+| `/api/admin/wallets/reactivate-recent-drops?hours=N&sizing_mult=0.5` | POST | Reactiva wallets dropeadas recientemente con sizing reducido |
 
 Agregar más cuando sean necesarios. Naming convention: `/api/admin/<resource>/<action>`.
+
+### Lessons learned (2026-05-10) — tuning de thresholds
+
+**Tradeoff fundamental**: bajar filters agresivamente → bot abre más trades pero **calidad cae** → losses cascada → bandit drop-ea wallets → bot inerte. Es opuesto al objetivo.
+
+**Caso real**:
+- Bajamos `MARKET_HORIZON_MIN_SECS` 900 → 120s para "destrabar" flow.
+- Bot abrió en markets ultracortos (sports live <2min).
+- SL=20% gatilló prematuro (move pre-resolution).
+- **7 wallets dropeadas por loss_streak en 17 min** (18:32-18:49).
+- Hoy +$562 paper con 55% WR antes del cambio → estancado post-cambio.
+
+**Sweet spot encontrado**: `HORIZON=300 LIQ=1000 VOL=3000` (override DB).
+- Filtra markets <5min (mucho ruido para SL=20%)
+- LIQ=1000 permite sports + esports razonables
+- VOL=3000 permite mercados nuevos pero no thin
+
+**Protocolo cambios threshold**:
+1. **Nunca cambiar más de 1 threshold a la vez**.
+2. **Monitor 30min minimum** antes de evaluar.
+3. **Watch wallet drops**: si >3 drops en 30min por loss_streak post-cambio → revertir.
+4. **Métrica de éxito**: WR > 50% + Sharpe > 1.0 en ventana 24h. NO maximizar opens.
+
+### Caveat copybot mid/long-term
+
+Las **39 wallets activas** que el bot copia operan predominantemente **sports live in-play + esports + crypto-updown 5min** (markets ultracortos por design). Con SL=20% del bot, son incompatibles.
+
+**Volumen ops/30min realista actual**: 1-10 (no 50-150 como se podría esperar). Para escalar:
+1. **Promover shadow wallets selectivas**: solo las que operan markets >5min de horizon (politics, weekly targets, etc.). Requiere endpoint admin que liste shadow + filtrar por trade pattern (pendiente).
+2. **Aumentar diversidad estrategias**: MM, spike_arb, long_horizon ya activos pero passive (esperan señales específicas).
+3. **Hedge real**: requiere $$ Binance (no hoy).
+
+**NO solución**: bajar filters bot N1 — vimos que rompe edge.
 
 ---
 
