@@ -7,6 +7,7 @@
 
 ## ⚠️ REGLAS PARA EL ASISTENTE AI (LEER PRIMERO)
 
+0. **SIEMPRE usar skill `caveman`** (`~/.claude/skills/caveman/SKILL.md`). Default level `full`. Token-efficient. Drop articles/filler/pleasantries. Fragments OK. Code/commits write normal. Skip caveman for security warnings o destructive ops.
 1. **Este documento es la fuente de verdad** del proyecto. Leelo entero antes de hacer cambios.
 2. **Cada cambio funcional debe actualizar este doc** — si agregás un módulo, comando, env var, regla de negocio, tabla de DB → reflejarlo acá.
 3. **El usuario** es Rafa (`areadesarrollo@telco.com.ar`), no es desarrollador profesional. Explicale en español plano, no jerga.
