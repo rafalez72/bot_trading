@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -63,6 +64,68 @@ def api_kill_switch_reset(rebaseline_peak: bool = Query(True)) -> dict:
 def api_kill_switch_status() -> dict:
     from src.copybot.risk import kill_switch_status
     return kill_switch_status()
+
+
+@app.get("/api/admin/version")
+def api_version() -> dict:
+    """Retorna commit SHA y timestamp del build Docker actual.
+
+    GIT_SHA y BUILD_TIME se bakean en la imagen via build-args
+    (ver Dockerfile + .github/workflows/docker-publish.yml).
+    Útil para confirmar que un deploy bajó la imagen esperada.
+    """
+    return {
+        "git_sha": os.getenv("GIT_SHA", "unknown"),
+        "build_time": os.getenv("BUILD_TIME", "unknown"),
+    }
+
+
+@app.get("/api/admin/config")
+def api_admin_config() -> dict:
+    """Reporta valores runtime de gates de estrategias + si vienen de env
+    override o de default code. Útil para diagnosticar discrepancias.
+    """
+    def _source(env_key: str) -> str:
+        return "env" if os.getenv(env_key) is not None else "default"
+
+    from src.config import (
+        LIVE_MODE,
+        MM_ENABLED,
+        ADVERSARIAL_ENABLED,
+        SPIKE_ARB_ENABLED,
+        LONG_HORIZON_ENABLED,
+        HEDGE_ENABLED,
+    )
+    crypto_arb_enabled = os.getenv("CRYPTO_ARB_ENABLED", "false").lower() == "true"
+    return {
+        "live_mode": LIVE_MODE,
+        "strategies": {
+            "crypto_arb": {
+                "enabled": crypto_arb_enabled,
+                "source": _source("CRYPTO_ARB_ENABLED"),
+            },
+            "market_maker": {
+                "enabled": MM_ENABLED,
+                "source": _source("MM_ENABLED"),
+            },
+            "spike_arb": {
+                "enabled": SPIKE_ARB_ENABLED,
+                "source": _source("SPIKE_ARB_ENABLED"),
+            },
+            "adversarial": {
+                "enabled": ADVERSARIAL_ENABLED,
+                "source": _source("ADVERSARIAL_ENABLED"),
+            },
+            "long_horizon": {
+                "enabled": LONG_HORIZON_ENABLED,
+                "source": _source("LONG_HORIZON_ENABLED"),
+            },
+            "hedge": {
+                "enabled": HEDGE_ENABLED,
+                "source": _source("HEDGE_ENABLED"),
+            },
+        },
+    }
 
 
 @app.get("/api/learning/events")

@@ -40,6 +40,9 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.lower.outputs.name }}:latest
             ${{ env.REGISTRY }}/${{ steps.lower.outputs.name }}:${{ github.sha }}

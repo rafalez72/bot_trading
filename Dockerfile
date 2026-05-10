@@ -15,3 +15,9 @@ COPY scripts/ ./scripts/
 RUN pip install --no-cache-dir -e ".[dashboard,analytics,live,postgres]"
 
 RUN mkdir -p data logs
+
+# Build metadata para /api/admin/version (qué commit corre en runtime)
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV GIT_SHA=${GIT_SHA}
+ENV BUILD_TIME=${BUILD_TIME}
