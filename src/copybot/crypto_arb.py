@@ -462,6 +462,109 @@ async def _open_arb_trade(market: dict, decision: dict) -> int | None:
     return None
 
 
+# --- Settler dedicado ---
+
+async def _settle_crypto_arb_resolved(client: PolymarketClient) -> int:
+    """Settle paper_trades open con source_wallet='crypto_arb' cuyos buckets
+    ya expiraron. Hace fetch directo a gamma por conditionId, lee
+    outcomePrices, y aplica settle a través del flujo de paper.settle_resolved.
+
+    Race contra resolución on-chain: post-bucket end, Polymarket tarda
+    ~10-60s en setear outcomePrices definitivos. Si el market aún está
+    `closed=false`, lo dejamos para el próximo ciclo.
+
+    Devuelve cantidad de trades settled en este pass.
+    """
+    from src.db.schema import db, tx
+    from src.copybot.paper import _resolved_payout, post_close_costs, EPSILON
+    from src.copybot.learning import on_paper_trade_closed
+
+    now = int(time.time())
+    # Targets: trades open de crypto_arb cuyos end_ts pasaron hace >=20s
+    # (margen para que la resolución on-chain se setee).
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, condition_id, entry_price, entry_size_usdc, outcome_index, raw
+            FROM paper_trades
+            WHERE source_wallet='crypto_arb' AND status='open'
+            """,
+        ).fetchall()
+    candidates = []
+    for r in rows:
+        try:
+            raw = json.loads(r["raw"]) if r["raw"] else {}
+            end_ts = int(raw.get("end_ts") or 0)
+        except Exception:
+            end_ts = 0
+        if end_ts and (now - end_ts) >= 20:
+            candidates.append((r, end_ts))
+    if not candidates:
+        return 0
+
+    # Agrupamos por condition_id para batchear fetch (un fetch por cid)
+    by_cid: dict[str, list] = {}
+    for r, _ in candidates:
+        by_cid.setdefault(r["condition_id"], []).append(r)
+
+    to_settle: list[tuple] = []
+    for cid, rs in by_cid.items():
+        try:
+            m = await client.get_market(cid)
+        except Exception:
+            continue
+        if not m:
+            continue
+        # Polymarket markets pueden mostrar `closed=true` o `outcomePrices`
+        # como [1.0, 0.0]/["1","0"] indicando resolución.
+        outcome_prices = m.get("outcomePrices")
+        # outcomePrices viene como list o JSON string en gamma
+        if isinstance(outcome_prices, list):
+            outcome_prices = json.dumps(outcome_prices)
+        is_closed = m.get("closed") is True or (
+            outcome_prices and any(
+                p in (1, 1.0, "1", "1.0") for p in (json.loads(outcome_prices) if outcome_prices else [])
+            )
+        )
+        if not is_closed:
+            continue
+        for r in rs:
+            payout = _resolved_payout(outcome_prices, r["outcome_index"])
+            if payout is None:
+                continue
+            entry = r["entry_price"]
+            size = r["entry_size_usdc"]
+            if entry > EPSILON:
+                shares = size / entry
+                gross = shares * (payout - entry)
+            else:
+                gross = 0.0
+            _, _, net_pnl = post_close_costs(gross)
+            status = "settled_win" if net_pnl > 0 else "settled_loss"
+            to_settle.append((payout, net_pnl, status, r["id"]))
+
+    if not to_settle:
+        return 0
+
+    with tx() as conn:
+        conn.executemany(
+            """
+            UPDATE paper_trades
+            SET exit_price=?, exit_at=strftime('%s','now'), pnl_usdc=?, status=?
+            WHERE id=?
+            """,
+            to_settle,
+        )
+    # on_paper_trade_closed dispara la notif Telegram (gain/loss) + bandit
+    # recompute. Llamado fuera de tx() porque cada uno abre su propia tx.
+    for _, _, _, pid in to_settle:
+        try:
+            await asyncio.to_thread(on_paper_trade_closed, pid)
+        except Exception:
+            log.exception("crypto_arb.settle on_paper_trade_closed pid=%d", pid)
+    return len(to_settle)
+
+
 # --- Loop principal ---
 
 async def crypto_arb_loop() -> None:
@@ -532,6 +635,23 @@ async def crypto_arb_loop() -> None:
                     decision = _evaluate_market(m, binance_ws, config, spot_history)
                     if decision and decision["action"] == "buy":
                         await _open_arb_trade(m, decision)
+
+                # Settle paper_trades open de buckets ya expirados. Los
+                # markets crypto-updown-5m resuelven on-chain ~30s después
+                # del bucket end. settle_resolved() global solo procesa
+                # markets con closed=1 en DB, pero el refresh de markets
+                # corre cada 4h — demasiado lento para buckets de 5min.
+                # Acá fetch directo via gamma por conditionId y settle.
+                try:
+                    n = await asyncio.wait_for(
+                        _settle_crypto_arb_resolved(client), timeout=15,
+                    )
+                    if n:
+                        log.info("crypto_arb.settled n=%d trades", n)
+                except asyncio.TimeoutError:
+                    log.warning("crypto_arb.settle timeout — sigo")
+                except Exception:
+                    log.exception("crypto_arb.settle error")
 
                 if metrics.cycles % HEARTBEAT_EVERY == 0:
                     snap = metrics.snapshot()
