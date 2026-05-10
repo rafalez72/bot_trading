@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal
 from typing import Optional
 
 from src.config import (
@@ -250,6 +251,90 @@ def estimate_slippage(
     }
 
 
+# Polymarket CLOB exige los siguientes límites de precisión decimal en el
+# payload de la orden. Si los excedés, el server responde HTTP 400:
+#   `invalid amounts, the market buy orders maker amount supports a max
+#    accuracy of 2 decimals, taker amount a max of 4 decimals`
+# Como maker = USDC (BUY: shares*price, SELL: shares directos en algunos paths),
+# y taker = shares (BUY) o USDC (SELL), nuestra estrategia conservadora es
+# garantizar que TANTO `shares` como `shares*price` queden dentro de los
+# límites estrictos: shares con max 4 decimales, producto con max 2 decimales.
+MAKER_MAX_DECIMALS = 2  # USDC notional → 2 decimales (centavos)
+TAKER_MAX_DECIMALS = 4  # shares → 4 decimales
+
+_DEC_2 = Decimal("0.01")
+_DEC_4 = Decimal("0.0001")
+
+
+def _quantize_amounts(shares: float, price: float) -> tuple[float, float]:
+    """Cuantiza (shares, price) para cumplir los límites de Polymarket.
+
+    Garantiza:
+      - shares: max 4 decimales (taker_max)
+      - shares * price: max 2 decimales (maker_max)
+
+    Estrategia adaptada al tick del precio:
+      * tick=0.01 (price 2 dec): shares enteros → maker = N*0.PP (2 dec ✓).
+      * tick=0.001 (price 3 dec): shares múltiplos de 10 → maker = 10K*0.PPP =
+        K*P.PP (2 dec ✓). En general shares*10^k debe ser entero donde k es
+        el exceso de decimales del price sobre 2.
+      * tick=0.0001 (4 dec): múltiplos de 100.
+      * Para precios "raros" (no en tick estándar), iteramos buscando el
+        mayor M' = N centavos t.q. M'/price tenga max 4 decimales y el
+        producto exacto sea M'.
+
+    NUNCA overshoot: el producto resultante <= shares*price original
+    (ROUND_DOWN). Devuelve (shares_quant, price); price no se modifica.
+    """
+    if shares <= 0 or price <= 0:
+        return (0.0, price)
+
+    s_dec = Decimal(str(shares))
+    p_dec = Decimal(str(price))
+
+    # ¿Cuántos decimales tiene el price? (Decimal exponent: -2 = 2 decimales)
+    p_exp = -p_dec.as_tuple().exponent if p_dec.as_tuple().exponent < 0 else 0
+
+    # Caso 1: tick estándar (price con 2, 3 o 4 decimales). Quantizar shares
+    # para que el producto sea entero múltiplo de 0.01.
+    # shares * 10^(p_exp-2) debe ser entero, i.e. shares múltiplo de 10^(p_exp-2)
+    # cuando p_exp > 2. Para p_exp <= 2, shares enteros bastan.
+    if p_exp <= 4:
+        if p_exp <= 2:
+            step_int = 1
+        else:
+            step_int = 10 ** (p_exp - 2)
+        # Truncar shares al múltiplo de step_int más cercano hacia abajo.
+        s_int = int(s_dec)
+        shares_quant = (s_int // step_int) * step_int
+        if shares_quant <= 0:
+            return (0.0, price)
+        # Sanity-check: el producto debe encajar en 2 decimales. Si por
+        # algún corner case (p ej. price con 5+ decimales) no encaja,
+        # caemos al loop iterativo abajo.
+        prod = Decimal(shares_quant) * p_dec
+        if prod.quantize(_DEC_2, rounding=ROUND_DOWN) == prod:
+            return (float(shares_quant), price)
+
+    # Caso 2: fallback iterativo. Arranca con M = floor(shares*price*100)/100
+    # y baja en pasos de 0.01 buscando un M tal que (M/price) sea exactamente
+    # 4-decimal y M / price * price = M.
+    maker_cents = int((s_dec * p_dec * 100).to_integral_value(rounding=ROUND_DOWN))
+    for _ in range(500):
+        if maker_cents <= 0:
+            return (0.0, price)
+        M = Decimal(maker_cents) / Decimal(100)
+        s_candidate = (M / p_dec).quantize(_DEC_4, rounding=ROUND_DOWN)
+        if s_candidate > 0 and (s_candidate * p_dec) == M:
+            return (float(s_candidate), price)
+        maker_cents -= 1
+
+    # Fallback defensivo: si nada cuadra en 500 pasos (price extremadamente
+    # raro), devolvemos 0 — el caller rechazará el trade en vez de mandar
+    # algo que el server va a rebotar con 400.
+    return (0.0, price)
+
+
 _OUTBOX_PATH = "/app/data/orders_outbox.jsonl"
 
 
@@ -410,12 +495,12 @@ def place_market_order(
     if price <= 0:
         return OrderResult(ok=False, error=f"precio invalido: {price}")
 
-    # Polymarket exige maker_amount con max 2 decimales (centavos USDC). Como
-    # maker = shares × price, hay que elegir shares tal que el producto tenga
-    # max 2 decimales:
-    #   - tick=0.01 (price con 2 decimales): shares enteros → maker siempre 2 dec ✓
-    #   - tick=0.001 (price con 3 decimales): shares múltiplos de 10 → maker 2 dec ✓
-    # Si no, el server rechaza con "invalid amounts, max 2 decimals".
+    # Polymarket CLOB rechaza con HTTP 400 si los amounts del payload superan
+    # sus límites de precisión: maker (USDC) max 2 decimales, taker (shares)
+    # max 4 decimales. Como la SDK firma con (shares, price) y computa
+    # maker = shares*price internamente, hay que cuantizar `shares` para que
+    # el producto siempre quede a 2 decimales exactos (sin pasarse del size
+    # pedido por el caller).
     tick_size = "0.01"
     if condition_id:
         meta = _get_market_meta(condition_id)
@@ -423,14 +508,9 @@ def place_market_order(
             tick_size = meta["tick_size"]
 
     raw_shares = size_usdc / price
-    if tick_size in ("0.001", "0.0001"):
-        # Cuantizar a múltiplos de 10 (resp. 100) para que maker tenga 2 decimales
-        step = 10 if tick_size == "0.001" else 100
-        shares = (int(raw_shares) // step) * step
-    else:
-        shares = int(raw_shares)
+    shares, price = _quantize_amounts(raw_shares, price)
     if shares <= 0:
-        return OrderResult(ok=False, error=f"size_usdc demasiado chico (tick={tick_size}, raw_shares={raw_shares:.2f})")
+        return OrderResult(ok=False, error=f"size_usdc demasiado chico (tick={tick_size}, raw_shares={raw_shares:.4f})")
 
     # --- Pre-check del orderbook ---
     if not skip_slippage_check:
@@ -464,9 +544,18 @@ def place_market_order(
 
     # --- Intento 2: precio bumpeado ---
     # BUY: pagamos un poco más para asegurar fill. SELL: aceptamos un poco menos.
+    # IMPORTANTE: redondeamos retry_price al tick del market (2 o 3 decimales)
+    # — pasarle un precio fuera del tick_size hace que el server rechace la
+    # orden con "invalid price" (mismo flujo de errores que decimales).
     bump = 1 + LIVE_RETRY_PRICE_BUMP_PCT if side.upper() == "BUY" else 1 - LIVE_RETRY_PRICE_BUMP_PCT
-    retry_price = round(price * bump, 3)
-    remaining = round(shares - filled, 2)
+    tick_dec = 2 if tick_size in ("0.01",) else 3 if tick_size in ("0.001",) else 4
+    retry_price = round(price * bump, tick_dec)
+    # `filled` viene en USDC (makingAmount del response del SDK), no en shares.
+    # Convertimos a shares restantes: shares_remaining = shares_total - filled/price
+    # y volvemos a cuantizar para mantener los límites decimales en la retry.
+    filled_shares = filled / price if price > 0 else 0
+    remaining_raw = max(0.0, shares - filled_shares)
+    remaining, retry_price = _quantize_amounts(remaining_raw, retry_price)
     if remaining <= 0:
         return OrderResult(
             ok=True, order_id=order_id, status=status,
@@ -474,8 +563,8 @@ def place_market_order(
         )
 
     log.info(
-        "retry %s con precio %.3f (vs %.3f, fill previo %.1f%%)",
-        side, retry_price, price, fill_pct * 100,
+        "retry %s con precio %.3f (vs %.3f, fill previo %.1f%%, remaining %.4f shares)",
+        side, retry_price, price, fill_pct * 100, remaining,
     )
     success2, resp2 = _build_and_post(
         client, token_id=token_id, side=side, shares=remaining, price=retry_price,
