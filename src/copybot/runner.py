@@ -538,9 +538,19 @@ async def run_loop(*, once: bool = False) -> None:
             from src.config import ADVERSARIAL_ENABLED
             if ADVERSARIAL_ENABLED:
                 from src.copybot.adversarial_asks import AdversarialAsks
-                adv = AdversarialAsks()
+                from src.copybot.crypto_arb import _list_active_updown_markets
+
+                # 2026-05-10 fix: sin markets_provider, run_once devuelve 0 →
+                # last_at=null para siempre. Wireamos provider que reusa la
+                # query de crypto_arb (UpDown 5min markets activos cerrando
+                # próximos 30min).
+                async def _adv_markets_provider() -> list[dict]:
+                    async with PolymarketClient() as c:
+                        return await _list_active_updown_markets(c)
+
+                adv = AdversarialAsks(markets_provider=_adv_markets_provider)
                 adv_task = asyncio.create_task(adv.run_loop())
-                log.info("adversarial_asks: arrancado en paralelo")
+                log.info("adversarial_asks: arrancado en paralelo (con markets_provider)")
         except Exception as e:
             log.warning("no se pudo arrancar adversarial_asks: %s", e)
 
