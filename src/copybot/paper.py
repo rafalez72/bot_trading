@@ -350,10 +350,14 @@ def open_position(
             vol = m["volume"]
             # Sólo rechazamos por liquidez/volumen si TENEMOS el dato.
             # Para stubs (None) confiamos en que el source trader ya filtró.
-            if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
-                return None, "low_liquidity"
-            if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
-                return None, "low_volume"
+            # crypto_arb opera markets de 5min con liquidez típica $1-5k —
+            # el threshold de $5k pensado para markets de horas/días no
+            # aplica. Exempt explícito para no perder operaciones válidas.
+            if source_wallet != "crypto_arb":
+                if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
+                    return None, "low_liquidity"
+                if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
+                    return None, "low_volume"
             cat = m["category"]
             # 2026-05-08: el bucket "(sin categoría)" agrupa slugs que el
             # matcher de categorize.py no clasifica — eso son ~30-40% del
@@ -361,7 +365,9 @@ def open_position(
             # promedio de cosas heterogéneas, no una mala categoría real.
             # Tratamos al default como "no bucket" y dejamos pasar; el
             # filtrado real lo hace el filtro por wallet/score/policy.
-            if cat and cat != "(sin categoría)":
+            # crypto_arb es un dominio dedicado con sus propios filtros
+            # (edge model + slope), no aplica el category-block global.
+            if source_wallet != "crypto_arb" and cat and cat != "(sin categoría)":
                 cat_row = conn.execute(
                     "SELECT status FROM category_perf WHERE category=?", (cat,)
                 ).fetchone()
@@ -369,10 +375,13 @@ def open_position(
                     return None, "category_blocked"
 
         # Policy self-improvement: bucket-level blocks
-        from src.copybot.policy import is_blocked as policy_blocked
-        block_reason = policy_blocked(category=cat, entry_at=timestamp, entry_price=price)
-        if block_reason:
-            return None, "policy_blocked"
+        # crypto_arb tiene sus propios bloqueos a nivel de signal (edge model);
+        # el policy global está calibrado sobre copy trading clásico.
+        if source_wallet != "crypto_arb":
+            from src.copybot.policy import is_blocked as policy_blocked
+            block_reason = policy_blocked(category=cat, entry_at=timestamp, entry_price=price)
+            if block_reason:
+                return None, "policy_blocked"
 
         # Precio extremo: no copiar entries muy cercanos a 0 o 1
         # (los wins son chicos, los losses pueden ser totales)
@@ -381,20 +390,24 @@ def open_position(
 
         # Diversification cap: si un solo wallet ya hizo > MAX_WALLET_24H_PCT
         # de TODOS los trades en 24h, rechazamos. Guard total>=10 para sample chico.
-        div_row = conn.execute(
-            """
-            SELECT
-              COUNT(*) AS total,
-              SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
-            FROM paper_trades
-            WHERE entry_at >= strftime('%s','now') - 86400
-            """,
-            (source_wallet,),
-        ).fetchone()
-        total_24h = (div_row["total"] or 0) if div_row else 0
-        this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
-        if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
-            return None, "diversification_cap"
+        # crypto_arb va a ser >50% del flujo si encuentra edge — el cap del
+        # copytrading clásico (anti-overconcentration de un wallet) no aplica
+        # al bot dedicado.
+        if source_wallet != "crypto_arb":
+            div_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
+                FROM paper_trades
+                WHERE entry_at >= strftime('%s','now') - 86400
+                """,
+                (source_wallet,),
+            ).fetchone()
+            total_24h = (div_row["total"] or 0) if div_row else 0
+            this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
+            if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
+                return None, "diversification_cap"
 
         size_usdc = COPY_BASE_USDC * sizing
 
@@ -404,10 +417,14 @@ def open_position(
 
         # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
         # no vale la pena. Descarta trades con sizing_mult muy chico.
-        from src.config import PAPER_MIN_EXPECTED_PNL_USDC
-        expected = expected_net_pnl(size_usdc)
-        if expected < PAPER_MIN_EXPECTED_PNL_USDC:
-            return None, "expected_pnl_too_low"
+        # crypto_arb usa CRYPTO_ARB_BET_SIZE_USDC (default $5) y su edge ya está
+        # filtrado por el modelo (>= CRYPTO_ARB_MIN_EDGE = 10pp). El threshold
+        # PAPER_MIN_EXPECTED_PNL del copytrading no se calibra contra ese flow.
+        if source_wallet != "crypto_arb":
+            from src.config import PAPER_MIN_EXPECTED_PNL_USDC
+            expected = expected_net_pnl(size_usdc)
+            if expected < PAPER_MIN_EXPECTED_PNL_USDC:
+                return None, "expected_pnl_too_low"
 
         # Cap de entries por (wallet, market): el source wallet suele hacer
         # DCA / pyramiding (varias entries averaging in en el mismo cid).
