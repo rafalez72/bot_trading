@@ -169,7 +169,10 @@ def test_stale_trade_respects_configured_threshold(isolated_db, monkeypatch):
     We monkeypatch the module-level threshold to a small value so the test
     is deterministic regardless of the env-driven default.
     """
-    monkeypatch.setattr(paper, "MAX_TRADE_AGE_SECONDS", 30)
+    # 2026-05-10: el threshold se movió a src.copybot.validation tras
+    # el refactor a single-source-of-truth para checks paper/live.
+    from src.copybot import validation as _val
+    monkeypatch.setattr(_val, "STALE_TRADE_MAX_AGE_S", 30)
 
     _seed_subscription()
 

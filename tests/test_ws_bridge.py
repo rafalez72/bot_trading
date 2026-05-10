@@ -259,7 +259,7 @@ def test_idempotencia_WS_primero_polling_segundo(isolated_db, monkeypatch):
     from src.copybot import paper
 
     # Permitir que el filtro stale_trade no rechace nuestro fixture
-    monkeypatch.setattr(paper, "MAX_TRADE_AGE_SECONDS", 10**9)
+    monkeypatch.setattr("src.copybot.validation.STALE_TRADE_MAX_AGE_S", 10**9)
 
     _seed_subscription("0xwallet1")
 
@@ -347,7 +347,7 @@ def test_idempotencia_polling_primero_WS_segundo(isolated_db, monkeypatch):
     un reconnect, o race en la otra dirección). El WS debe ver el guard."""
     from src.copybot import paper
 
-    monkeypatch.setattr(paper, "MAX_TRADE_AGE_SECONDS", 10**9)
+    monkeypatch.setattr("src.copybot.validation.STALE_TRADE_MAX_AGE_S", 10**9)
 
     _seed_subscription("0xwallet1")
     payload = _make_payload(side="BUY", timestamp=1778000000)

@@ -289,221 +289,42 @@ def _apply_dry_slippage(side: str, price: float) -> float:
 
 def _open_position_validate(conn, *, source_wallet, source_trade_id, condition_id,
                             outcome_index, price, timestamp, raw):
-    """Reusa toda la validación de paper.open_position.
+    """Aplica los mismos pre-open checks que paper.open_position.
 
-    Devuelve (size_usdc, market_row, category, category_allowed) si pasa, o
-    (None, reject_reason) si rechaza. Es deliberadamente similar a paper para
-    mantener simetría — cualquier mejora a los filtros se aplica a ambos.
+    2026-05-10 refactor: la lógica de filtros vive en
+    src.copybot.validation.run_pre_open_checks (single source of truth).
+    Lo único que cambia entre paper/live es el `TradeValidationContext`
+    (tabla destino, capital, threshold de PnL esperado, log_reject hook).
+
+    Devuelve ((size_usdc, market_row, category), None) si pasa, o
+    (None, reject_reason) si rechaza.
     """
-    if _check_kill_switch(conn):
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "kill_switch")
-        return None, "kill_switch"
+    from src.copybot.validation import (
+        TradeValidationContext,
+        run_pre_open_checks,
+    )
 
-    # Anti-stale: ver paper.open_position. Mismo umbral compartido (config.STALE_TRADE_MAX_AGE_S).
-    # _should_log_stale dedupea logs del mismo source_trade_id en 60s — el
-    # polling re-procesa los mismos trades 10+ veces/segundo (caso real
-    # 2026-05-09: 12 stale_trade rejects en 1 segundo para el mismo wallet+cid).
-    # La rejection sigue ocurriendo; solo silenciamos el log + el insert al
-    # tabla live_rejects para evitar spam.
-    from src.copybot.paper import MAX_TRADE_AGE_SECONDS, _should_log_stale
-    age = int(time.time()) - int(timestamp or 0)
-    if age > MAX_TRADE_AGE_SECONDS:
-        if _should_log_stale(source_trade_id):
-            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
-                        "stale_trade", detail=json.dumps({"age_s": age,
-                                                          "threshold_s": MAX_TRADE_AGE_SECONDS}))
-        return None, "stale_trade"
-
-    sub = conn.execute(
-        "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
-        (source_wallet,),
-    ).fetchone()
-    if not sub:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "no_subscription")
-        return None, "no_subscription"
-    if sub["status"] != "active":
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
-                    detail=json.dumps({"sub_status": sub["status"]}))
-        return None, "inactive"
-    # IMPORTANTE: usar `is None` y NO `or` — un sizing_mult=0 (drop residual)
-    # con `or` se convertía a 1.0, dejando wallets dropped operando como
-    # zombies. Ahora 0 es 0 y cae al check de EPSILON debajo.
-    sm = sub["sizing_mult"]
-    sizing = 1.0 if sm is None else float(sm)
-    if sizing <= EPSILON:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "inactive",
-                    detail=json.dumps({"sizing_mult": sizing}))
-        return None, "inactive"
-
-    cs = conn.execute(
-        """
-        SELECT cp.status FROM wallet_clusters wc
-        JOIN cluster_perf cp ON cp.cluster_id = wc.cluster_id
-        WHERE wc.wallet=?
-        """,
-        (source_wallet,),
-    ).fetchone()
-    if cs and cs["status"] == "blocked":
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "cluster_blocked")
-        return None, "cluster_blocked"
-    if cs and cs["status"] == "penalized":
-        sizing = sizing * 0.5
-
-    dup = conn.execute(
-        "SELECT id FROM live_trades WHERE source_trade_id=?",
-        (source_trade_id,),
-    ).fetchone()
-    if dup:
-        # duplicate: no se loguea (ruido alto, valor bajo)
-        return None, "duplicate"
-
-    m = _ensure_market_stub(conn, condition_id, raw)
-    # Filtro inteligente: bloquear markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS.
-    # Reemplaza el filtro lazy por slug pattern. Más preciso: un -15m- recién abierto
-    # (15 min restantes) ya pasa, pero un -1h- con 3 min restantes se rechaza.
-    # Si no hay timestamp parseable en el slug, fail-open (no bloquea — los slugs
-    # sin epoch suelen ser markets largos: deportes, política, etc).
-    slug = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
-    if not slug and m:
-        slug = m["slug"] if "slug" in m.keys() else None
-    expiry_ts = _parse_slug_expiry(slug)
-    if expiry_ts is not None:
-        time_left = expiry_ts - int(time.time())
-        if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
-            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price,
-                        "expires_too_soon",
-                        detail=json.dumps({"slug": slug, "time_left_sec": time_left,
-                                            "min_required": MIN_TIME_TO_EXPIRY_SECONDS}))
-            return None, "expires_too_soon"
-    cat = None
-    if m:
-        liq = m["liquidity"]
-        vol = m["volume"]
-        if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
-            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "low_liquidity",
-                        detail=json.dumps({"liquidity": liq, "min": MIN_MARKET_LIQUIDITY_USDC}))
-            return None, "low_liquidity"
-        if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
-            _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "low_volume",
-                        detail=json.dumps({"volume": vol, "min": MIN_MARKET_VOLUME_USDC}))
-            return None, "low_volume"
-        cat = m["category"]
-        # 2026-05-08: paridad con paper.py — "(sin categoría)" es un default
-        # del matcher, no una categoría real. No bloquear por ese bucket.
-        if cat and cat != "(sin categoría)":
-            cat_row = conn.execute(
-                "SELECT status FROM category_perf WHERE category=?", (cat,)
-            ).fetchone()
-            if cat_row and cat_row["status"] == "blocked":
-                _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "category_blocked",
-                            detail=json.dumps({"category": cat}))
-                return None, "category_blocked"
-
-    from src.copybot.policy import is_blocked as policy_blocked
-    if policy_blocked(category=cat, entry_at=timestamp, entry_price=price):
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "policy_blocked",
-                    detail=json.dumps({"category": cat}))
-        return None, "policy_blocked"
-
-    if price < 0.05 or price > 0.95:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "extreme_price")
-        return None, "extreme_price"
-
-    # Diversification cap: si un solo wallet ya hizo > MAX_WALLET_24H_PCT
-    # de TODOS los trades en 24h, rechazamos para forzar diversificación.
-    # Guard total>=10 para evitar rechazos cuando recién arrancamos
-    # (1 trade de un wallet sería 100% de un sample chico).
-    from src.copybot.tradebook import TABLE as _TABLE_DIV
-    div_row = conn.execute(
-        f"""
-        SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
-        FROM {_TABLE_DIV}
-        WHERE entry_at >= strftime('%s','now') - 86400
-        """,
-        (source_wallet,),
-    ).fetchone()
-    total_24h = (div_row["total"] or 0) if div_row else 0
-    this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
-    if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
+    def _log(reason: str, detail=None) -> None:
         _log_reject(
-            source_wallet, condition_id, outcome_index, "BUY", price,
-            "diversification_cap",
-            detail=json.dumps({
-                "total_24h": total_24h,
-                "this_wallet_24h": this_wallet_24h,
-                "pct": this_wallet_24h / total_24h,
-                "cap": MAX_WALLET_24H_PCT,
-            }),
+            source_wallet, condition_id, outcome_index, "BUY", price, reason,
+            detail=json.dumps(detail) if detail else None,
         )
-        return None, "diversification_cap"
 
-    # Size base × sizing del bandit. Adicionalmente: en markets thin
-    # (liq < $3000) escalamos a 0.5× para mitigar slippage real (los markets
-    # chicos tienen orderbooks delgados → tu orden mueve el precio).
-    # Límite duro: liq < MIN_MARKET_LIQUIDITY_USDC ya rechazó arriba; el
-    # escalado aquí cubre la franja $1500-3000 = "operable pero arriesgado".
-    liq = m["liquidity"] if (m and m["liquidity"] is not None) else None
-    liq_factor = 0.5 if (liq is not None and liq < 3000) else 1.0
-    size_usdc = LIVE_BASE_USDC * sizing * liq_factor
-
-    # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
-    # no vale la pena. Esto descarta trades donde sizing_mult dejó el size muy chico.
-    expected = expected_net_pnl(size_usdc)
-    if expected < LIVE_MIN_EXPECTED_PNL_USDC:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "expected_pnl_too_low",
-                    detail=json.dumps({"size_usdc": size_usdc, "expected": expected,
-                                        "min": LIVE_MIN_EXPECTED_PNL_USDC}))
-        return None, "expected_pnl_too_low"
-
-    # Cap de entries por (wallet, market): el source wallet suele hacer
-    # DCA / pyramiding (varias entries averaging in en el mismo cid). Antes
-    # bloqueábamos por dollar-cap LIVE_MAX_PER_WALLET_USDC, lo que con base
-    # $2.5 y cap $10 dejaba pasar 4 entries — pero sumaba cross-market
-    # spuriamente. Ahora contamos entries open por (wallet, cid): hasta
-    # MAX_ENTRIES_PER_WALLET_MARKET (default 3). El per-market dollar cap
-    # (MAX_PER_MARKET_PCT * LIVE_CAPITAL_USDC) sigue actuando abajo como
-    # segundo guard sobre el size acumulado.
-    entries_open = conn.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM live_trades
-        WHERE source_wallet=? AND condition_id=? AND status='open'
-        """,
-        (source_wallet, condition_id),
-    ).fetchone()["c"]
-    if entries_open >= MAX_ENTRIES_PER_WALLET_MARKET:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "wallet_concentration",
-                    detail=json.dumps({"entries_open": entries_open,
-                                        "max": MAX_ENTRIES_PER_WALLET_MARKET}))
-        return None, "wallet_concentration"
-
-    per_market_cap = LIVE_CAPITAL_USDC * MAX_PER_MARKET_PCT
-    market_open = conn.execute(
-        """
-        SELECT COALESCE(SUM(entry_size_usdc), 0) as v
-        FROM live_trades
-        WHERE condition_id=? AND status='open'
-        """,
-        (condition_id,),
-    ).fetchone()["v"]
-    if market_open + size_usdc > per_market_cap + EPSILON:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "market_concentration",
-                    detail=json.dumps({"open_usdc": market_open, "size_usdc": size_usdc,
-                                        "cap": per_market_cap}))
-        return None, "market_concentration"
-
-    global_open = conn.execute(
-        "SELECT COALESCE(SUM(entry_size_usdc), 0) as v FROM live_trades WHERE status='open'"
-    ).fetchone()["v"]
-    if global_open + size_usdc > LIVE_CAPITAL_USDC + EPSILON:
-        _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "capital_full",
-                    detail=json.dumps({"open_usdc": global_open, "size_usdc": size_usdc,
-                                        "cap": LIVE_CAPITAL_USDC}))
-        return None, "capital_full"
-
-    return (size_usdc, m, cat), None
+    ctx = TradeValidationContext(
+        source_wallet=source_wallet,
+        source_trade_id=source_trade_id,
+        condition_id=condition_id,
+        outcome_index=outcome_index,
+        price=price,
+        timestamp=timestamp,
+        raw=raw,
+        trades_table="live_trades",
+        capital_usdc=LIVE_CAPITAL_USDC,
+        base_usdc=LIVE_BASE_USDC,
+        min_expected_pnl_usdc=LIVE_MIN_EXPECTED_PNL_USDC,
+        log_reject=_log,
+    )
+    return run_pre_open_checks(conn, ctx)
 
 
 def open_position(

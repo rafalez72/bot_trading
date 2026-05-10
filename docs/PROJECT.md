@@ -1,6 +1,6 @@
 # Polymarket Copy Bot — Master Project Doc
 
-> **Última actualización**: 2026-05-09 (día denso: fix BIGINT cursors RTDS ms→s + 8 features defensivas A-G+I post-análisis pérdidas + bot N2 crypto_arb con edge model probabilístico + Telegram con categoría/título + auto-rebalance 2h + discovery topvolume diario + shadow watch 200 candidatas + relax wallet_concentration y stale_trade. ~17 commits, 109 tests verde.)
+> **Última actualización**: 2026-05-10 (single-source-of-truth para checks paper/live: nuevo `src/copybot/validation.py` con los 18 reject reasons. paper.py y executor.py llaman al mismo `run_pre_open_checks`. Antes había drift: 8+ exempts para crypto_arb se aplicaron a paper.py el 2026-05-09 pero NO a executor.py — el bot N2 nunca podría haber operado en LIVE_MODE. + bug crypto end-to-end resuelto: settler dedicado por slug + on_paper_trade_closed sin early-return para wallets sintéticas. + Telegram crypto operativo. + reset PnL via bot_state.pnl_reset_at.)
 > **Propósito**: documento maestro que cualquier asistente AI puede leer al inicio de una nueva conversación para entender el estado completo del proyecto. **Si modificás funcionalidad, ACTUALIZÁ ESTE DOCUMENTO.**
 
 ---
@@ -769,6 +769,98 @@ PnL acumulado: +$1,470.66 sobre cap $100
 ---
 
 ## 16. Bitácora de avances (changelog cronológico)
+
+### 2026-05-10 — Refactor validation compartida + crypto N2 operativo end-to-end
+
+**Hito**: paper y live ahora comparten 100% de la lógica de pre-open checks
+vía `src/copybot/validation.py`. **Lo único que cambia entre paper y live es el
+`.env`** (`LIVE_MODE=true`/`false`), como pidió el user. Y los 7 bugs
+encadenados que tenían al bot N2 (crypto_arb) sin abrir un solo trade real
+quedaron resueltos.
+
+#### Refactor a single-source-of-truth (validation.py)
+**Problema diagnosticado**: el 2026-05-09 apliqué 8+ exempts para crypto_arb
+en `paper.py` (no_subscription, expires_too_soon, low_liquidity, low_volume,
+category_blocked, policy_blocked, diversification_cap, expected_pnl_too_low).
+**Pero `executor.py` (LIVE) NUNCA fue tocado**. Si pasábamos a real, crypto_arb
+no podría haber abierto ni un trade — todos los filtros del copytrading
+clásico lo bloqueaban.
+
+Refactor:
+- **`src/copybot/validation.py`** (nuevo, ~330 líneas): `TradeValidationContext`
+  + `run_pre_open_checks(conn, ctx)` con los 18 reject reasons en orden, todos
+  los exempts de crypto_arb integrados, y los helpers (`_market_stub`,
+  `_check_kill_switch`, `should_log_stale`, `_parse_end_date_to_epoch`).
+- **`paper.open_position`**: ~150 líneas eliminadas, ahora arma el context
+  (table='paper_trades', BOT_CAPITAL_USDC, COPY_BASE_USDC,
+  PAPER_MIN_EXPECTED_PNL_USDC) y llama `run_pre_open_checks`.
+- **`executor._open_position_validate`**: ~230 líneas eliminadas, mismo
+  pattern (table='live_trades', LIVE_CAPITAL_USDC, LIVE_BASE_USDC,
+  LIVE_MIN_EXPECTED_PNL_USDC) + callback `log_reject` para persistir a
+  live_rejects (paper no persiste rejects).
+- Tests actualizados: monkeypatches movidos de `paper.MAX_TRADE_AGE_SECONDS`
+  a `validation.STALE_TRADE_MAX_AGE_S`. 109/109 verde.
+
+**Resultado**: cualquier mejora futura a los filtros se aplica
+automáticamente a ambos. **Pasar a real es flip de env vars**:
+```
+LIVE_MODE=true     # actual: false
+LIVE_DRY_RUN=false # actual: true
+```
+(con los caveats de validación en muestra grande, wallet limpia, capital
+inicial chico, etc. — ver §17).
+
+#### Cadena de 7 bugs del bot N2 (crypto_arb) — resueltos hoy
+Tras 4h de zombi (13 trades open sin settle, 0 notif Telegram):
+
+1. **`no_subscription`** (`a0546a3`): `paper.open_position` rejectaba a
+   `crypto_arb` porque no estaba en `copy_subscriptions`. Exempt para
+   wallets sintéticas.
+2. **`expires_too_soon`** (`bd19f16`): MIN_TIME_TO_EXPIRY_SECONDS=600 (10min)
+   bloqueaba updown-5m. Exempt para crypto_arb (precisamente diseñado para
+   markets <5min).
+3. **4 filtros más** (`ea7d546`): `low_liquidity` (markets crypto-updown
+   tienen $1-5k vs MIN=$5k), `low_volume`, `category_blocked` (si "crypto"
+   estuviera en blocklist), `policy_blocked`, `diversification_cap` (crypto_arb
+   sería >50% del flow), `expected_pnl_too_low`. Todos exempt.
+4. **BOT_CAPITAL_USDC=96** muy chico: 24 trades del N1 ocupaban $92.11 →
+   solo $4 libres < bet $5 → `capital_full`. Subido a 150 en `.env`.
+5. **Settler dedicado** (`c86f903`): `paper.settle_resolved()` global solo
+   procesa markets con `closed=1` en DB, pero el refresh de markets corre
+   cada 4h. Para buckets de 5min → trades zombi para siempre. Nuevo
+   `_settle_crypto_arb_resolved` en el loop del crypto_arb (cada 15s) que
+   fetch directo a gamma.
+6. **Gamma API roto con conditionId+closed** (`d7d4cc8`): pedirle a gamma
+   `/markets?conditionId=X` IGNORA el filtro tanto con `closed=true` como
+   sin él, devolviendo markets random (verificado: pedimos doge-updown cid
+   → devolvió biden-corona/rhianna-album). Fix: agrupar por slug en lugar
+   de cid (gamma sí respeta `slug=Y&closed=true`). + validación de cid del
+   response como defensa permanente.
+7. **`on_paper_trade_closed` early-return** (`c6edffe`): hacía
+   `if not sub: return` cuando el wallet no estaba en copy_subscriptions.
+   Aplicaba a TODOS los settles de crypto_arb → notif gain/loss nunca
+   dispararon. Fix: skip drop/cluster checks si `is_synthetic_source`,
+   pero seguir al notif + bandit.
+
+Después de los 7 fixes: bot N2 operando con primera muestra positiva
+(+$10-15 sobre 50+ trades, win rate ~60%). Notif Telegram operativas con
+formato `🪙 Crypto-shortterm · _título_`.
+
+#### PnL acumulado: reset opcional + unificado (one-shot adjustment)
+- `bot_state.pnl_reset_at` (epoch s, default 0). Filtra `SUM(pnl_usdc)` por
+  `exit_at >= reset_at`. UPDATE manual a esa key resetea el contador sin
+  perder histórico.
+- `notifier.gain()`/`loss()` aceptan `bucket_label` opcional. Iteramos:
+  primero versión separada (Crypto vs Sports), luego unificada (single
+  pool, una sola wallet en prod). Final: un solo `Acumulado:` que suma
+  todo desde el reset.
+
+#### Tests
+- 109/109 passing post-refactor.
+- 7 fallas pre-existentes en `tests/test_executor.py` (deadlock SQLite
+  `_log_reject` dentro de tx() — no relacionado con el refactor).
+
+---
 
 ### 2026-05-09 — N1+N2 deploy + 8 features defensivas + bot crypto_arb + universe scaling
 

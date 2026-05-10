@@ -214,253 +214,41 @@ def open_position(
     locales en el momento que procesamos. Si se omiten, defaultean a los del
     source (compatibilidad pre-feature-G; rows viejas tienen NULL).
     """
+    # 2026-05-10 refactor: todos los pre-open checks viven en
+    # validation.run_pre_open_checks (single source of truth compartida con
+    # executor.py para LIVE). Lo único que cambia entre paper/live es el
+    # context (tabla destino, capital, threshold de pnl esperado).
+    from src.copybot.validation import (
+        TradeValidationContext,
+        run_pre_open_checks,
+    )
+    from src.config import PAPER_MIN_EXPECTED_PNL_USDC
+
+    ctx = TradeValidationContext(
+        source_wallet=source_wallet,
+        source_trade_id=source_trade_id,
+        condition_id=condition_id,
+        outcome_index=outcome_index,
+        price=price,
+        timestamp=timestamp,
+        raw=raw,
+        trades_table="paper_trades",
+        capital_usdc=BOT_CAPITAL_USDC,
+        base_usdc=COPY_BASE_USDC,
+        min_expected_pnl_usdc=PAPER_MIN_EXPECTED_PNL_USDC,
+        log_reject=None,  # paper no persiste rejects; los rejects se ven en logs
+    )
     with tx() as conn:
-        if _check_kill_switch(conn):
-            return None, "kill_switch"
+        result, reject = run_pre_open_checks(conn, ctx)
+        if reject:
+            return None, reject
+        size_usdc, m, _cat = result
 
-        # Anti-stale: si el trade del source wallet tiene más de
-        # MAX_TRADE_AGE_SECONDS de antigüedad cuando lo procesamos, no
-        # copiar. Caso 2026-05-06: 2 trades LoL Game 2 entry tardío → -$10
-        # cada uno cuando el match terminó a $0.001 minutos después.
-        import time as _time
-        age = int(_time.time()) - int(timestamp or 0)
-        if age > MAX_TRADE_AGE_SECONDS:
-            # Suprimimos logs duplicados del mismo source_trade_id en 60s
-            # (polling re-procesa los mismos trades 10+ veces/segundo).
-            if _should_log_stale(source_trade_id):
-                log.info(
-                    "paper.stale_trade wallet=%s cid=%s age_s=%d threshold=%d",
-                    (source_wallet or "")[:10], (condition_id or "")[:10],
-                    age, MAX_TRADE_AGE_SECONDS,
-                )
-            return None, "stale_trade"
-
-        # crypto_arb es una source_wallet sintética del bot N2 (no una wallet
-        # real de Polymarket), no necesita entry en copy_subscriptions ni
-        # wallet_clusters. Skip los 2 checks que dependen de eso.
-        if source_wallet != "crypto_arb":
-            sub = conn.execute(
-                "SELECT sizing_mult, status FROM copy_subscriptions WHERE wallet=?",
-                (source_wallet,),
-            ).fetchone()
-            if not sub:
-                return None, "no_subscription"
-            if sub["status"] != "active":
-                return None, "inactive"
-            # Usar `is None` y NO `or` — un sizing_mult=0 (drop residual) con `or`
-            # se convertía a 1.0, dejando wallets dropped operando como zombies.
-            sm = sub["sizing_mult"]
-            sizing = 1.0 if sm is None else float(sm)
-            if sizing <= EPSILON:
-                return None, "inactive"
-
-            # Cluster check: si el cluster del wallet está blocked, no abrir
-            cs = conn.execute(
-                """
-                SELECT cp.status, cp.avg_win_rate, cp.pnl_usdc, cp.n_trades
-                FROM wallet_clusters wc
-                JOIN cluster_perf cp ON cp.cluster_id = wc.cluster_id
-                WHERE wc.wallet=?
-                """,
-                (source_wallet,),
-            ).fetchone()
-            if cs and cs["status"] == "blocked":
-                return None, "cluster_blocked"
-        else:
-            # crypto_arb: sizing fijo 1.0, sin cluster check.
-            sizing = 1.0
-            cs = None
-        # Si el cluster está penalizado, achicamos el sizing a la mitad
-        if cs and cs["status"] == "penalized":
-            sizing = sizing * 0.5
-
-        # Duplicado por source_trade_id
-        dup = conn.execute(
-            "SELECT id FROM paper_trades WHERE source_trade_id=?",
-            (source_trade_id,),
-        ).fetchone()
-        if dup:
-            return None, "duplicate"
-
-        # Liquidez / volumen / categoría del mercado
-        # Si no está en `markets`, creamos stub con slug/title del raw del trade
-        # (cubre los mercados negRisk que la Gamma API no devuelve por conditionId)
-        m = _ensure_market_stub(conn, condition_id, raw)
-
-        # Resolvemos el slug temprano: lo necesitan tanto el market_horizon
-        # check (Feature E) como el slug-epoch check más abajo.
-        slug_for_filters = (raw or {}).get("slug") or (raw or {}).get("eventSlug")
-        if not slug_for_filters and m:
-            try:
-                slug_for_filters = m["slug"]
-            except (KeyError, IndexError):
-                slug_for_filters = None
-
-        # Feature A: short-horizon market filter.
-        # Markets cuyo `end_date` está a <MARKET_HORIZON_MIN_SECS (default 30min)
-        # son ruido para SL=20%: el mid se mueve por noise pre-resolución.
-        # Excluimos `crypto_arb` que está diseñado para markets de 5min.
-        # Si end_date es desconocido/None → fail-open (no rechazar).
-        if source_wallet != "crypto_arb" and m is not None:
-            try:
-                end_date_raw = m["end_date"]
-            except (KeyError, IndexError):
-                end_date_raw = None
-            end_ts = _parse_end_date_to_epoch(end_date_raw)
-            if end_ts is None:
-                log.debug(
-                    "market_horizon: end_date desconocido cid=%s — allow",
-                    (condition_id or "")[:10],
-                )
-            else:
-                horizon_left = end_ts - int(time.time())
-                if horizon_left < MARKET_HORIZON_MIN_SECS:
-                    return None, "market_too_short"
-
-        # Feature E: bloqueo por categoría ultra-corta (esports live,
-        # crypto-updown 5/15min, sport in-play). Independiente del check de
-        # horizon: aplica aunque end_date no esté disponible para crypto/esports
-        # (que se detectan por slug pattern).
-        if BLOCK_ULTRASHORT_MARKETS and source_wallet != "crypto_arb":
-            from src.copybot.categorize import is_ultrashort_market
-            end_ts_for_cat = None
-            if m is not None:
-                try:
-                    end_ts_for_cat = _parse_end_date_to_epoch(m["end_date"])
-                except (KeyError, IndexError):
-                    end_ts_for_cat = None
-            if is_ultrashort_market(slug_for_filters, end_ts_for_cat):
-                return None, "ultrashort_market"
-
-        # Smart expiry filter: bloquea markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS
-        # (default 600s = 10min). Cubre slugs con epoch al final, slugs con
-        # date+hour ET, y -YYYY-MM-DD$ al final. Fail-open si no parsea.
-        # crypto_arb está diseñado precisamente para markets de 5min — exempt.
-        slug = slug_for_filters
-        if source_wallet != "crypto_arb":
-            expiry_ts = parse_slug_expiry(slug)
-            if expiry_ts is not None:
-                time_left = expiry_ts - int(time.time())
-                if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
-                    return None, "expires_too_soon"
-
-        cat = None
-        if m:
-            liq = m["liquidity"]
-            vol = m["volume"]
-            # Sólo rechazamos por liquidez/volumen si TENEMOS el dato.
-            # Para stubs (None) confiamos en que el source trader ya filtró.
-            # crypto_arb opera markets de 5min con liquidez típica $1-5k —
-            # el threshold de $5k pensado para markets de horas/días no
-            # aplica. Exempt explícito para no perder operaciones válidas.
-            if source_wallet != "crypto_arb":
-                if liq is not None and liq < MIN_MARKET_LIQUIDITY_USDC:
-                    return None, "low_liquidity"
-                if vol is not None and vol < MIN_MARKET_VOLUME_USDC:
-                    return None, "low_volume"
-            cat = m["category"]
-            # 2026-05-08: el bucket "(sin categoría)" agrupa slugs que el
-            # matcher de categorize.py no clasifica — eso son ~30-40% del
-            # flujo y el bloqueo histórico (615 trades, 27% wr) era un
-            # promedio de cosas heterogéneas, no una mala categoría real.
-            # Tratamos al default como "no bucket" y dejamos pasar; el
-            # filtrado real lo hace el filtro por wallet/score/policy.
-            # crypto_arb es un dominio dedicado con sus propios filtros
-            # (edge model + slope), no aplica el category-block global.
-            if source_wallet != "crypto_arb" and cat and cat != "(sin categoría)":
-                cat_row = conn.execute(
-                    "SELECT status FROM category_perf WHERE category=?", (cat,)
-                ).fetchone()
-                if cat_row and cat_row["status"] == "blocked":
-                    return None, "category_blocked"
-
-        # Policy self-improvement: bucket-level blocks
-        # crypto_arb tiene sus propios bloqueos a nivel de signal (edge model);
-        # el policy global está calibrado sobre copy trading clásico.
-        if source_wallet != "crypto_arb":
-            from src.copybot.policy import is_blocked as policy_blocked
-            block_reason = policy_blocked(category=cat, entry_at=timestamp, entry_price=price)
-            if block_reason:
-                return None, "policy_blocked"
-
-        # Precio extremo: no copiar entries muy cercanos a 0 o 1
-        # (los wins son chicos, los losses pueden ser totales)
-        if price < 0.05 or price > 0.95:
-            return None, "extreme_price"
-
-        # Diversification cap: si un solo wallet ya hizo > MAX_WALLET_24H_PCT
-        # de TODOS los trades en 24h, rechazamos. Guard total>=10 para sample chico.
-        # crypto_arb va a ser >50% del flujo si encuentra edge — el cap del
-        # copytrading clásico (anti-overconcentration de un wallet) no aplica
-        # al bot dedicado.
-        if source_wallet != "crypto_arb":
-            div_row = conn.execute(
-                """
-                SELECT
-                  COUNT(*) AS total,
-                  SUM(CASE WHEN source_wallet=? THEN 1 ELSE 0 END) AS this_wallet
-                FROM paper_trades
-                WHERE entry_at >= strftime('%s','now') - 86400
-                """,
-                (source_wallet,),
-            ).fetchone()
-            total_24h = (div_row["total"] or 0) if div_row else 0
-            this_wallet_24h = (div_row["this_wallet"] or 0) if div_row else 0
-            if total_24h >= 10 and (this_wallet_24h / total_24h) > MAX_WALLET_24H_PCT:
-                return None, "diversification_cap"
-
-        size_usdc = COPY_BASE_USDC * sizing
-
-        # Realismo: el bot paga MÁS que el source por slippage de ejecución
+        # Realismo: aplicar slippage de ejecución al precio del source.
+        # No es un check de rechazo, así que se queda fuera del módulo
+        # validation (que solo decide pasa/rechaza).
         liquidity = m["liquidity"] if m else None
         price = realistic_entry_price(price, liquidity)
-
-        # Filter anti-fees: si el PnL esperado del trade no cubre fees + slippage,
-        # no vale la pena. Descarta trades con sizing_mult muy chico.
-        # crypto_arb usa CRYPTO_ARB_BET_SIZE_USDC (default $5) y su edge ya está
-        # filtrado por el modelo (>= CRYPTO_ARB_MIN_EDGE = 10pp). El threshold
-        # PAPER_MIN_EXPECTED_PNL del copytrading no se calibra contra ese flow.
-        if source_wallet != "crypto_arb":
-            from src.config import PAPER_MIN_EXPECTED_PNL_USDC
-            expected = expected_net_pnl(size_usdc)
-            if expected < PAPER_MIN_EXPECTED_PNL_USDC:
-                return None, "expected_pnl_too_low"
-
-        # Cap de entries por (wallet, market): el source wallet suele hacer
-        # DCA / pyramiding (varias entries averaging in en el mismo cid).
-        # Bloqueamos a partir de N entries simultáneas — no antes — para
-        # dejar pasar el patrón legítimo. El per-market dollar cap
-        # (MAX_PER_MARKET_PCT) sigue aplicándose abajo como guard adicional.
-        entries_open = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM paper_trades
-            WHERE source_wallet=? AND condition_id=? AND status='open'
-            """,
-            (source_wallet, condition_id),
-        ).fetchone()["c"]
-        if entries_open >= MAX_ENTRIES_PER_WALLET_MARKET:
-            return None, "wallet_concentration"
-
-        # Cap por mercado: max MAX_PER_MARKET_PCT del capital en un solo cid
-        per_market_cap = BOT_CAPITAL_USDC * MAX_PER_MARKET_PCT
-        market_open = conn.execute(
-            """
-            SELECT COALESCE(SUM(entry_size_usdc), 0) as v
-            FROM paper_trades
-            WHERE condition_id=? AND status='open'
-            """,
-            (condition_id,),
-        ).fetchone()["v"]
-        if market_open + size_usdc > per_market_cap + EPSILON:
-            return None, "market_concentration"
-
-        # Cap global: total open <= BOT_CAPITAL_USDC
-        global_open = conn.execute(
-            "SELECT COALESCE(SUM(entry_size_usdc), 0) as v FROM paper_trades WHERE status='open'"
-        ).fetchone()["v"]
-        if global_open + size_usdc > BOT_CAPITAL_USDC + EPSILON:
-            return None, "capital_full"
 
         asset = (raw or {}).get("asset")
         # Feature G: telemetry de copy lag. Si el caller no pasó our_entry_at/
