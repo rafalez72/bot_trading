@@ -491,6 +491,59 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar crypto_arb: %s", e)
 
+    # Strategy A — market making (default off, gated por MM_ENABLED).
+    # Ver src/copybot/market_maker.py: posteo de bid+ask con spread fijo
+    # y rebalance periódico. maybe_start_market_maker_in_background ya
+    # checkea MM_ENABLED internamente y devuelve None si está off, pero
+    # gateamos también acá para evitar el import si no aplica.
+    mm_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.config import MM_ENABLED
+            if MM_ENABLED:
+                from src.copybot.market_maker import maybe_start_market_maker_in_background
+                mm_task = maybe_start_market_maker_in_background()
+                if mm_task is not None:
+                    log.info("market_maker: arrancado en paralelo")
+                else:
+                    log.info("market_maker: maybe_start devolvió None (cfg disabled)")
+        except Exception as e:
+            log.warning("no se pudo arrancar market_maker: %s", e)
+
+    # Strategy B — spike arbitrage (default off, gated por SPIKE_ARB_ENABLED).
+    # Ver src/copybot/spike_arb.py: detecta moves absolutos del spot en
+    # ventana corta y postea limit orders contra el desplazamiento del
+    # mid en Polymarket. spike_arb_loop chequea config.enabled internamente.
+    spike_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.config import SPIKE_ARB_ENABLED
+            if SPIKE_ARB_ENABLED:
+                from src.copybot.spike_arb import spike_arb_loop
+                spike_task = asyncio.create_task(spike_arb_loop())
+                log.info("spike_arb: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar spike_arb: %s", e)
+
+    # Strategy C — adversarial asks (default off, gated por ADVERSARIAL_ENABLED).
+    # Ver src/copybot/adversarial_asks.py: postea asks baratos en el lado
+    # "loser" cuando el bucket está casi cerrado. AdversarialAsks no expone
+    # `start_adversarial_in_background`, así que instanciamos la clase y
+    # disparamos run_loop como task. markets_provider=None → run_once
+    # devuelve 0 sin DB hits hasta que se enchufe un provider real;
+    # signal_only=true por default deja el flujo en modo paper/log.
+    adv_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.config import ADVERSARIAL_ENABLED
+            if ADVERSARIAL_ENABLED:
+                from src.copybot.adversarial_asks import AdversarialAsks
+                adv = AdversarialAsks()
+                adv_task = asyncio.create_task(adv.run_loop())
+                log.info("adversarial_asks: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar adversarial_asks: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))
