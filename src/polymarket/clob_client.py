@@ -14,6 +14,7 @@ NO importar este módulo a top-level desde otros archivos del bot:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Optional
@@ -767,6 +768,569 @@ def place_market_order(
         tx_hash=resp2.get("transactionHash") or resp.get("transactionHash"),
         raw={"first": resp, "retry": resp2},
     )
+
+
+# =============================================================================
+# Extensiones para market_maker (A) + spike_arb (B) + adversarial (C)
+# =============================================================================
+#
+# Estas funciones agregan a `clob_client.py` la primitiva mínima que necesitan
+# los bots N1 (mm), N2 (spike_arb) y N3 (adversarial_asks) para operar en live:
+#
+#   - place_limit_order_gtc:  GTC = Good-Till-Cancelled. Posteás y NO esperás
+#     fill — devuelve order_id. Distinto al FOK (cancela si no fillea inmediato)
+#     y al FAK (IOC partial fill).
+#   - cancel_order / cancel_all_orders: control imperativo del orderbook propio.
+#   - get_open_orders / get_fills_since: reconciliation post-restart o post-fill.
+#   - split_position / redeem_position: ConditionalTokensFramework on-chain ops.
+#     Permite gastar USDC para obtener YES+NO shares 1:1 (split) o redimir
+#     shares ganadoras a USDC (redeem) tras settlement.
+#
+# Diseño:
+#   - Mismo patrón lazy import: nunca pagar el costo del SDK si no se usa.
+#   - Errors capturados → devolvemos None / False / [] para no romper callers.
+#   - Audit log en outbox para split/redeem (son tx on-chain costosas).
+#
+# Referencias:
+#   - https://docs.polymarket.com/developers/CLOB/orders/cancel-orders
+#   - https://docs.polymarket.com/developers/CLOB/orders/get-orders
+#   - https://docs.polymarket.com/developers/CLOB/data-api (fills/trades)
+#   - eshan-bhimani/polymarket-hft-bot: patterns FOK + limit
+#   - Polygon ConditionalTokens: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+#   - Polygon NegRiskAdapter:    0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296
+
+# Polygon mainnet — direcciones canónicas Polymarket.
+USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+CONDITIONAL_TOKENS_POLYGON = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+NEG_RISK_ADAPTER_POLYGON = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+
+# ABI mínimo para split/merge/redeem en ConditionalTokensFramework.
+# Polymarket también expone el `NegRiskAdapter` con la MISMA firma
+# (`splitPosition` / `redeemPositions`) para neg_risk markets — es un
+# wrapper. El ABI sirve para ambos.
+_CT_ABI_FRAGMENTS = [
+    {
+        "name": "splitPosition",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "partition", "type": "uint256[]"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "redeemPositions",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "outputs": [],
+    },
+]
+
+
+def place_limit_order_gtc(
+    *,
+    token_id: str,
+    side: str,
+    price: float,
+    size: float,
+    ttl_s: Optional[int] = None,
+    condition_id: Optional[str] = None,
+) -> OrderResult:
+    """Postea una orden LIMIT GTC (Good-Till-Cancelled) y devuelve sin esperar fill.
+
+    GTC = la orden vive en el book hasta que sea matcheada o cancelada
+    explícitamente (vs FOK que cancela atomicamente si no fillea, o FAK que
+    IOC partial fill). En Polymarket CLOB → ``OrderType.GTC`` con
+    ``expiration=0`` (sin expiry) o ``expiration=epoch_seconds`` si ttl_s.
+
+    Uso primario:
+      - market_maker (N1): postear bids/asks pasivos en torno al mid.
+      - spike_arb (N2): limit a mid con TTL=60s.
+      - adversarial_asks (N3): ask en spike upward.
+
+    Devuelve OrderResult con order_id si el server aceptó la orden. Caller
+    debe usar ``cancel_order(order_id)`` o ``get_open_orders()`` para tracking.
+
+    NOTA: a diferencia de ``place_market_order``, NO hay pre-check de slippage
+    porque GTC no es taker — el caller controla el price, asume que sabe.
+    Sí cuantizamos amounts para los límites de Polymarket (maker 2 dec,
+    taker 4 dec).
+    """
+    if price <= 0:
+        return OrderResult(ok=False, error=f"precio invalido: {price}")
+    if size <= 0:
+        return OrderResult(ok=False, error=f"size invalido: {size}")
+
+    client = get_client()
+    if client is None:
+        return OrderResult(ok=False, error="CLOB no configurado")
+
+    # Cuantizar shares para que el producto (USDC notional) quepa en 2 decimales.
+    shares_q, price_q = _quantize_amounts(size, price)
+    if shares_q <= 0:
+        return OrderResult(
+            ok=False,
+            error=f"size {size} demasiado chico al price {price} (post-quantize=0)",
+        )
+
+    try:
+        from py_clob_client_v2.clob_types import (
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+        )
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
+    except ImportError as e:
+        return OrderResult(ok=False, error=f"sdk import: {e}")
+
+    expiration = 0
+    if ttl_s and ttl_s > 0:
+        import time as _t
+        expiration = int(_t.time()) + int(ttl_s)
+
+    # OrderArgs en algunas versiones del SDK no acepta `expiration` como
+    # kwarg. Intentamos con, y si falla por TypeError, fallback sin (TTL=0).
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price_q,
+            size=shares_q,
+            side=BUY if side.upper() == "BUY" else SELL,
+            expiration=expiration,
+        )
+    except TypeError:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price_q,
+            size=shares_q,
+            side=BUY if side.upper() == "BUY" else SELL,
+        )
+
+    options = None
+    if condition_id:
+        meta = _get_market_meta(condition_id)
+        if meta:
+            options = PartialCreateOrderOptions(
+                neg_risk=meta["neg_risk"],
+                tick_size=meta["tick_size"],
+            )
+
+    _outbox_log("attempt_gtc", {
+        "token_id": token_id, "condition_id": condition_id,
+        "side": side, "shares": shares_q, "price": price_q,
+        "ttl_s": ttl_s, "expiration": expiration,
+    })
+
+    try:
+        if options is not None:
+            signed = client.create_order(order_args, options)
+        else:
+            signed = client.create_order(order_args)
+    except Exception as e:
+        _outbox_log("gtc_create_failed", {"token_id": token_id, "error": str(e)[:300]})
+        return OrderResult(ok=False, error=f"create_order: {e}")
+
+    try:
+        resp = client.post_order(signed, OrderType.GTC) or {}
+    except Exception as e:
+        _outbox_log("gtc_post_failed", {"token_id": token_id, "error": str(e)[:300]})
+        return OrderResult(ok=False, error=f"post_order: {e}")
+
+    order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+    status = resp.get("status", "live")
+    _outbox_log("gtc_post_ok", {"token_id": token_id, "order_id": order_id, "status": status})
+
+    return OrderResult(
+        ok=True,
+        order_id=order_id,
+        status=status,
+        filled_size=float(resp.get("makingAmount", 0) or 0) or 0.0,
+        avg_price=price_q,
+        raw=resp,
+    )
+
+
+def cancel_order(order_id: str) -> bool:
+    """Cancela UNA orden por id. Devuelve True si el server confirma cancel.
+
+    Polymarket SDK v2: ``client.cancel(order_id)`` devuelve un dict con
+    ``canceled: [<id>]`` y ``not_canceled: {<id>: reason}``. Si el id está
+    en ``canceled`` → True. Si está en ``not_canceled`` (ej. ya fillada o
+    inexistente) → False. Si la SDK tira excepción → False (defensivo).
+    """
+    if not order_id:
+        return False
+    client = get_client()
+    if client is None:
+        return False
+    try:
+        resp = client.cancel(order_id) or {}
+    except Exception as e:
+        log.warning("cancel_order falló id=%s: %s", str(order_id)[:20], e)
+        _outbox_log("cancel_failed", {"order_id": order_id, "error": str(e)[:200]})
+        return False
+    canceled = resp.get("canceled") or []
+    not_canceled = resp.get("not_canceled") or {}
+    ok = order_id in canceled and order_id not in not_canceled
+    _outbox_log("cancel", {"order_id": order_id, "ok": ok, "resp": resp})
+    return ok
+
+
+def cancel_all_orders(token_id: Optional[str] = None) -> int:
+    """Cancela TODAS las orders abiertas (o filtradas por token_id).
+
+    Útil al shutdown del bot — evita que queden bids/asks zombies en el book
+    si el proceso muere por OOM o restart no-limpio.
+
+    SDK v2:
+      - ``client.cancel_all()`` cancela TODO.
+      - ``client.cancel_market_orders(market=token_id)`` cancela solo de un
+        token específico.
+
+    Devuelve el número de orders canceladas exitosamente (puede ser 0 si no
+    había nada). En error, devuelve 0 — el caller no se entera, pero el
+    outbox queda con la traza.
+    """
+    client = get_client()
+    if client is None:
+        return 0
+    try:
+        if token_id:
+            resp = client.cancel_market_orders(market=token_id) or {}
+        else:
+            resp = client.cancel_all() or {}
+    except Exception as e:
+        log.warning("cancel_all_orders falló (token=%s): %s", token_id or "ALL", e)
+        _outbox_log("cancel_all_failed", {"token_id": token_id, "error": str(e)[:200]})
+        return 0
+    canceled = resp.get("canceled") or []
+    n = len(canceled)
+    _outbox_log("cancel_all", {"token_id": token_id, "n_canceled": n, "resp": resp})
+    return n
+
+
+def get_open_orders(token_id: Optional[str] = None) -> list[dict]:
+    """Lista todas las orders abiertas del usuario, opcionalmente filtradas.
+
+    SDK v2: ``client.get_orders(OpenOrderParams(asset_id=token_id))``.
+
+    Devuelve list de dicts (raw del server). Cada item tiene típicamente:
+      { "id": str, "asset_id": str, "side": "BUY"|"SELL",
+        "price": str, "size": str, "size_matched": str,
+        "owner": str, "status": "LIVE"|"PARTIAL"|... }
+
+    En error o sin orders → lista vacía (caller puede hacer `if not orders:`).
+    """
+    client = get_client()
+    if client is None:
+        return []
+    try:
+        from py_clob_client_v2.clob_types import OpenOrderParams
+        params = OpenOrderParams(asset_id=token_id) if token_id else OpenOrderParams()
+        resp = client.get_orders(params)
+    except ImportError:
+        # Fallback: SDK más nuevo expone get_orders sin params helper.
+        try:
+            resp = client.get_orders()
+        except Exception as e:
+            log.warning("get_open_orders fallback falló: %s", e)
+            return []
+    except Exception as e:
+        log.warning("get_open_orders falló (token=%s): %s", token_id or "ALL", e)
+        return []
+    if not resp:
+        return []
+    if isinstance(resp, dict):
+        # Algunas versiones devuelven {"orders": [...]}.
+        resp = resp.get("orders") or resp.get("data") or []
+    if not isinstance(resp, list):
+        return []
+    if token_id:
+        # Doble check filter por si la SDK no filtra server-side.
+        resp = [
+            o for o in resp
+            if str(o.get("asset_id") or o.get("token_id") or "") == token_id
+        ]
+    return resp
+
+
+def get_fills_since(timestamp_s: int) -> list[dict]:
+    """Devuelve fills (trades ejecutados) del usuario desde ``timestamp_s`` (epoch).
+
+    Polymarket data-api endpoint:
+      GET ``{DATA_API}/data-api/trades?user={funder}&takerOnly=false``
+
+    Estrategia:
+      1. Si la SDK expone ``get_trades(TradeParams(...))`` lo usamos.
+      2. Sino, httpx directo al data-api con el funder address.
+      3. Filtramos client-side por ``timestamp >= timestamp_s``.
+
+    Devuelve list de dicts: cada fill tiene típicamente
+      { "id": str, "asset_id": str, "side": "BUY"|"SELL",
+        "price": float, "size": float, "timestamp": int (epoch s),
+        "transaction_hash": str, "maker_orders": [...], ... }
+
+    Útil para market_maker reconciliation: tras restart, reconstruir
+    inventory desde la última timestamp persistida.
+    """
+    if timestamp_s < 0:
+        timestamp_s = 0
+    client = get_client()
+    if client is None:
+        return []
+
+    # Path 1: SDK helper.
+    fills: list[dict] = []
+    try:
+        from py_clob_client_v2.clob_types import TradeParams
+        params = TradeParams(after=timestamp_s)
+        resp = client.get_trades(params)
+        if isinstance(resp, list):
+            fills = resp
+        elif isinstance(resp, dict):
+            fills = resp.get("trades") or resp.get("data") or []
+    except ImportError:
+        fills = []
+    except Exception as e:
+        log.warning("get_fills_since via SDK falló: %s", e)
+        fills = []
+
+    # Path 2: data-api directo si la SDK no devolvió nada (o tiró).
+    if not fills and POLYMARKET_FUNDER_ADDRESS:
+        try:
+            import httpx
+            from src.config import DATA_API
+            url = f"{DATA_API}/trades"
+            r = httpx.get(
+                url,
+                params={"user": POLYMARKET_FUNDER_ADDRESS, "takerOnly": "false"},
+                timeout=10.0,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    fills = data
+                elif isinstance(data, dict):
+                    fills = data.get("trades") or data.get("data") or []
+        except Exception as e:
+            log.warning("get_fills_since via data-api falló: %s", e)
+
+    # Filter client-side por timestamp (defensivo: la SDK/API podría no respetar after).
+    out = []
+    for f in fills:
+        ts = f.get("timestamp") or f.get("ts") or f.get("match_time") or 0
+        try:
+            ts = int(float(ts))
+        except (TypeError, ValueError):
+            ts = 0
+        # Algunos endpoints devuelven ms en vez de seg.
+        if ts > 10**12:
+            ts //= 1000
+        if ts >= timestamp_s:
+            out.append(f)
+    return out
+
+
+def _w3_client() -> Optional[tuple]:
+    """Helper compartido por split/redeem: instancia web3 + account.
+
+    Devuelve (w3, account, ct_address_default) o None si no hay private key
+    o web3 no está disponible.
+
+    El ``ct_address_default`` es el ConditionalTokens framework canónico;
+    el caller puede usar NegRiskAdapter para markets con neg_risk=True.
+    """
+    if not POLYMARKET_PRIVATE_KEY:
+        log.error("split/redeem requieren POLYMARKET_PRIVATE_KEY (no en .env)")
+        return None
+    try:
+        from web3 import Web3
+        from eth_account import Account
+    except ImportError as e:
+        log.error("web3 no instalado: %s", e)
+        return None
+
+    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        account = Account.from_key(POLYMARKET_PRIVATE_KEY)
+    except Exception as e:
+        log.error("web3 init falló: %s", e)
+        return None
+
+    return (w3, account, CONDITIONAL_TOKENS_POLYGON)
+
+
+def split_position(
+    condition_id: str,
+    size_usdc: float,
+    *,
+    neg_risk: Optional[bool] = None,
+) -> Optional[str]:
+    """ERC1155 ``splitPosition``: gasta USDC y obtiene YES + NO shares 1:1.
+
+    Flujo on-chain:
+      1. Approve USDC al ConditionalTokens (o NegRiskAdapter) si necesario.
+      2. Call ``splitPosition(USDC, parent=0x0, conditionId, partition=[1,2], amount)``.
+      3. Resultado: tu wallet recibe ``size_usdc`` shares YES + ``size_usdc`` NO.
+
+    ¿Por qué? Útil para market_maker / adversarial: si ves un mid YES=0.55,
+    NO=0.40 (suma <1.00 = arb), splitteás $X → te llevás $X YES + $X NO,
+    y vendés YES@0.55 + NO@0.40 → ingresás $0.95X. Edge directo.
+
+    Devuelve el tx_hash si la tx fue submitted, None en error. NO espera
+    confirmation — caller debe poll si lo necesita.
+
+    Nota: ``size_usdc`` se convierte a wei (USDC tiene 6 decimales en
+    Polygon). conditionId es bytes32 (0x prefijo, 32 bytes).
+    """
+    if size_usdc <= 0:
+        return None
+    if not condition_id or not condition_id.startswith("0x") or len(condition_id) != 66:
+        log.error("split_position: condition_id inválido (%s)", condition_id)
+        return None
+
+    setup = _w3_client()
+    if setup is None:
+        return None
+    w3, account, _default_addr = setup
+
+    # neg_risk → usar NegRiskAdapter; sino ConditionalTokens.
+    if neg_risk is None:
+        meta = _get_market_meta(condition_id)
+        neg_risk = bool(meta["neg_risk"]) if meta else False
+    target = NEG_RISK_ADAPTER_POLYGON if neg_risk else CONDITIONAL_TOKENS_POLYGON
+
+    try:
+        contract = w3.eth.contract(address=w3.to_checksum_address(target),
+                                   abi=_CT_ABI_FRAGMENTS)
+    except Exception as e:
+        log.error("split_position: contract init falló: %s", e)
+        return None
+
+    amount_wei = int(round(size_usdc * 10**6))
+    parent_collection = b"\x00" * 32
+    partition = [1, 2]  # YES, NO
+
+    try:
+        tx = contract.functions.splitPosition(
+            w3.to_checksum_address(USDC_POLYGON),
+            parent_collection,
+            condition_id,
+            partition,
+            amount_wei,
+        ).build_transaction({
+            "from": account.address,
+            "nonce": w3.eth.get_transaction_count(account.address),
+            "gas": 300_000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(
+            getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+        )
+        tx_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+        _outbox_log("split_position", {
+            "condition_id": condition_id, "size_usdc": size_usdc,
+            "neg_risk": neg_risk, "tx_hash": tx_hex,
+        })
+        return tx_hex
+    except Exception as e:
+        log.exception("split_position falló cid=%s: %s", condition_id[:10], e)
+        _outbox_log("split_failed", {"condition_id": condition_id, "error": str(e)[:300]})
+        return None
+
+
+def redeem_position(
+    condition_id: str,
+    outcome_index: int,
+    *,
+    neg_risk: Optional[bool] = None,
+) -> Optional[str]:
+    """ERC1155 ``redeemPositions``: redime shares ganadoras a USDC tras settlement.
+
+    Counterpart de ``split_position``. Una vez UMA resuelve el market y
+    el ConditionalTokens conoce el payout, el holder de shares ganadoras
+    puede llamar ``redeemPositions(USDC, parent=0x0, conditionId, indexSets)``
+    para canjear sus tokens por USDC.
+
+    ``outcome_index``: 0 = YES, 1 = NO. Se traduce a indexSet:
+      - YES → 0b01 = 1
+      - NO  → 0b10 = 2
+
+    Devuelve tx_hash o None en error. NO espera confirmation. Si el market
+    NO resolvió aún, la tx revierte (web3 puede tirar exception en
+    ``send_raw_transaction`` o aceptar y revertir on-chain — depende del
+    nodo).
+    """
+    if outcome_index not in (0, 1):
+        log.error("redeem_position: outcome_index inválido (%d), debe ser 0 (YES) o 1 (NO)",
+                  outcome_index)
+        return None
+    if not condition_id or not condition_id.startswith("0x") or len(condition_id) != 66:
+        log.error("redeem_position: condition_id inválido (%s)", condition_id)
+        return None
+
+    setup = _w3_client()
+    if setup is None:
+        return None
+    w3, account, _default_addr = setup
+
+    if neg_risk is None:
+        meta = _get_market_meta(condition_id)
+        neg_risk = bool(meta["neg_risk"]) if meta else False
+    target = NEG_RISK_ADAPTER_POLYGON if neg_risk else CONDITIONAL_TOKENS_POLYGON
+
+    try:
+        contract = w3.eth.contract(address=w3.to_checksum_address(target),
+                                   abi=_CT_ABI_FRAGMENTS)
+    except Exception as e:
+        log.error("redeem_position: contract init falló: %s", e)
+        return None
+
+    # YES = indexSet 1 (bit 0), NO = indexSet 2 (bit 1).
+    index_set = 1 if outcome_index == 0 else 2
+    parent_collection = b"\x00" * 32
+
+    try:
+        tx = contract.functions.redeemPositions(
+            w3.to_checksum_address(USDC_POLYGON),
+            parent_collection,
+            condition_id,
+            [index_set],
+        ).build_transaction({
+            "from": account.address,
+            "nonce": w3.eth.get_transaction_count(account.address),
+            "gas": 250_000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(
+            getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+        )
+        tx_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+        _outbox_log("redeem_position", {
+            "condition_id": condition_id, "outcome_index": outcome_index,
+            "neg_risk": neg_risk, "tx_hash": tx_hex,
+        })
+        return tx_hex
+    except Exception as e:
+        log.exception("redeem_position falló cid=%s: %s", condition_id[:10], e)
+        _outbox_log("redeem_failed", {
+            "condition_id": condition_id, "outcome_index": outcome_index,
+            "error": str(e)[:300],
+        })
+        return None
 
 
 def health_check() -> dict:
