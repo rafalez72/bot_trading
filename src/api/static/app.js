@@ -10,6 +10,7 @@ function dashboard() {
         summary: null, liveSummary: null, liveTrades: [],
         hlSummary: null, hlTrades: [],
         dxSummary: null, dxTrades: [],
+        stratStatus: null,
 
         async init() {
             await this.refresh();
@@ -28,7 +29,7 @@ function dashboard() {
         async refresh() {
             this.loading = true;
             try {
-                const [s, ls, lt, hs, ht, ds, dt] = await Promise.all([
+                const [s, ls, lt, hs, ht, ds, dt, st] = await Promise.all([
                     fetch('/api/summary').then(r => r.json()).catch(() => null),
                     fetch('/api/live/summary').then(r => r.json()).catch(() => null),
                     fetch('/api/live/trades?limit=10').then(r => r.json()).catch(() => []),
@@ -36,11 +37,13 @@ function dashboard() {
                     fetch('/api/hl/trades?limit=10').then(r => r.json()).catch(() => []),
                     fetch('/api/dx/summary').then(r => r.json()).catch(() => null),
                     fetch('/api/dx/trades?limit=10').then(r => r.json()).catch(() => []),
+                    fetch('/api/strategies/status').then(r => r.json()).catch(() => null),
                 ]);
                 this.summary = s; this.liveSummary = ls;
                 this.liveTrades = Array.isArray(lt) ? lt : (lt?.trades || []);
                 this.hlSummary = hs; this.hlTrades = Array.isArray(ht) ? ht : [];
                 this.dxSummary = ds; this.dxTrades = Array.isArray(dt) ? dt : [];
+                this.stratStatus = st;
                 this.lastUpdate = new Date().toLocaleTimeString('es-AR', {
                     hour: '2-digit', minute: '2-digit', second: '2-digit'
                 });
@@ -74,6 +77,20 @@ function dashboard() {
             return { txt: 'OFF', cls: 'text-slate-400 bg-slate-900 border-slate-700' };
         },
         get killActive() { return !!this.summary?.kill_switch?.active; },
+
+        get stratList() {
+            const s = this.stratStatus || {};
+            const empty = { open: 0, pnl_24h: 0, pnl_total: 0, last_at: null, enabled: false };
+            return [
+                { key: 'n1_copybot',  label: 'N1 Copy-bot',   data: s.n1_copybot   || empty },
+                { key: 'crypto_arb',  label: 'Crypto-arb N2', data: s.crypto_arb   || empty },
+                { key: 'market_maker',label: 'Market Maker',  data: s.market_maker || empty },
+                { key: 'spike_arb',   label: 'Spike Arb',     data: s.spike_arb    || empty },
+                { key: 'adversarial', label: 'Adversarial',   data: s.adversarial  || empty },
+                { key: 'long_horizon',label: 'Long Horizon',  data: s.long_horizon || empty },
+                { key: 'hedge',       label: 'Hedge (perp)',  data: s.hedge        || empty },
+            ];
+        },
 
         get tabData() {
             if (this.tab === 'pm') return {

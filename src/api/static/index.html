@@ -34,12 +34,39 @@
             </div>
         </header>
 
-        <div class="grid grid-cols-3 gap-1 mb-2 bg-slate-900 border border-slate-800 rounded-lg p-1">
+        <div class="grid grid-cols-4 gap-1 mb-2 bg-slate-900 border border-slate-800 rounded-lg p-1">
             <button @click="tab='pm'" :class="tab==='pm' ? 'bg-emerald-900/60 text-emerald-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">Poly</button>
-            <button @click="tab='hl'" :class="tab==='hl' ? 'bg-blue-900/60 text-blue-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">Hyperliquid</button>
+            <button @click="tab='hl'" :class="tab==='hl' ? 'bg-blue-900/60 text-blue-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">HL</button>
             <button @click="tab='dx'" :class="tab==='dx' ? 'bg-purple-900/60 text-purple-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">dYdX</button>
+            <button @click="tab='strat'" :class="tab==='strat' ? 'bg-amber-900/60 text-amber-300' : 'text-slate-400'" class="text-xs font-medium py-1.5 rounded transition">7-Strat</button>
         </div>
 
+        <!-- Tab Strategies (las 7) -->
+        <div x-show="tab==='strat'" class="space-y-1">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-2 flex items-center justify-between">
+                <p class="text-[11px] text-slate-300 font-semibold">Strategies snapshot</p>
+                <p class="text-[10px] text-slate-500" x-show="stratStatus?._ts">
+                    upd <span x-text="hhmm(stratStatus._ts)"></span>
+                </p>
+            </div>
+            <template x-for="s in stratList" :key="s.key">
+                <div class="bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5">
+                    <div class="flex items-center justify-between text-xs">
+                        <div class="flex items-center gap-1.5">
+                            <span :class="s.data.enabled ? 'text-emerald-400' : 'text-slate-600'" x-text="s.data.enabled ? 'on' : 'off'" class="text-[9px] uppercase font-mono"></span>
+                            <span class="text-slate-200 font-medium" x-text="s.label"></span>
+                        </div>
+                        <span class="font-bold tabular-nums" :class="(s.data.pnl_24h ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'" x-text="fmtUsdSigned(s.data.pnl_24h)"></span>
+                    </div>
+                    <div class="flex items-center justify-between text-[10px] text-slate-500 mt-0.5">
+                        <span>open <span class="text-slate-300" x-text="s.data.open ?? 0"></span> · total <span :class="(s.data.pnl_total ?? 0) >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'" x-text="fmtUsdSigned(s.data.pnl_total)"></span></span>
+                        <span x-text="s.data.last_at ? hhmm(s.data.last_at) : '—'"></span>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <div x-show="tab !== 'strat'">
         <div x-show="tab==='pm' && killActive" class="bg-rose-950/60 border border-rose-800 rounded-lg px-3 py-2 mb-2 flex items-center gap-2">
             <span class="text-base">⛔</span>
             <div class="flex-1 min-w-0">
@@ -135,6 +162,7 @@
                 · wallet $<span x-text="tabData.config?.max_per_wallet_usdc"></span>
             </span>
         </div>
+        </div><!-- /tab !== strat -->
     </div>
 
     <script src="/static/app.js"></script>

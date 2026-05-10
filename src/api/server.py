@@ -202,6 +202,175 @@ def api_crypto_arb_status() -> dict:
     return snap
 
 
+@app.get("/api/strategies/status")
+def api_strategies_status() -> dict:
+    """Snapshot agregado de las 7 strategies del bot.
+
+    Por cada strategy devuelve:
+        - enabled: si está activa según .env
+        - open: cantidad de trades/orders abiertos
+        - pnl_24h: PnL realizado últimas 24h
+        - pnl_total: PnL realizado total
+        - last_activity_at: epoch del último evento (open/close)
+        - meta: dict opcional con extras (in-proc metrics si aplican)
+
+    Diseñado para falla blanda: si una tabla no existe (porque la strategy
+    nunca corrió), devuelve zeros. No tira 500.
+    """
+    import os
+    import time as _t
+
+    today_ts = int(_t.time()) - 86400
+
+    def _safe_query(q: str, params: tuple = ()) -> dict:
+        """Devuelve {'open': n, 'pnl_24h': x, 'pnl_total': y, 'last_at': ts}
+        o zeros si la tabla no existe."""
+        try:
+            with db() as conn:
+                row = conn.execute(q, params).fetchone()
+            if not row:
+                return {"open": 0, "pnl_24h": 0.0, "pnl_total": 0.0, "last_at": None}
+            return {
+                "open": int(row["open_n"] or 0),
+                "pnl_24h": float(row["pnl_24h"] or 0),
+                "pnl_total": float(row["pnl_total"] or 0),
+                "last_at": int(row["last_at"]) if row["last_at"] else None,
+            }
+        except Exception:
+            return {"open": 0, "pnl_24h": 0.0, "pnl_total": 0.0, "last_at": None}
+
+    # 1. N1 copybot — paper_trades sin source_wallet 'crypto_arb*'
+    n1 = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                              AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(exit_at, entry_at)) AS last_at
+        FROM paper_trades
+        WHERE source_wallet NOT IN ('crypto_arb', 'crypto_arb_hedge')
+        """,
+        (today_ts,),
+    )
+    n1["enabled"] = True
+
+    # 2. crypto_arb — paper_trades con source_wallet='crypto_arb' + metrics file
+    ca = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                              AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(exit_at, entry_at)) AS last_at
+        FROM paper_trades
+        WHERE source_wallet='crypto_arb'
+        """,
+        (today_ts,),
+    )
+    ca["enabled"] = os.getenv("CRYPTO_ARB_ENABLED", "false").lower() == "true"
+    try:
+        from src.copybot.crypto_arb import read_snapshot_from_file
+        snap = read_snapshot_from_file()
+        if snap:
+            ca["meta"] = {
+                "cycles": snap.get("cycles"),
+                "opens_yes": snap.get("opens", {}).get("yes"),
+                "opens_no": snap.get("opens", {}).get("no"),
+            }
+    except Exception:
+        pass
+
+    # 3. market_maker — mm_orders
+    mm = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status IN ('open','filled') THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status='closed' AND filled_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status='closed' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(filled_at, created_at)) AS last_at
+        FROM mm_orders
+        """,
+        (today_ts,),
+    )
+    mm["enabled"] = os.getenv("MARKET_MAKER_ENABLED", "false").lower() == "true"
+
+    # 4. spike_arb — spike_arb_trades
+    sa = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status IN ('open','posted','filled') THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(closed_at, filled_at, signal_at)) AS last_at
+        FROM spike_arb_trades
+        """,
+        (today_ts,),
+    )
+    sa["enabled"] = os.getenv("SPIKE_ARB_ENABLED", "false").lower() == "true"
+
+    # 5. adversarial_asks — adversarial_orders
+    ad = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status IN ('detected','posted','filled') THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND filled_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(filled_at, signal_at)) AS last_at
+        FROM adversarial_orders
+        """,
+        (today_ts,),
+    )
+    ad["enabled"] = os.getenv("ADVERSARIAL_ASKS_ENABLED", "false").lower() == "true"
+
+    # 6. long_horizon — long_horizon_trades
+    lh = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status IN ('open','posted','filled') THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(closed_at, opened_at)) AS last_at
+        FROM long_horizon_trades
+        """,
+        (today_ts,),
+    )
+    lh["enabled"] = os.getenv("LONG_HORIZON_ENABLED", "false").lower() == "true"
+
+    # 7. hedge — hedge_trades (pnl_total_usdc)
+    hd = _safe_query(
+        """
+        SELECT
+          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_n,
+          COALESCE(SUM(CASE WHEN status='closed' AND closed_at >= ?
+                              THEN pnl_total_usdc ELSE 0 END), 0) AS pnl_24h,
+          COALESCE(SUM(CASE WHEN status='closed' THEN pnl_total_usdc ELSE 0 END), 0) AS pnl_total,
+          MAX(COALESCE(closed_at, opened_at)) AS last_at
+        FROM hedge_trades
+        """,
+        (today_ts,),
+    )
+    hd["enabled"] = os.getenv("CRYPTO_ARB_HEDGE_ENABLED", "false").lower() == "true"
+
+    return {
+        "_ts": int(_t.time()),
+        "n1_copybot": n1,
+        "crypto_arb": ca,
+        "market_maker": mm,
+        "spike_arb": sa,
+        "adversarial": ad,
+        "long_horizon": lh,
+        "hedge": hd,
+    }
+
+
 @app.get("/api/ws-status")
 def api_ws_status() -> dict:
     """Snapshot del WS bridge.
