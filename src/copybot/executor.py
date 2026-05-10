@@ -274,6 +274,13 @@ from src.copybot._slug_expiry import parse_slug_expiry as _parse_slug_expiry  # 
 def _apply_dry_slippage(side: str, price: float) -> float:
     """Aplica slippage pesimista al precio simulado de un dry-run.
 
+    NOTA (2026-05-10): post `place_market_order(dry_run=True)` ahora consulta
+    el orderbook REAL (estimate_slippage) y devuelve VWAP realista. Esta
+    función agrega un colchón adicional pequeño (LIVE_DRY_SLIPPAGE_PCT) sobre
+    ese VWAP. Conservador por design — el dry-run ahora es ligeramente más
+    pesimista que el live, lo que es aceptable: preferimos descubrir
+    estrategias rentables en dry-run que ver pérdidas en live.
+
     BUY paga más (price * (1 + slippage)).
     SELL recibe menos (price * (1 - slippage)).
     Clamp a [0.01, 0.99] para evitar precios degenerados en bordes.
@@ -931,4 +938,5 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
                 pass
     except Exception:
         pass
+
     return len(phantom_ids)

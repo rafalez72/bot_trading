@@ -475,17 +475,48 @@ def place_market_order(
     Devuelve OrderResult con filled_size = shares ejecutadas reales.
     """
     if dry_run:
-        shares = size_usdc / price if price > 0 else 0
+        # NUEVO 2026-05-10: dry-run REALISTA. Antes devolvía midpoint
+        # idealizado, lo que generó 86% win rate fake en simulación
+        # mientras live operaba a 0%. Ahora consultamos el orderbook real
+        # (mismo que usa el live) y simulamos un fill VWAP-based.
+        # Así el dry-run se vuelve predictivo de la performance live.
+        if price <= 0:
+            return OrderResult(ok=False, error=f"precio invalido: {price}")
+        raw_shares = size_usdc / price
+        if not skip_slippage_check:
+            slip = estimate_slippage(
+                token_id=token_id, side=side,
+                target_size_shares=raw_shares, target_price=price,
+            )
+            if not slip.get("ok"):
+                # Mismo path de rechazo que live: si no hay liquidez o
+                # slippage > umbral, dry-run también debe rechazar.
+                log.info(
+                    "[DRY-RUN] %s abortado por pre-check (orderbook real): %s",
+                    side, slip.get("error"),
+                )
+                return OrderResult(
+                    ok=False,
+                    error=f"pre-check: {slip.get('error')}",
+                    raw=slip,
+                )
+            vwap = float(slip.get("vwap") or price)
+            sim_avg = vwap
+        else:
+            sim_avg = price
+        # Recalc shares para el size objetivo dado el avg_price simulado
+        shares = (size_usdc / sim_avg) if sim_avg > 0 else 0
         log.info(
-            "[DRY-RUN] %s token=%s.. price=%.3f size=%.2f USDC (~%.2f shares)",
-            side, token_id[:12], price, size_usdc, shares,
+            "[DRY-RUN] %s token=%s.. target_px=%.3f sim_avg=%.3f size=%.2f USDC "
+            "(~%.2f shares)",
+            side, token_id[:12], price, sim_avg, size_usdc, shares,
         )
         return OrderResult(
             ok=True,
             order_id=f"DRY-{token_id[:12]}-{side}",
             status="matched",
             filled_size=shares,
-            avg_price=price,
+            avg_price=sim_avg,
         )
 
     client = get_client()
