@@ -46,6 +46,7 @@ ENABLED_NOTIFICATIONS = {
     "outage",  # alertas de servicio caído (Polymarket / Vercel proxy)
     "hl_close",  # cierres del bot HL paralelo (dry-run)
     "dx_close",  # cierres del bot dYdX v4 paralelo (dry-run)
+    "live_phantom",  # cierres "fantasma" (closed_external por cleanup on-chain)
 }
 
 
@@ -270,6 +271,51 @@ def live_close(*, source_wallet: str, market_slug: str | None,
     if tx_hash:
         txt += f"\n[Ver tx](https://polygonscan.com/tx/{tx_hash})"
     send(txt)
+
+
+def live_phantom(
+    *,
+    trade_id: int | None = None,
+    size_usdc: float = 0.0,
+    market_slug: str | None = None,
+    source_wallet: str | None = None,
+    n_phantoms: int | None = None,
+) -> bool:
+    """Notif cuando un live_trade se marca como `closed_external` por phantom_cleanup.
+
+    Crítico: estos trades NO settlearon on-chain. El USDC puede estar perdido
+    o atorado en una posición fantasma — el user debe verificar manualmente
+    en polymarket.com. Antes (pre 2026-05-10) esto se hacía SILENTE: el user
+    perdió $76 sin enterarse.
+
+    Si `n_phantoms` viene seteado, se envía un resumen agregado (no por trade).
+    """
+    if "live_phantom" not in ENABLED_NOTIFICATIONS:
+        return False
+    if n_phantoms is not None and trade_id is None:
+        # Mensaje agregado (resumen)
+        txt = (
+            f"🟠 *FANTASMAS detectados* (no settled on-chain)\n"
+            f"Cantidad: {n_phantoms} live_trades\n"
+            f"Capital atado: ${size_usdc:.2f}\n"
+            f"🧪 _USDC posiblemente perdido — verificar en polymarket.com_"
+        )
+        return send(txt)
+
+    parts = [
+        "🟠 *FANTASMA* (no settled on-chain)",
+        f"Capital atado: ${size_usdc:.2f}",
+    ]
+    if trade_id is not None:
+        parts.append(f"Trade #{trade_id}")
+    if source_wallet:
+        parts.append(f"Trader: `{source_wallet[:12]}`")
+    if market_slug:
+        parts.append(f"Mercado: {market_slug}")
+    parts.append(
+        "🧪 _USDC posiblemente perdido — verificar en polymarket.com_"
+    )
+    return send("\n".join(parts))
 
 
 def live_error(*, stage: str, error: str) -> None:

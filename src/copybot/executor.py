@@ -845,6 +845,29 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
     if not phantom_ids:
         return 0
 
+    # Snapshot per-trade ANTES del UPDATE para tener datos para Telegram
+    # (size, slug, wallet). Hacemos una sola query batch.
+    phantom_details: list[dict] = []
+    with db() as conn:
+        placeholders_q = ",".join("?" * len(phantom_ids))
+        det_rows = conn.execute(
+            f"""
+            SELECT lt.id, lt.entry_size_usdc, lt.source_wallet, lt.condition_id,
+                   m.slug
+            FROM live_trades lt
+            LEFT JOIN markets m ON m.condition_id = lt.condition_id
+            WHERE lt.id IN ({placeholders_q})
+            """,
+            phantom_ids,
+        ).fetchall()
+        for r in det_rows:
+            phantom_details.append({
+                "id": r["id"],
+                "size_usdc": float(r["entry_size_usdc"] or 0),
+                "source_wallet": r["source_wallet"],
+                "slug": r["slug"],
+            })
+
     now_ts = int(time.time())
     with tx() as conn:
         placeholders = ",".join("?" * len(phantom_ids))
@@ -878,12 +901,34 @@ def cleanup_phantom_positions(min_age_seconds: int = 7200) -> int:
         "(no existen en /positions del proxy). on-chain assets count=%d",
         len(phantom_ids), len(onchain_assets),
     )
+
+    # CRÍTICO (2026-05-10): NOTIF Telegram por cada phantom. Antes esto era
+    # silente y el usuario perdió $76 sin enterarse de 29/50 trades. Para
+    # bursts grandes (>5 phantoms) mandamos un solo summary; para pocos,
+    # individual para que el user pueda ir a verificarlos en polymarket.com.
     try:
-        from src.copybot.notifier import send
-        send(
-            f"🧹 *Phantom cleanup*: {len(phantom_ids)} live_trades marcados como "
-            f"closed_external (ya no existen on-chain). Cap del bot liberado."
-        )
+        from src.copybot.notifier import live_phantom
+        if len(phantom_details) <= 5:
+            for d in phantom_details:
+                try:
+                    live_phantom(
+                        trade_id=d["id"],
+                        size_usdc=d["size_usdc"],
+                        market_slug=d["slug"],
+                        source_wallet=d["source_wallet"],
+                    )
+                except Exception:
+                    pass
+        else:
+            # batch summary: total capital atado
+            total_size = sum(d["size_usdc"] for d in phantom_details)
+            try:
+                live_phantom(
+                    n_phantoms=len(phantom_details),
+                    size_usdc=total_size,
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     return len(phantom_ids)
