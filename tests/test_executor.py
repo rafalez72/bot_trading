@@ -398,3 +398,42 @@ def test_open_position_does_not_insert_when_order_phantom_ok(isolated_db, monkey
     with db() as conn:
         after = conn.execute("SELECT COUNT(*) AS n FROM live_trades").fetchone()["n"]
     assert after == before
+
+
+# ---------- regresión: tx() re-entrante por thread ----------
+
+def test_tx_is_reentrant_within_same_thread(isolated_db):
+    """tx() anidada en el MISMO thread debe ser passthrough — sin BEGIN nuevo.
+
+    Bug original (resuelto en src/db/schema.py): SQLite es single-writer-per-file,
+    así que una segunda conn intentando ``BEGIN IMMEDIATE`` mientras la outer
+    aún tenía el write-lock se quedaba esperando ``busy_timeout=15s`` y fallaba
+    con "database is locked". Path típico: ``_log_reject`` (que hace su propio
+    ``with tx()``) invocado desde ``_open_position_validate`` que a su vez
+    corre dentro del ``with tx()`` del caller.
+    """
+    # Anida 2 tx() en el mismo thread y verifica que el inner ve los writes
+    # del outer aún sin commit. Si abriera una conn nueva, no los vería
+    # (SQLite WAL aísla writers no commiteados) — y además se colgaría.
+    with tx() as outer:
+        outer.execute(
+            "INSERT INTO bot_state (key, value) VALUES ('reentrant_probe', 'outer')"
+        )
+        with tx() as inner:
+            row = inner.execute(
+                "SELECT value FROM bot_state WHERE key='reentrant_probe'"
+            ).fetchone()
+            assert row is not None and row["value"] == "outer", (
+                "tx() anidada no es passthrough: el inner abrió conn nueva y no "
+                "ve el INSERT pendiente del outer (o se está colgando)."
+            )
+            inner.execute(
+                "UPDATE bot_state SET value='inner' WHERE key='reentrant_probe'"
+            )
+
+    # Tras commit del outer, los writes de ambos niveles persisten.
+    with db() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_state WHERE key='reentrant_probe'"
+        ).fetchone()
+    assert row["value"] == "inner"

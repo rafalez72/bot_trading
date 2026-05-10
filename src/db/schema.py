@@ -50,6 +50,19 @@ if BACKEND not in ("sqlite", "postgres"):
 # distintas no se bloquean. Eso es la razón principal de migrar.
 _TX_LOCK = threading.RLock()
 
+# Re-entrancia per-thread del tx(): SQLite es single-writer-per-file, así que
+# si un caller A está en `with tx() as conn:` y ese path invoca otro `tx()`
+# (típico: `_log_reject` dentro de `_open_position_validate`), una nueva
+# conexión NO puede tomar el write-lock del archivo hasta que A commitee →
+# `BEGIN IMMEDIATE` → "database is locked" → 30s timeout en tests.
+#
+# Solución: TLS slot que registra la conn outer activa en el thread actual.
+# Si tx() detecta una outer ya activa en el mismo thread, hace passthrough:
+# yield la misma conn (sin BEGIN/COMMIT propios). El outer es el único que
+# realmente abre/cierra la transacción. Para Postgres aplicamos la misma
+# semántica por consistencia (anidar BEGIN dentro de BEGIN tampoco aporta).
+_TX_TLS = threading.local()
+
 
 # --------------------------------------------------------------------------- #
 # Postgres wrapper: traduce queries SQLite-specific al volar
@@ -795,10 +808,26 @@ def tx() -> Iterator[Any]:
     Postgres: row-level locks nativos. Una `BEGIN` simple, sin process-lock
     (PG maneja concurrencia entre procesos via MVCC). El _TX_LOCK no se
     toma — múltiples writers concurrentes a filas distintas no se bloquean.
+
+    Re-entrancia: si ya existe una tx() activa en el mismo thread (caller
+    outer en el stack hizo `with tx()`), reutilizamos la misma conn como
+    passthrough — sin BEGIN/COMMIT propios. Esto evita el deadlock SQLite
+    "database is locked" cuando un path interno (ej. ``_log_reject``)
+    abre tx() anidada mientras la outer aún tiene el write-lock del file.
     """
+    outer = getattr(_TX_TLS, "conn", None)
+    if outer is not None:
+        # Anidado: passthrough. Si el inner falla, la excepción propaga y el
+        # outer hace ROLLBACK. Si el outer falla después de un inner exitoso,
+        # el ROLLBACK del outer también revierte los writes del inner —
+        # semántica esperable de "todo o nada por transacción raíz".
+        yield outer
+        return
+
     if BACKEND == "sqlite":
         with _TX_LOCK:
             conn = _connect_sqlite()
+            _TX_TLS.conn = conn
             try:
                 _retry_locked(lambda: conn.execute("BEGIN IMMEDIATE"))
                 yield conn
@@ -810,12 +839,14 @@ def tx() -> Iterator[Any]:
                     pass
                 raise
             finally:
+                _TX_TLS.conn = None
                 conn.close()
     else:
         # Postgres
         import psycopg
         real = psycopg.connect(_build_pg_dsn(), autocommit=False)
         conn = _PgConn(real)
+        _TX_TLS.conn = conn
         try:
             yield conn
             real.commit()
@@ -826,4 +857,5 @@ def tx() -> Iterator[Any]:
                 pass
             raise
         finally:
+            _TX_TLS.conn = None
             conn.close()
