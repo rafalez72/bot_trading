@@ -382,15 +382,32 @@ def open_position(
         _log_reject(source_wallet, condition_id, outcome_index, "BUY", price, "no_token_id")
         return None, "no_token_id"
 
-    # Ejecutar la orden
-    order = place_market_order(
-        token_id=token_id,
-        side="BUY",
-        size_usdc=size_usdc,
-        price=price,
-        dry_run=LIVE_DRY_RUN,
-        condition_id=condition_id,
-    )
+    # Ejecutar la orden. CRÍTICO (2026-05-10): cualquier excepción acá NO debe
+    # dejar un live_trade row insertado — el INSERT solo ocurre DESPUÉS del
+    # check de `order.ok` y del phantom guard. Si el wrapper tira excepción
+    # (network, SDK bug, etc.), tratamos como `order_exception` y retornamos
+    # sin tocar la DB. Audit trail al outbox para análisis posterior.
+    try:
+        order = place_market_order(
+            token_id=token_id,
+            side="BUY",
+            size_usdc=size_usdc,
+            price=price,
+            dry_run=LIVE_DRY_RUN,
+            condition_id=condition_id,
+        )
+    except Exception as e:
+        log.exception(
+            "place_market_order tiró excepción (cid=%s.. price=%.3f): %s",
+            condition_id[:10], price, e,
+        )
+        _log_reject(
+            source_wallet, condition_id, outcome_index, "BUY", price,
+            "order_exception",
+            detail=json.dumps({"error": str(e)[:200]}),
+        )
+        return None, "order_exception"
+
     if not order.ok:
         log.warning("BUY no matcheada: %s (cid=%s.. price=%.3f)",
                     order.error, condition_id[:10], price)
