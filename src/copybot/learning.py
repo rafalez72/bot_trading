@@ -225,6 +225,7 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
     # mostrándose en cada notif vía pt.
     try:
         from src.copybot.notifier import gain as notif_gain, loss as notif_loss
+        from src.copybot.tradebook import TABLE as TRADES_TABLE_NOTIF
         pnl_amount = pt["pnl_usdc"] or 0
         with db() as c2:
             reset_row = c2.execute(
@@ -234,9 +235,12 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
                 reset_at = int((reset_row["value"] if reset_row else "0") or "0")
             except (TypeError, ValueError):
                 reset_at = 0
+            # IMPORTANTE: usar TRADES_TABLE_NOTIF (paper_trades en paper,
+            # live_trades en live) — sino al pasar a LIVE_MODE el "Acumulado"
+            # del Telegram seguiría mostrando PnL viejo del paper.
             total_row = c2.execute(
-                """
-                SELECT COALESCE(SUM(pnl_usdc), 0) as p FROM paper_trades
+                f"""
+                SELECT COALESCE(SUM(pnl_usdc), 0) as p FROM {TRADES_TABLE_NOTIF}
                 WHERE status IN ('closed_win','closed_loss','settled_win','settled_loss')
                   AND COALESCE(exit_at, 0) >= ?
                 """,
