@@ -355,5 +355,27 @@ LONG_HORIZON_MIN_EDGE_PCT = float(os.getenv("LONG_HORIZON_MIN_EDGE_PCT", "5"))
 LONG_HORIZON_BET_USDC = float(os.getenv("LONG_HORIZON_BET_USDC", "10"))
 LONG_HORIZON_CHECK_INTERVAL_S = int(os.getenv("LONG_HORIZON_CHECK_INTERVAL_S", "300"))
 
+# ---------- Crypto arb hedge (Nivel B+, 2026-05-10) ----------
+# Hedge atómico: long Polymarket UP/DOWN + short Binance perp del mismo
+# símbolo → exposure delta-neutral. Capturamos solo el lag del mid Polymarket
+# vs spot Binance, no la dirección. Edge mínimo 5pp (más bajo que crypto_arb
+# normal porque el hedge anula riesgo direccional).
+#
+# Activación gated por HEDGE_ENABLED. NUNCA arrancar en LIVE sin paper validado:
+# si la pierna Polymarket fillea pero la perp no (margen insuficiente, error de
+# red), quedamos con exposure direccional sin cobertura → pérdida por el side
+# equivocado del bucket. El orchestrator hace rollback Polymarket si la perp
+# falla, pero el rollback paga slippage.
+#
+# HEDGE_MAX_FUNDING_RATE: si funding rate del perp > este valor (positive),
+# pagar funding mientras estamos short es prohibitivo → abort. Default 0.0005
+# (0.05%/8h ≈ 1.5%/mes — soportable para hedges intra-bucket de 5min).
+HEDGE_ENABLED = os.getenv("HEDGE_ENABLED", "false").lower() == "true"
+HEDGE_MIN_EDGE = float(os.getenv("HEDGE_MIN_EDGE", "0.05"))
+HEDGE_BET_USDC = float(os.getenv("HEDGE_BET_USDC", "10.0"))
+HEDGE_LEVERAGE = int(os.getenv("HEDGE_LEVERAGE", "2"))
+HEDGE_MAX_FUNDING_RATE = float(os.getenv("HEDGE_MAX_FUNDING_RATE", "0.0005"))
+HEDGE_CHECK_INTERVAL_S = float(os.getenv("HEDGE_CHECK_INTERVAL_S", "15.0"))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 (ROOT / "logs").mkdir(parents=True, exist_ok=True)
