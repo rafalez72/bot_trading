@@ -416,6 +416,56 @@ class BinancePerpClient:
             signed=True,
         )
 
+    async def get_position_mode(self) -> bool:
+        """Devuelve True si la cuenta está en hedge mode (dualSidePosition).
+
+        Endpoint: ``GET /fapi/v1/positionSide/dual``. Binance responde
+        ``{"dualSidePosition": true}`` o ``{"dualSidePosition": false}``.
+
+        Lo usamos al startup para evitar mandar un POST innecesario cuando ya
+        está habilitado (un POST con el mismo valor responde -4059, que
+        igualmente tratamos como noop, pero el GET es más barato y no
+        contamina los logs).
+        """
+        data = await self._request(
+            "GET", "/fapi/v1/positionSide/dual", signed=True,
+        )
+        if not isinstance(data, dict):
+            raise BinancePerpError(
+                f"positionSide/dual respuesta inesperada: {type(data).__name__}",
+                payload=data,
+            )
+        return bool(data.get("dualSidePosition"))
+
+    async def get_account_info(self) -> dict:
+        """Devuelve snapshot de la cuenta vía ``GET /fapi/v2/account``.
+
+        El payload tiene varios campos; expone solo los que el orchestrator
+        usa para decidir si hay margen suficiente para abrir nuevas patas:
+
+        - ``totalWalletBalance``: USDT total (sin contar PnL no realizado).
+        - ``availableBalance``: USDT libre para nuevas posiciones.
+        - ``totalUnrealizedProfit``: PnL flotante de posiciones abiertas.
+        - ``totalMarginBalance``: wallet + PnL no realizado.
+
+        Retorna dict con todos los campos parseados a float + ``raw`` con la
+        respuesta completa. Si Binance devuelve algo inesperado, lanza
+        :class:`BinancePerpError`.
+        """
+        data = await self._request("GET", "/fapi/v2/account", signed=True)
+        if not isinstance(data, dict):
+            raise BinancePerpError(
+                f"account respuesta inesperada: {type(data).__name__}",
+                payload=data,
+            )
+        return {
+            "totalWalletBalance": float(data.get("totalWalletBalance") or 0.0),
+            "availableBalance": float(data.get("availableBalance") or 0.0),
+            "totalUnrealizedProfit": float(data.get("totalUnrealizedProfit") or 0.0),
+            "totalMarginBalance": float(data.get("totalMarginBalance") or 0.0),
+            "raw": data,
+        }
+
     async def get_funding_rate(self, symbol: str) -> dict:
         """Devuelve el último funding rate {rate, next_funding_ts, mark_price}.
 
