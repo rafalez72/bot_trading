@@ -107,55 +107,35 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
         wallet = pt["source_wallet"]
         is_win = pt["status"].endswith("_win")
 
-        sub = conn.execute(
-            "SELECT * FROM copy_subscriptions WHERE wallet=?", (wallet,)
-        ).fetchone()
-        if not sub:
-            return
+        # Wallets sintéticos (crypto_arb del bot N2) no tienen entry en
+        # copy_subscriptions. Skip los pasos de drop/sizing/cluster pero
+        # SEGUIR al notif gain/loss + categoría + bandit. Pre-fix, este
+        # `return` cortaba el flow y crypto_arb nunca disparaba notifs.
+        is_synthetic_source = wallet == "crypto_arb"
+        sub = None
+        if not is_synthetic_source:
+            sub = conn.execute(
+                "SELECT * FROM copy_subscriptions WHERE wallet=?", (wallet,)
+            ).fetchone()
+            if not sub:
+                return
 
-        # 2) Drop por racha consecutiva
-        recent = conn.execute(
-            f"""
-            SELECT status FROM {TRADES_TABLE}
-            WHERE source_wallet=?
-              AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
-            ORDER BY exit_at DESC LIMIT ?
-            """,
-            (wallet, DROP_AFTER_LOSSES),
-        ).fetchall()
+        # 2) Drop por racha consecutiva (skip si es source sintético crypto_arb)
         was_dropped = False
-        if (
-            len(recent) == DROP_AFTER_LOSSES
-            and all(r["status"].endswith("_loss") for r in recent)
-        ):
-            before = sub["sizing_mult"] or 1.0
-            conn.execute(
-                """
-                UPDATE copy_subscriptions
-                SET status='dropped', stopped_at=datetime('now'), sizing_mult=0
-                WHERE wallet=?
-                """,
-                (wallet,),
-            )
-            _log_event(
-                conn, wallet, "drop", before, 0.0,
-                f"{DROP_AFTER_LOSSES} pérdidas consecutivas",
-                {"reason": "loss_streak"},
-            )
-            was_dropped = True
-
-        # 3) Drop por PnL acumulado catastrófico (independiente de racha)
-        if not was_dropped:
-            agg = conn.execute(
+        if not is_synthetic_source:
+            recent = conn.execute(
                 f"""
-                SELECT COALESCE(SUM(pnl_usdc), 0) p, COUNT(*) n
-                FROM {TRADES_TABLE}
+                SELECT status FROM {TRADES_TABLE}
                 WHERE source_wallet=?
                   AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                ORDER BY exit_at DESC LIMIT ?
                 """,
-                (wallet,),
-            ).fetchone()
-            if agg["n"] >= DROP_PNL_MIN_TRADES and agg["p"] <= DROP_PNL_THRESHOLD_USDC:
+                (wallet, DROP_AFTER_LOSSES),
+            ).fetchall()
+            if (
+                len(recent) == DROP_AFTER_LOSSES
+                and all(r["status"].endswith("_loss") for r in recent)
+            ):
                 before = sub["sizing_mult"] or 1.0
                 conn.execute(
                     """
@@ -167,10 +147,38 @@ def on_paper_trade_closed(paper_trade_id: int) -> None:
                 )
                 _log_event(
                     conn, wallet, "drop", before, 0.0,
-                    f"PnL acumulado ${agg['p']:+.2f} en {agg['n']} trades",
-                    {"reason": "cumulative_pnl", "pnl": agg["p"], "n": agg["n"]},
+                    f"{DROP_AFTER_LOSSES} pérdidas consecutivas",
+                    {"reason": "loss_streak"},
                 )
                 was_dropped = True
+
+            # 3) Drop por PnL acumulado catastrófico (independiente de racha)
+            if not was_dropped:
+                agg = conn.execute(
+                    f"""
+                    SELECT COALESCE(SUM(pnl_usdc), 0) p, COUNT(*) n
+                    FROM {TRADES_TABLE}
+                    WHERE source_wallet=?
+                      AND status IN ('closed_win','closed_loss','settled_win','settled_loss')
+                    """,
+                    (wallet,),
+                ).fetchone()
+                if agg["n"] >= DROP_PNL_MIN_TRADES and agg["p"] <= DROP_PNL_THRESHOLD_USDC:
+                    before = sub["sizing_mult"] or 1.0
+                    conn.execute(
+                        """
+                        UPDATE copy_subscriptions
+                        SET status='dropped', stopped_at=datetime('now'), sizing_mult=0
+                        WHERE wallet=?
+                        """,
+                        (wallet,),
+                    )
+                    _log_event(
+                        conn, wallet, "drop", before, 0.0,
+                        f"PnL acumulado ${agg['p']:+.2f} en {agg['n']} trades",
+                        {"reason": "cumulative_pnl", "pnl": agg["p"], "n": agg["n"]},
+                    )
+                    was_dropped = True
 
     # Auto-reemplazo silencioso post-tx (sin notif por pedido del usuario)
     if was_dropped:
