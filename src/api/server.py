@@ -89,6 +89,48 @@ def api_thresholds_set(name: str, value: float | None = Query(None)) -> dict:
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/admin/wallets/reactivate-recent-drops")
+def api_wallets_reactivate_recent(
+    hours: float = Query(4.0, ge=0.5, le=72.0),
+    reason_substr: str = Query("pérdidas consecutivas"),
+    sizing_mult: float = Query(0.5, ge=0.1, le=1.0),
+) -> dict:
+    """Reactiva wallets dropeadas en últimas N horas con reason matching.
+
+    Default: 4h + 'pérdidas consecutivas' + sizing_mult=0.5 (start half
+    size para que si vuelve mala racha, drop sea más lento). Útil tras
+    cambios de threshold que generaron drops por motivo NO relacionado
+    al edge real.
+    """
+    from src.db.schema import tx
+    cutoff_clause = f"datetime('now', '-{float(hours)} hours')"
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT wallet, reason, stopped_at FROM copy_subscriptions
+            WHERE status='dropped' AND stopped_at >= {cutoff_clause}
+              AND reason LIKE '%' || ? || '%'
+            ORDER BY stopped_at DESC
+            """,
+            (reason_substr,),
+        ).fetchall()
+    wallets = [dict(r) for r in rows]
+    if not wallets:
+        return {"reactivated": 0, "wallets": []}
+    with tx() as conn:
+        for w in wallets:
+            conn.execute(
+                """
+                UPDATE copy_subscriptions
+                SET status='active', stopped_at=NULL, sizing_mult=?,
+                    reason=?
+                WHERE wallet=?
+                """,
+                (sizing_mult, f"admin reactivate (was: {w['reason']})", w["wallet"]),
+            )
+    return {"reactivated": len(wallets), "wallets": wallets}
+
+
 @app.get("/api/admin/version")
 def api_version() -> dict:
     """Retorna commit SHA y timestamp del build Docker actual.
