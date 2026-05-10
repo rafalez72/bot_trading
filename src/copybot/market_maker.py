@@ -66,22 +66,44 @@ MAX_TIME_TO_CLOSE_S = 3600  # 1h
 
 
 def _ensure_schema() -> None:
-    """Crea la tabla `mm_orders` (idempotente). Llamar antes de cualquier I/O."""
-    ddl = """
-    CREATE TABLE IF NOT EXISTS mm_orders (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        condition_id  TEXT NOT NULL,
-        side          TEXT NOT NULL,
-        price         REAL NOT NULL,
-        size_usdc     REAL NOT NULL,
-        order_id      TEXT,
-        status        TEXT DEFAULT 'open',
-        filled_at     INTEGER,
-        fill_price    REAL,
-        pnl_usdc      REAL,
-        created_at    INTEGER DEFAULT (strftime('%s','now'))
-    )
+    """Crea la tabla `mm_orders` (idempotente). Llamar antes de cualquier I/O.
+
+    Backend-aware: SQLite usa INTEGER PK AUTOINC + REAL, PG usa BIGSERIAL +
+    DOUBLE PRECISION. Detectado vía `BACKEND` de schema.py.
     """
+    from src.db.schema import BACKEND
+    if BACKEND == "postgres":
+        ddl = """
+        CREATE TABLE IF NOT EXISTS mm_orders (
+            id            BIGSERIAL PRIMARY KEY,
+            condition_id  TEXT NOT NULL,
+            side          TEXT NOT NULL,
+            price         DOUBLE PRECISION NOT NULL,
+            size_usdc     DOUBLE PRECISION NOT NULL,
+            order_id      TEXT,
+            status        TEXT DEFAULT 'open',
+            filled_at     BIGINT,
+            fill_price    DOUBLE PRECISION,
+            pnl_usdc      DOUBLE PRECISION,
+            created_at    BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT)
+        )
+        """
+    else:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS mm_orders (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id  TEXT NOT NULL,
+            side          TEXT NOT NULL,
+            price         REAL NOT NULL,
+            size_usdc     REAL NOT NULL,
+            order_id      TEXT,
+            status        TEXT DEFAULT 'open',
+            filled_at     INTEGER,
+            fill_price    REAL,
+            pnl_usdc      REAL,
+            created_at    INTEGER DEFAULT (strftime('%s','now'))
+        )
+        """
     try:
         with tx() as conn:
             conn.execute(ddl)

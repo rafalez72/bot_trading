@@ -137,7 +137,7 @@ class _HedgeMetrics:
 # DDL idempotente. INTEGER PRIMARY KEY AUTOINCREMENT en SQLite, BIGSERIAL
 # en Postgres (vía traducción del wrapper). Mantenemos el schema simple — el
 # auditing detallado vive en `raw` (JSON).
-_TABLE_DDL = """
+_TABLE_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS hedge_trades (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     bucket_slug        TEXT NOT NULL,
@@ -160,6 +160,29 @@ CREATE TABLE IF NOT EXISTS hedge_trades (
 )
 """
 
+_TABLE_DDL_PG = """
+CREATE TABLE IF NOT EXISTS hedge_trades (
+    id                 BIGSERIAL PRIMARY KEY,
+    bucket_slug        TEXT NOT NULL,
+    symbol             TEXT,
+    side               TEXT,
+    poly_trade_id      BIGINT,
+    perp_order_id      TEXT,
+    perp_qty           DOUBLE PRECISION,
+    perp_entry_price   DOUBLE PRECISION,
+    spot_at_entry      DOUBLE PRECISION,
+    edge_at_open       DOUBLE PRECISION,
+    status             TEXT DEFAULT 'open',
+    pnl_poly_usdc      DOUBLE PRECISION,
+    pnl_perp_usdc      DOUBLE PRECISION,
+    pnl_total_usdc     DOUBLE PRECISION,
+    fees_total_usdc    DOUBLE PRECISION,
+    opened_at          BIGINT,
+    closed_at          BIGINT,
+    raw                JSONB
+)
+"""
+
 _TABLE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_hedge_status ON hedge_trades(status)",
     "CREATE INDEX IF NOT EXISTS idx_hedge_bucket ON hedge_trades(bucket_slug)",
@@ -174,9 +197,10 @@ def init_table() -> None:
     INTEGER PRIMARY KEY AUTOINCREMENT → BIGSERIAL).
     """
     try:
-        from src.db.schema import db
+        from src.db.schema import db, BACKEND
+        ddl = _TABLE_DDL_PG if BACKEND == "postgres" else _TABLE_DDL_SQLITE
         with db() as conn:
-            conn.execute(_TABLE_DDL)
+            conn.execute(ddl)
             for ix in _TABLE_INDEXES:
                 conn.execute(ix)
     except Exception:

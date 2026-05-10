@@ -142,7 +142,7 @@ class _Metrics:
 
 # --- DB schema (on-demand) ---
 
-_TABLE_DDL = """
+_TABLE_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS spike_arb_trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL,
@@ -163,6 +163,27 @@ CREATE TABLE IF NOT EXISTS spike_arb_trades (
 )
 """
 
+_TABLE_DDL_PG = """
+CREATE TABLE IF NOT EXISTS spike_arb_trades (
+    id              BIGSERIAL PRIMARY KEY,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    spike_pct       DOUBLE PRECISION,
+    mid_at_signal   DOUBLE PRECISION,
+    limit_price     DOUBLE PRECISION,
+    size_usdc       DOUBLE PRECISION,
+    order_id        TEXT,
+    fill_price      DOUBLE PRECISION,
+    status          TEXT DEFAULT 'open',
+    pnl_usdc        DOUBLE PRECISION,
+    bucket_slug     TEXT,
+    bucket_end_ts   BIGINT,
+    signal_at       BIGINT,
+    filled_at       BIGINT,
+    closed_at       BIGINT
+)
+"""
+
 _TABLE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_spike_arb_status ON spike_arb_trades(status)",
     "CREATE INDEX IF NOT EXISTS idx_spike_arb_symbol ON spike_arb_trades(symbol)",
@@ -178,9 +199,10 @@ def init_table() -> None:
     AUTOINCREMENT`` también — ver ``_translate_sql_to_pg``).
     """
     try:
-        from src.db.schema import db
+        from src.db.schema import db, BACKEND
+        ddl = _TABLE_DDL_PG if BACKEND == "postgres" else _TABLE_DDL_SQLITE
         with db() as conn:
-            conn.execute(_TABLE_DDL)
+            conn.execute(ddl)
             for ix in _TABLE_INDEXES:
                 conn.execute(ix)
     except Exception:
