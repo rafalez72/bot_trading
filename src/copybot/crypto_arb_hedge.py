@@ -39,6 +39,8 @@ import json
 import logging
 import os
 import time
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -1272,6 +1274,14 @@ async def crypto_arb_hedge_loop() -> None:
                     )
                 except asyncio.TimeoutError:
                     log.warning("crypto_arb_hedge: list markets timeout — sigo")
+                    markets = []
+                except (httpx.HTTPError, ConnectionError) as e:
+                    # Transient net error (gamma close conn, DNS hiccup). Bot
+                    # retoma siguiente ciclo. No spamear Telegram con stacktrace.
+                    log.warning(
+                        "crypto_arb_hedge: list markets transient_net %s — sigo",
+                        type(e).__name__,
+                    )
                     markets = []
                 except Exception:
                     log.exception("crypto_arb_hedge: list markets error")

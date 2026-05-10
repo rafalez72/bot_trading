@@ -30,7 +30,9 @@ SYMBOL_VOL_PCT_PER_MIN: dict[str, float] = {
 }
 
 # Default min edge (probability points) — env override CRYPTO_ARB_MIN_EDGE.
-DEFAULT_MIN_EDGE = 0.10
+# 2026-05-10: bajado de 0.10 → 0.03. Edges reales en UpDown 5min son 2-5pp.
+# 0.10 filtra ~100% de trades (paper sin operaciones cripto). 0.03 balance.
+DEFAULT_MIN_EDGE = 0.03
 
 
 def get_sigma_pct_per_min(symbol: str) -> float:
@@ -52,7 +54,7 @@ def get_sigma_pct_per_min(symbol: str) -> float:
 
 
 def get_min_edge() -> float:
-    """Read CRYPTO_ARB_MIN_EDGE env (probability points). Default 0.10."""
+    """Read CRYPTO_ARB_MIN_EDGE env (probability points). Default 0.03."""
     raw = os.getenv("CRYPTO_ARB_MIN_EDGE")
     if raw:
         try:

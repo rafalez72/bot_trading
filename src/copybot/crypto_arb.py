@@ -38,6 +38,8 @@ import re
 import tempfile
 import threading
 import time
+
+import httpx
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,7 +72,9 @@ SLUG_REGEX = re.compile(r"^(btc|eth|sol|xrp|bnb|hype|doge)-updown-5m-(\d+)$")
 
 # --- Parámetros configurables vía env ---
 DEFAULT_CHECK_INTERVAL_S = 15.0
-DEFAULT_PRE_CLOSE_WINDOW_S = 180.0  # solo evaluar markets que cierran en próximos 180s
+DEFAULT_PRE_CLOSE_WINDOW_S = 300.0  # solo evaluar markets que cierran en próximos 300s
+# 2026-05-10: subido 180 → 300. UpDown 5min: bot solo veía últimos 3min (ya priced-in).
+# 5min completo = más oportunidades capture señal antes que mercado converja.
 DEFAULT_MOMENTUM_THRESHOLD_PCT = 0.3
 DEFAULT_MAX_MID_TARGET = 0.70       # midpoint del lado a comprar debe ser <0.70
 DEFAULT_BET_SIZE_USDC = 5.0
@@ -749,6 +753,14 @@ async def crypto_arb_loop() -> None:
                     )
                 except asyncio.TimeoutError:
                     log.warning("crypto_arb: list markets timeout — sigo")
+                    markets = []
+                except (httpx.HTTPError, ConnectionError) as e:
+                    # Transient net error (gamma close conn). Bot continúa
+                    # siguiente ciclo. No spamear Telegram con stacktrace.
+                    log.warning(
+                        "crypto_arb: list markets transient_net %s — sigo",
+                        type(e).__name__,
+                    )
                     markets = []
                 except Exception:
                     log.exception("crypto_arb: list markets error")
