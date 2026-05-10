@@ -771,6 +771,11 @@ PnL acumulado: +$1,470.66 sobre cap $100
 
 ## 16. Bitácora de avances (changelog cronológico)
 
+### 2026-05-10 — Infra pre-live: backup script + dashboard 7-strategies + pip-audit baseline
+- `scripts/db_backup.sh`: snapshot PG (`pg_dump|gzip`) o SQLite (`cp`) → `/app/backups/copybot-<TS>.{sql.gz,db}`. Correr antes de cada flip a `LIVE_DRY_RUN=false` o cambios de schema.
+- `/api/strategies/status` (server.py): snapshot agregado de las 7 strategies (n1_copybot, crypto_arb, market_maker, spike_arb, adversarial, long_horizon, hedge) — open count + pnl 24h + last_activity por tabla. Dashboard (`index.html`) tiene sección nueva "Strategies".
+- `pip-audit` primera corrida documentada (ver commit `chore(security)` del día) — baseline de vulnerabilidades en deps.
+
 ### 2026-05-10 — Refactor validation compartida + crypto N2 operativo end-to-end
 
 **Hito**: paper y live ahora comparten 100% de la lógica de pre-open checks
