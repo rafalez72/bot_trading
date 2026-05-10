@@ -489,33 +489,144 @@ async def _post_adversarial_ask_signal_only(
     return None
 
 
+async def _live_executor(setup: dict) -> dict:
+    """Live executor "Plan B" — split complete set + post limit SELL del loser.
+
+    Setup dict::
+
+        {
+          "bucket_slug": str,           # e.g. "btc-updown-5m-1777505400"
+          "loser_side": "Up" | "Down",  # lado a vender (token va a $0)
+          "ask_price":  float,          # precio del SELL (e.g. 0.05)
+          "size_usdc":  float,          # USDC a mintear via splitPosition
+        }
+
+    Flujo:
+      1. Resolver ``conditionId`` desde ``slug`` via Gamma (closed=true porque
+         el bucket está casi resolviendo — si está activo, también matchea).
+      2. Resolver ``token_id`` del lado perdedor via ``token_resolver``.
+      3. ``split_position(condition_id, size_usdc)`` — mint YES+NO 1:1.
+      4. ``place_limit_order_gtc(token_id, side='SELL', price=ask_price, ...)``
+         — orden resting hasta bucket close.
+
+    Resultado:
+      - Si retail/bot pega la ask → cobramos ``ask_price * shares`` y settle
+        del lado perdedor vale $0 (ya no tenemos esas shares). Net positivo.
+      - Si nadie pega → loser settle $0, winner settle $1 → recuperamos lo
+        gastado (size_usdc) sin pérdida ni ganancia.
+
+    Devuelve dict::
+
+        {"ok": bool, "order_id": str | None, "split_tx_hash": str | None,
+         "token_id": str | None, "error": str | None}
+    """
+    # Imports lazy: si LIVE no está activo no pagamos costo del SDK.
+    try:
+        from src.polymarket.clob_client import (
+            place_limit_order_gtc,
+            split_position,
+        )
+        from src.polymarket.client import GAMMA_API, PolymarketClient
+    except Exception as e:
+        return {"ok": False, "error": f"clob_import: {e}"}
+
+    try:
+        from src.polymarket.token_resolver import resolve_token_id
+    except Exception as e:
+        return {"ok": False, "error": f"token_resolver_import: {e}"}
+
+    slug = setup.get("bucket_slug") or ""
+    loser_side = setup.get("loser_side") or ""
+    ask_price = float(setup.get("ask_price") or 0.0)
+    size_usdc = float(setup.get("size_usdc") or 0.0)
+
+    if not slug or loser_side not in (SIDE_UP, SIDE_DOWN):
+        return {"ok": False, "error": "invalid_setup"}
+    if ask_price <= 0 or size_usdc <= 0:
+        return {"ok": False, "error": "invalid_amounts"}
+
+    loser_outcome_index = 0 if loser_side == SIDE_UP else 1
+
+    # 1+2: resolver conditionId + token_id en una sola sesión async.
+    try:
+        async with PolymarketClient() as c:
+            try:
+                d = await c._get(
+                    f"{GAMMA_API}/markets",
+                    params={"slug": slug, "closed": "true", "limit": 1},
+                )
+            except Exception as e:
+                return {"ok": False, "error": f"gamma_lookup: {e}"}
+            if not d:
+                return {"ok": False, "error": "market_not_found"}
+            m = d[0] if isinstance(d, list) else d
+            if not isinstance(m, dict):
+                return {"ok": False, "error": "market_not_dict"}
+            condition_id = m.get("conditionId")
+            token_id = await resolve_token_id(c, slug, loser_outcome_index)
+    except Exception as e:
+        return {"ok": False, "error": f"resolve_failed: {e}"}
+
+    if not condition_id or not token_id:
+        return {"ok": False, "error": "no_cid_or_token"}
+
+    # 3. Split position: gasta size_usdc → mintea YES+NO 1:1.
+    try:
+        tx_hash = split_position(condition_id, size_usdc)
+    except Exception as e:
+        return {"ok": False, "error": f"split_exception: {e}"}
+    if not tx_hash:
+        return {"ok": False, "error": "split_failed"}
+
+    # 4. Postear LIMIT SELL GTC del lado perdedor.
+    try:
+        result = place_limit_order_gtc(
+            token_id=token_id,
+            side="SELL",
+            price=ask_price,
+            size=size_usdc / ask_price,
+            ttl_s=None,  # GTC — vive hasta bucket close o cancel manual
+            condition_id=condition_id,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"limit_post_exception: {e}",
+            "split_tx_hash": tx_hash,
+        }
+    if not getattr(result, "ok", False):
+        return {
+            "ok": False,
+            "error": f"limit_post_failed: {getattr(result, 'error', None)}",
+            "split_tx_hash": tx_hash,
+            "token_id": token_id,
+        }
+
+    return {
+        "ok": True,
+        "order_id": getattr(result, "order_id", None),
+        "split_tx_hash": tx_hash,
+        "token_id": token_id,
+        "error": None,
+    }
+
+
 async def _post_adversarial_ask_live(
     token_id: str, side: str, price: float, size_usdc: float,
 ) -> Optional[str]:
-    """STUB — postear ask resting (GTC) en el CLOB. NO IMPLEMENTADO.
+    """Hook adapter — el flujo live REAL pasa por ``_live_executor`` con
+    setup completo (incluye bucket_slug+loser_side para mint+resolve). Este
+    adapter queda como fallback raise: indica al caller que use el path
+    de ``_live_executor`` directo desde ``evaluate_and_post``.
 
-    Razón: requiere mint de complete set (split position vía CTF Exchange)
-    o BUY-then-resell, ninguno de los cuales está expuesto en
-    ``src.polymarket.clob_client``. El flujo correcto sería:
-
-    1. ``CTFExchange.splitPosition(condition_id, amount)`` — gasta USDC,
-       recibe ERC1155 de YES + NO.
-    2. ``client.create_order + post_order(OrderType.GTC)`` con side=SELL,
-       price=ask_price, size=size_usdc/ask_price del token_id loser.
-    3. Listen al WS user channel para detectar fill.
-    4. En fill: registrar PnL = (price - 0) * shares - fees.
-    5. En no-fill: cancel pre-close, redeem winner side por $1.
-
-    Implementarlo requiere extender ``clob_client.py`` con:
-    - ``split_position(condition_id, amount_usdc)`` (web3 call al CTF Exchange)
-    - ``place_limit_order_gtc(token_id, side, price, size)`` (orden resting)
-    - ``cancel_order(order_id)``
-
-    Por ahora, ``signal_only=False`` levanta NotImplementedError.
+    Mantenido por compat con la signature de ``PostAskHook`` (4 args). Si
+    alguien instancia ``AdversarialAsks(post_ask_hook=_post_adversarial_ask_live)``
+    explícito sin pasar por evaluate_and_post → falla loud.
     """
     raise NotImplementedError(
-        "live adversarial asks require splitPosition + GTC orders; "
-        "extend clob_client.py first. Use signal_only=true to log opportunities."
+        "use AdversarialAsks.evaluate_and_post live path "
+        "(LIVE_MODE=True + signal_only=False) — _live_executor handles "
+        "split+limit. Direct hook signature insufficient (no condition_id/slug)."
     )
 
 
@@ -546,6 +657,7 @@ class AdversarialAsks:
         markets_provider: Optional[Callable[[], Awaitable[list[dict]]]] = None,
         post_ask_hook: Optional[PostAskHook] = None,
         now_fn: Optional[Callable[[], int]] = None,
+        live_executor: Optional[Callable[[dict], Awaitable[dict]]] = None,
     ):
         self.config = config or AdversarialConfig.from_env()
         self.markets_provider = markets_provider
@@ -554,6 +666,10 @@ class AdversarialAsks:
             if self.config.signal_only
             else _post_adversarial_ask_live
         )
+        # Live executor inyectable: en prod es ``_live_executor`` (split +
+        # limit SELL GTC); en tests pasamos un mock. Solo se invoca cuando
+        # LIVE_MODE=True AND signal_only=False.
+        self._live_executor_fn = live_executor or _live_executor
         self.now_fn = now_fn or (lambda: int(time.time()))
 
         # spot_history[symbol] = list[(ts_ms, price)]
@@ -638,30 +754,65 @@ class AdversarialAsks:
         if dedup_key in self._posted:
             return decision
 
-        # Resolver token_id del lado loser.
+        # Resolver token_id del lado loser (best-effort, para signal_only).
+        # En LIVE el ``_live_executor`` re-resuelve via token_resolver async.
         token_id = self._resolve_token_id(market, decision.loser_side)
-        if not token_id:
-            log.warning(
-                "adversarial.no_token_id slug=%s side=%s",
-                slug, decision.loser_side,
-            )
-            return decision
 
-        # Postear (o loggear) la ask.
+        # Branch LIVE: si LIVE_MODE=True AND signal_only=False, usamos
+        # ``_live_executor`` (split_position + limit SELL GTC). El executor
+        # resuelve condition_id + token_id internamente — no requiere que
+        # el market dict los traiga.
+        live_path = False
         try:
-            order_id = await self.post_ask_hook(
-                token_id, "SELL",
-                self.config.ask_price, self.config.size_usdc,
-            )
-        except NotImplementedError:
-            log.warning(
-                "adversarial.live_not_implemented slug=%s — set signal_only=true",
-                slug,
-            )
-            return decision
+            from src.config import LIVE_MODE as _LIVE_MODE
         except Exception:
-            log.exception("adversarial.post_ask error slug=%s", slug)
-            return decision
+            _LIVE_MODE = False
+        if _LIVE_MODE and not self.config.signal_only:
+            live_path = True
+
+        order_id: Optional[str] = None
+        if live_path:
+            setup = {
+                "bucket_slug": slug,
+                "loser_side": decision.loser_side,
+                "ask_price": self.config.ask_price,
+                "size_usdc": self.config.size_usdc,
+            }
+            try:
+                live_result = await self._live_executor_fn(setup)
+            except Exception:
+                log.exception("adversarial.live_executor crash slug=%s", slug)
+                return decision
+            if not live_result.get("ok"):
+                log.warning(
+                    "adversarial.live_executor_failed slug=%s err=%s",
+                    slug, live_result.get("error"),
+                )
+                return decision
+            order_id = live_result.get("order_id")
+            token_id = live_result.get("token_id") or token_id
+        else:
+            if not token_id:
+                log.warning(
+                    "adversarial.no_token_id slug=%s side=%s",
+                    slug, decision.loser_side,
+                )
+                return decision
+            # Path no-live (signal_only o paper): hook tipado.
+            try:
+                order_id = await self.post_ask_hook(
+                    token_id, "SELL",
+                    self.config.ask_price, self.config.size_usdc,
+                )
+            except NotImplementedError:
+                log.warning(
+                    "adversarial.live_not_implemented slug=%s — set signal_only=true",
+                    slug,
+                )
+                return decision
+            except Exception:
+                log.exception("adversarial.post_ask error slug=%s", slug)
+                return decision
 
         self._posted.add(dedup_key)
 
@@ -751,6 +902,7 @@ __all__ = [
     "AdversarialAsks",
     "AdversarialConfig",
     "AdversarialDecision",
+    "_live_executor",
     "detect_loser_side",
     "evaluate_market",
     "init_schema",
