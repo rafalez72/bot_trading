@@ -335,12 +335,14 @@ def open_position(
         # Smart expiry filter: bloquea markets que expiran en <MIN_TIME_TO_EXPIRY_SECONDS
         # (default 600s = 10min). Cubre slugs con epoch al final, slugs con
         # date+hour ET, y -YYYY-MM-DD$ al final. Fail-open si no parsea.
+        # crypto_arb está diseñado precisamente para markets de 5min — exempt.
         slug = slug_for_filters
-        expiry_ts = parse_slug_expiry(slug)
-        if expiry_ts is not None:
-            time_left = expiry_ts - int(time.time())
-            if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
-                return None, "expires_too_soon"
+        if source_wallet != "crypto_arb":
+            expiry_ts = parse_slug_expiry(slug)
+            if expiry_ts is not None:
+                time_left = expiry_ts - int(time.time())
+                if time_left < MIN_TIME_TO_EXPIRY_SECONDS:
+                    return None, "expires_too_soon"
 
         cat = None
         if m:
