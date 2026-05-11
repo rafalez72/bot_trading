@@ -102,8 +102,8 @@ def api_wallets_reactivate_recent(
     cambios de threshold que generaron drops por motivo NO relacionado
     al edge real.
     """
-    # Portable: query all dropped + filter en Python (cutoff en TEXT/timestamp
-    # tiene diferente formato entre SQLite y PG, evitamos datetime() function).
+    # Portable: query all dropped + filter en Python (cutoff y LIKE en SQL
+    # tienen syntax diferente SQLite vs PG, evitamos ambos en SQL).
     from datetime import datetime, timedelta, timezone
     from src.db.schema import tx
     cutoff = datetime.now(timezone.utc) - timedelta(hours=float(hours))
@@ -111,13 +111,13 @@ def api_wallets_reactivate_recent(
         rows = conn.execute(
             """
             SELECT wallet, reason, stopped_at FROM copy_subscriptions
-            WHERE status='dropped'
-              AND reason LIKE '%' || ? || '%'
-              AND stopped_at IS NOT NULL
+            WHERE status='dropped' AND stopped_at IS NOT NULL
             ORDER BY stopped_at DESC LIMIT 200
             """,
-            (reason_substr,),
         ).fetchall()
+    # Filter por reason_substr en Python (case-insensitive)
+    needle = (reason_substr or "").lower()
+    rows = [r for r in rows if needle in (dict(r).get("reason") or "").lower()]
 
     def _parse_ts(v):
         if v is None:
