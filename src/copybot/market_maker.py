@@ -372,78 +372,81 @@ class MarketMaker:
 
     # ---- Default candidates query (placeholder, se mockea en tests) ----
 
-    def _default_list_candidates(self) -> list[dict]:
-        """Lee de tabla `markets` candidatos eligibles para MM.
+    async def _default_list_candidates(self) -> list[dict]:
+        """Pullea Gamma API directo + filtros para MM.
+
+        Tabla `markets` local NO sirve: rows stub del WS tienen NULL en
+        liquidity/volume/end_date. Y Gamma a veces devuelve liquidity=99.999
+        placeholder. Mejor: fetch fresh + filter razonable.
 
         Filtros:
-        - active=1, closed=0
-        - end_date > now + max_time_to_close_s (horizon mínimo)
-        - liquidity >= min market liq (override DB → env)
-        - volume >= min vol (override DB → env)
-        - category excluye esports live + crypto-updown (incompatibles MM)
+        - closed=false (markets activos)
+        - end_date > now + max_time_to_close_s (>1h)
+        - excluye esports live + crypto-updown + sports in-play
+        - ordenado por endDate descending (markets más largos primero)
 
-        Devuelve hasta max_concurrent_pairs * 3 candidates (buffer para cap).
+        Devuelve hasta max_concurrent_pairs * 3 candidates.
         """
-        from datetime import datetime, timezone
-        from src.db.schema import db
-        from src.copybot.threshold_overrides import (
-            get_min_market_liquidity_usdc,
-            get_min_market_volume_usdc,
-        )
+        from datetime import datetime, timezone, timedelta
+        from src.polymarket.client import PolymarketClient
 
-        min_liq = get_min_market_liquidity_usdc()
-        min_vol = get_min_market_volume_usdc()
         limit = max(self.config.max_concurrent_pairs * 3, 30)
-        excluded_cat_patterns = ("crypto-updown", "esports-live", "live-")
+        excluded_patterns = (
+            "updown", "-live-", "next-set-winner", "exact-score",
+            "next-game-", "set-",
+        )
+        excluded_cats = ("crypto", "esports")
+        now = datetime.now(timezone.utc)
+        min_end = now + timedelta(seconds=self.config.max_time_to_close_s)
+        iso_min = min_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
-            with db() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT condition_id, slug, question, category, end_date,
-                           liquidity, volume, outcome_prices
-                    FROM markets
-                    WHERE active=1 AND closed=0
-                      AND liquidity >= ?
-                      AND volume >= ?
-                      AND end_date IS NOT NULL
-                    ORDER BY liquidity DESC
-                    LIMIT ?
-                    """,
-                    (min_liq, min_vol, limit),
-                ).fetchall()
+            async with PolymarketClient() as client:
+                out = []
+                seen = 0
+                async for m in client.iter_markets(
+                    page_size=500, closed=False,
+                    order="endDate", ascending=True,
+                    end_date_min=iso_min,
+                ):
+                    seen += 1
+                    if seen > 2000:  # safety bound
+                        break
+                    slug = (m.get("slug") or "").lower()
+                    cat = (m.get("category") or "").lower()
+                    if any(p in slug for p in excluded_patterns):
+                        continue
+                    if any(c in cat for c in excluded_cats):
+                        continue
+                    end_str = m.get("endDate") or ""
+                    try:
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        if not end_dt.tzinfo:
+                            end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        continue
+                    secs_left = (end_dt - now).total_seconds()
+                    if secs_left < self.config.max_time_to_close_s:
+                        continue
+                    out.append({
+                        "condition_id": m.get("conditionId"),
+                        "slug": m.get("slug"),
+                        "question": m.get("question"),
+                        "end_ts": int(end_dt.timestamp()),
+                        "secs_to_close": secs_left,
+                        "outcome_prices": m.get("outcomePrices"),
+                        "clob_token_ids": m.get("clobTokenIds"),
+                    })
+                    if len(out) >= limit:
+                        break
+                log.debug(
+                    "market_maker._default_list_candidates: %d seen, %d eligibles",
+                    seen, len(out),
+                )
+                return out
         except Exception as e:
-            log.debug("market_maker._default_list_candidates query failed: %s", e)
+            log.warning("market_maker._default_list_candidates fetch failed: %s", e)
             return []
-
-        now_utc = datetime.now(timezone.utc)
-        out = []
-        for r in rows:
-            d = dict(r)
-            cat = (d.get("category") or "").lower()
-            if any(p in cat for p in excluded_cat_patterns):
-                continue
-            slug_lc = (d.get("slug") or "").lower()
-            if any(p in slug_lc for p in ("updown", "-live-")):
-                continue
-            end_date_str = d.get("end_date")
-            if not end_date_str:
-                continue
-            try:
-                # end_date típico: '2026-05-15T12:00:00Z'
-                s = str(end_date_str).replace("Z", "+00:00")
-                end_dt = datetime.fromisoformat(s)
-                if not end_dt.tzinfo:
-                    end_dt = end_dt.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                continue
-            secs_left = (end_dt - now_utc).total_seconds()
-            if secs_left < self.config.max_time_to_close_s:
-                continue
-            d["end_ts"] = int(end_dt.timestamp())
-            d["secs_to_close"] = secs_left
-            out.append(d)
-        return out[:limit]
 
     async def _resolve_market_tokens(self, market: dict) -> Optional[dict]:
         """Resuelve {yes_token_id, no_token_id} desde el slug del market.
@@ -508,7 +511,16 @@ class MarketMaker:
 
     async def _tick(self) -> None:
         """Un ciclo: scan → cancel/repost stale → place new → handle fills."""
-        candidates = self._list_candidates_fn()
+        # 2026-05-10: soporte async candidate fn (Gamma fetch directo).
+        # Tabla `markets` local tiene NULL para liquidity/volume (los stubs
+        # del WS solo guardan slug+question). El fix `_default_list_candidates`
+        # async pullea Gamma con filters reales.
+        import asyncio as _asyncio
+        cand_fn = self._list_candidates_fn
+        if _asyncio.iscoroutinefunction(cand_fn):
+            candidates = await cand_fn()
+        else:
+            candidates = cand_fn()
         # Cap: aplicamos hard limit antes de cualquier cosa. Si vienen 20
         # candidates pero cap=5, sólo mantenemos los 5 que ya tenemos vivos
         # más nuevos hasta llegar al cap.
