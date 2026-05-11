@@ -603,6 +603,18 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar grid_bot: %s", e)
 
+    # Signal Bot Binance — alertas Telegram RSI/EMA/MACD sobre BTC/ETH/SOL.
+    # WS público (sin API key) — siempre arrancable.
+    signal_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.binance.signal_bot import maybe_start_signal_bot_in_background
+            signal_task = await maybe_start_signal_bot_in_background()
+            if signal_task is not None:
+                log.info("signal_bot: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar signal_bot: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

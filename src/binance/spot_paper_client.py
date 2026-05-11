@@ -32,6 +32,17 @@ log = logging.getLogger(__name__)
 # Fee aproximado spot maker/taker (BNB discount aplicado da 0.075%, sin BNB 0.1%)
 FEE_PCT = 0.001  # 0.1%
 
+# Realism tuning — simular condiciones reales de Binance Spot.
+# - Spread bid/ask: en Binance Spot líquido (BTC/ETH/SOL), spread típico 0.01-0.05%.
+# - Slippage adicional: por queue position + order book competition.
+# - Fill probability: cuando price cruza el limit, no siempre fillea inmediato
+#   (otros bots pelean por el level, parcial fills posibles). Aprox 75% fill en
+#   cada tick que cruza, 100% después de 3 ticks consecutivos.
+SPREAD_PCT = 0.0003   # 0.03% bid/ask gap
+SLIPPAGE_PCT = 0.0005  # 0.05% adicional por queue/competition
+FILL_PROB_FIRST_CROSS = 0.75  # 75% de chance fill al primer cruce
+FILL_PROB_GROWTH = 0.20  # +20% cada tick cruzado consecutivo
+
 # Filter approximations por símbolo (real exchangeInfo se podría cachear).
 SYMBOL_FILTERS = {
     "BTCUSDT": {"tickSize": 0.01, "stepSize": 0.00001, "minNotional": 5.0, "base": "BTC", "quote": "USDT"},
@@ -54,6 +65,9 @@ class _OpenOrder:
     quote_qty: float
     status: str = "NEW"
     created_at: int = field(default_factory=lambda: int(time.time()))
+    # Realism: contador de ticks consecutivos donde el price cruzó.
+    # Sube fill probability gradualmente para simular queue position.
+    crossed_ticks: int = 0
 
 
 class BinanceSpotPaperClient:
@@ -103,11 +117,11 @@ class BinanceSpotPaperClient:
     # ----- public endpoints (mimicry BinanceSpotClient) -----
 
     async def get_book_ticker(self, symbol: str) -> dict:
-        """Reusa WS para best bid/ask. Si no hay, retorna last_price ±0.01%."""
+        """Best bid/ask simulado con SPREAD_PCT realista (~0.03%)."""
         price = self._get_current_price(symbol)
         if price is None:
             raise RuntimeError(f"paper: no price for {symbol} (WS aún no recibió)")
-        spread = price * 0.0001
+        spread = price * SPREAD_PCT
         return {
             "symbol": symbol,
             "bidPrice": f"{price - spread:.8f}",
@@ -269,6 +283,14 @@ class BinanceSpotPaperClient:
             await asyncio.sleep(2.0)
 
     async def _reconcile_fills(self) -> None:
+        """Simulate realistic fill behavior.
+
+        - BUY fillea cuando ASK price (bid_price + spread) cruza el limit.
+        - SELL fillea cuando BID price (ask_price - spread) cruza el limit.
+        - Fill probability sube por tick consecutivo cruzado (queue position).
+        - Slippage adicional aplicado al fill_price (no fill exacto al limit).
+        """
+        import random
         for oid in list(self._open_orders.keys()):
             order = self._open_orders.get(oid)
             if not order:
@@ -276,36 +298,46 @@ class BinanceSpotPaperClient:
             price = self._get_current_price(order.symbol)
             if price is None:
                 continue
-            filled = False
-            fill_price = order.price
-            # BUY fillea si el market price baja a su limit o más bajo.
-            if order.side == "BUY" and price <= order.price:
-                filled = True
-                fill_price = order.price  # asumimos fill al limit
-            # SELL fillea si el market sube al limit o más alto.
-            elif order.side == "SELL" and price >= order.price:
-                filled = True
-                fill_price = order.price
-            if not filled:
+            spread = price * SPREAD_PCT
+            # Approximated bid/ask reales
+            best_bid = price - spread
+            best_ask = price + spread
+            crossed = False
+            if order.side == "BUY" and best_ask <= order.price:
+                crossed = True
+            elif order.side == "SELL" and best_bid >= order.price:
+                crossed = True
+            if not crossed:
+                order.crossed_ticks = 0
                 continue
+            # Subir contador consecutive crosses
+            order.crossed_ticks += 1
+            # Fill probability: 75% al primer cruce, +20% por tick consecutivo
+            fill_prob = min(1.0, FILL_PROB_FIRST_CROSS + FILL_PROB_GROWTH * (order.crossed_ticks - 1))
+            if random.random() > fill_prob:
+                # Skip fill este tick (queue position no llegó aún)
+                continue
+            # Fill price con slippage realista
+            if order.side == "BUY":
+                fill_price = min(order.price, best_ask * (1 + SLIPPAGE_PCT))
+            else:
+                fill_price = max(order.price, best_bid * (1 - SLIPPAGE_PCT))
             # Aplicar fee
             f = SYMBOL_FILTERS.get(order.symbol, {})
             base = f.get("base", "")
             if order.side == "BUY":
-                # Recibe base (menos fee en base).
                 received = order.qty * (1 - FEE_PCT)
                 self._balances[base] += received
             else:
-                # Recibe USDT (menos fee en USDT).
                 received_usdt = order.qty * fill_price * (1 - FEE_PCT)
                 self._balances["USDT"] += received_usdt
             order.status = "FILLED"
             self._open_orders.pop(oid, None)
             log.info(
-                "paper.fill %s %s price=%.4f qty=%.6f market=%.4f",
-                order.symbol, order.side, fill_price, order.qty, price,
+                "paper.fill %s %s limit=%.4f fill=%.4f qty=%.6f market=%.4f (slip=%.4f)",
+                order.symbol, order.side, order.price, fill_price, order.qty,
+                price, fill_price - order.price,
             )
-            # Callbacks
             for cb in self._fill_callbacks:
                 try:
                     await cb(order, fill_price)
