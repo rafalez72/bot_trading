@@ -373,13 +373,77 @@ class MarketMaker:
     # ---- Default candidates query (placeholder, se mockea en tests) ----
 
     def _default_list_candidates(self) -> list[dict]:
-        """Lee de tabla `markets` los buckets que cumplen filtros.
+        """Lee de tabla `markets` candidatos eligibles para MM.
 
-        TODO(market_maker): hoy la tabla `markets` no guarda `vol_24h` ni
-        token_id_yes. Hay que enriquecer con el data-api o cachear desde
-        Gamma. Por ahora devuelve [] como fail-safe.
+        Filtros:
+        - active=1, closed=0
+        - end_date > now + max_time_to_close_s (horizon mínimo)
+        - liquidity >= min market liq (override DB → env)
+        - volume >= min vol (override DB → env)
+        - category excluye esports live + crypto-updown (incompatibles MM)
+
+        Devuelve hasta max_concurrent_pairs * 3 candidates (buffer para cap).
         """
-        return []
+        from datetime import datetime, timezone
+        from src.db.schema import db
+        from src.copybot.threshold_overrides import (
+            get_min_market_liquidity_usdc,
+            get_min_market_volume_usdc,
+        )
+
+        min_liq = get_min_market_liquidity_usdc()
+        min_vol = get_min_market_volume_usdc()
+        limit = max(self.config.max_concurrent_pairs * 3, 30)
+        excluded_cat_patterns = ("crypto-updown", "esports-live", "live-")
+
+        try:
+            with db() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT condition_id, slug, question, category, end_date,
+                           liquidity, volume, outcome_prices
+                    FROM markets
+                    WHERE active=1 AND closed=0
+                      AND liquidity >= ?
+                      AND volume >= ?
+                      AND end_date IS NOT NULL
+                    ORDER BY liquidity DESC
+                    LIMIT ?
+                    """,
+                    (min_liq, min_vol, limit),
+                ).fetchall()
+        except Exception as e:
+            log.debug("market_maker._default_list_candidates query failed: %s", e)
+            return []
+
+        now_utc = datetime.now(timezone.utc)
+        out = []
+        for r in rows:
+            d = dict(r)
+            cat = (d.get("category") or "").lower()
+            if any(p in cat for p in excluded_cat_patterns):
+                continue
+            slug_lc = (d.get("slug") or "").lower()
+            if any(p in slug_lc for p in ("updown", "-live-")):
+                continue
+            end_date_str = d.get("end_date")
+            if not end_date_str:
+                continue
+            try:
+                # end_date típico: '2026-05-15T12:00:00Z'
+                s = str(end_date_str).replace("Z", "+00:00")
+                end_dt = datetime.fromisoformat(s)
+                if not end_dt.tzinfo:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            secs_left = (end_dt - now_utc).total_seconds()
+            if secs_left < self.config.max_time_to_close_s:
+                continue
+            d["end_ts"] = int(end_dt.timestamp())
+            d["secs_to_close"] = secs_left
+            out.append(d)
+        return out[:limit]
 
     async def _resolve_market_tokens(self, market: dict) -> Optional[dict]:
         """Resuelve {yes_token_id, no_token_id} desde el slug del market.
