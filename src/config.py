@@ -311,8 +311,11 @@ DX_USE_ORDERBOOK_FILL = os.getenv("DX_USE_ORDERBOOK_FILL", "true").lower() == "t
 # false hasta validación explícita.
 _MM_DEFAULT = "false" if LIVE_MODE else "true"
 MM_ENABLED = os.getenv("MM_ENABLED", _MM_DEFAULT).lower() == "true"
-# spread_bps: 300 = 3% spread total. Si mid=0.50 → bid=0.485, ask=0.515.
-MM_SPREAD_BPS = int(os.getenv("MM_SPREAD_BPS", "300"))
+# spread_bps: 150 = 1.5% spread total. Si mid=0.50 → bid=0.4925, ask=0.5075.
+# 2026-05-11: bajado 300→150. Spread 3% rara vez fillea — la mayoría de
+# arbitrajes/scalpers compiten en 0.5-1.5% range. 1.5% balance entre
+# fill probability y adverse selection.
+MM_SPREAD_BPS = int(os.getenv("MM_SPREAD_BPS", "150"))
 # USDC por side (bid + ask se postean por separado).
 MM_BET_PER_SIDE_USDC = float(os.getenv("MM_BET_PER_SIDE_USDC", "2.0"))
 # Cap de pares (bid+ask) concurrentes para limitar exposición total.
@@ -347,7 +350,10 @@ SPIKE_ARB_LIMIT_TTL_S = int(os.getenv("SPIKE_ARB_LIMIT_TTL_S", "60"))
 _ADV_DEFAULT = "false" if LIVE_MODE else "true"
 ADVERSARIAL_ENABLED = os.getenv("ADVERSARIAL_ENABLED", _ADV_DEFAULT).lower() == "true"
 ADVERSARIAL_MAX_SECS_TO_CLOSE = float(os.getenv("ADVERSARIAL_MAX_SECS_TO_CLOSE", "60"))
-ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.85"))
+# 2026-05-11: bajado 0.85→0.75. Adversarial 0 ops 30h con 0.85 — threshold
+# muy conservador. Con 0.75 captura más buckets pre-close (lado loser
+# probable >0.75 prob = lado ganador). Más false positives pero más signal.
+ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.75"))
 ADVERSARIAL_ASK_PRICE = float(os.getenv("ADVERSARIAL_ASK_PRICE", "0.05"))
 ADVERSARIAL_SIZE_USDC = float(os.getenv("ADVERSARIAL_SIZE_USDC", "2.0"))
 
