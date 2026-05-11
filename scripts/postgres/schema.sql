@@ -371,3 +371,28 @@ CREATE TABLE IF NOT EXISTS clv_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_clv_recorded ON clv_metrics(recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clv_source ON clv_metrics(source, recorded_at DESC);
+
+-- Binance Spot orders (grid_bot + signal_bot, 2026-05-11)
+CREATE TABLE IF NOT EXISTS binance_orders (
+    id              BIGSERIAL PRIMARY KEY,
+    strategy        TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    order_type      TEXT NOT NULL,
+    client_order_id TEXT,
+    exchange_order_id TEXT,
+    price           DOUBLE PRECISION,
+    qty             DOUBLE PRECISION,
+    quote_qty       DOUBLE PRECISION,
+    fill_price      DOUBLE PRECISION,
+    fill_qty        DOUBLE PRECISION,
+    status          TEXT NOT NULL,
+    pnl_usdc        DOUBLE PRECISION,
+    posted_at       BIGINT NOT NULL,
+    filled_at       BIGINT,
+    canceled_at     BIGINT,
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_binance_orders_strategy ON binance_orders(strategy, posted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_binance_orders_status ON binance_orders(status, symbol);
+CREATE INDEX IF NOT EXISTS idx_binance_orders_exch ON binance_orders(exchange_order_id);

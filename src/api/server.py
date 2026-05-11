@@ -154,6 +154,54 @@ def api_wallets_reactivate_recent(
     return {"reactivated": len(wallets), "wallets": wallets}
 
 
+@app.get("/api/admin/binance/status")
+def api_binance_status() -> dict:
+    """Snapshot grid bot: balance, open orders, fills 24h, PnL 24h.
+
+    Si no hay BINANCE_API_KEY → retorna config sin llamar API (placeholder).
+    """
+    import asyncio
+    import time as _t
+    out: dict = {
+        "configured": bool(os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET")),
+        "grid_enabled": os.getenv("GRID_BOT_ENABLED", "false").lower() == "true",
+        "symbol": os.getenv("GRID_BOT_SYMBOL", "BTCUSDT"),
+    }
+    since = int(_t.time()) - 86400
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS n_orders,
+                SUM(CASE WHEN status='FILLED' THEN 1 ELSE 0 END) AS n_fills,
+                COALESCE(SUM(CASE WHEN status='FILLED' AND filled_at >= ?
+                                    THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+                COALESCE(SUM(CASE WHEN status='FILLED'
+                                    THEN pnl_usdc ELSE 0 END), 0) AS pnl_total
+            FROM binance_orders
+            WHERE strategy='grid_bot'
+            """,
+            (since,),
+        ).fetchone()
+        open_rows = conn.execute(
+            """
+            SELECT side, COUNT(*) AS n
+            FROM binance_orders
+            WHERE strategy='grid_bot' AND status='NEW'
+            GROUP BY side
+            """,
+        ).fetchall()
+    if row:
+        out.update({
+            "n_orders_total": int(row["n_orders"] or 0),
+            "n_filled_total": int(row["n_fills"] or 0),
+            "pnl_24h_usdc": float(row["pnl_24h"] or 0),
+            "pnl_total_usdc": float(row["pnl_total"] or 0),
+        })
+    out["open_orders"] = {r["side"]: int(r["n"]) for r in (open_rows or [])}
+    return out
+
+
 @app.get("/api/admin/version")
 def api_version() -> dict:
     """Retorna commit SHA y timestamp del build Docker actual.

@@ -591,6 +591,18 @@ async def run_loop(*, once: bool = False) -> None:
         except Exception as e:
             log.warning("no se pudo arrancar crypto_arb_hedge: %s", e)
 
+    # Grid Bot Binance Spot (2026-05-11). Gateado por GRID_BOT_ENABLED + BINANCE_API_KEY.
+    # Captura volatilidad sideways BTC/ETH. Independiente de strategies Polymarket.
+    grid_task: asyncio.Task | None = None
+    if not once:
+        try:
+            from src.binance.grid_bot import maybe_start_grid_bot_in_background
+            grid_task = await maybe_start_grid_bot_in_background()
+            if grid_task is not None:
+                log.info("grid_bot: arrancado en paralelo")
+        except Exception as e:
+            log.warning("no se pudo arrancar grid_bot: %s", e)
+
     cycle = 0
     last_sweep = 0.0
     sweep_period_cycles = max(1, STOPLOSS_SWEEP_SECONDS // max(COPY_POLL_SECONDS, 1))

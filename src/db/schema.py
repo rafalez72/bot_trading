@@ -753,6 +753,32 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_clv_recorded ON clv_metrics(recorded_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_clv_source ON clv_metrics(source, recorded_at DESC)",
+    # Binance Spot — grid bot + signal bot (2026-05-11).
+    # Cada orden posteada (open/filled/canceled). pnl_usdc se calcula al
+    # close (match BUY → SELL del mismo símbolo del grid).
+    """CREATE TABLE IF NOT EXISTS binance_orders (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy        TEXT NOT NULL,           -- 'grid_bot' | 'signal_bot'
+        symbol          TEXT NOT NULL,
+        side            TEXT NOT NULL,           -- BUY | SELL
+        order_type      TEXT NOT NULL,           -- LIMIT | MARKET
+        client_order_id TEXT,
+        exchange_order_id TEXT,
+        price           REAL,                    -- limit price (NULL si market)
+        qty             REAL,                    -- base asset quantity
+        quote_qty       REAL,                    -- USDT notional
+        fill_price      REAL,                    -- avg fill
+        fill_qty        REAL,
+        status          TEXT NOT NULL,           -- NEW | FILLED | CANCELED | REJECTED
+        pnl_usdc        REAL,                    -- realizado al close (NULL si open)
+        posted_at       INTEGER NOT NULL,
+        filled_at       INTEGER,
+        canceled_at     INTEGER,
+        notes           TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_binance_orders_strategy ON binance_orders(strategy, posted_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_binance_orders_status ON binance_orders(status, symbol)",
+    "CREATE INDEX IF NOT EXISTS idx_binance_orders_exch ON binance_orders(exchange_order_id)",
 ]
 
 
