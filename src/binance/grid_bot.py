@@ -46,15 +46,15 @@ class GridConfig:
     symbol: str = "BTCUSDT"
     low_price: float = 0.0
     high_price: float = 0.0
-    n_levels: int = 10
-    quote_per_level_usdt: float = 40.0
-    poll_interval_s: float = 15.0
-    max_concurrent_buys: int = 10  # cap inicial
-    daily_loss_cap_usdt: float = 40.0  # pause si pnl_24h < -40
-    auto_range: bool = True  # si True, calcula range dinámico al startup
-    auto_range_pct: float = 0.08  # ±8% del mid actual
-    paper_mode: bool = False  # True = simulator, no API real
-    initial_usdt_paper: float = 400.0  # solo si paper_mode
+    n_levels: int = 20  # más niveles (era 10) → más fills
+    quote_per_level_usdt: float = 20.0  # bet más chico (era 40) para más concurrencia
+    poll_interval_s: float = 8.0  # más rápido (era 15)
+    max_concurrent_buys: int = 20
+    daily_loss_cap_usdt: float = 40.0
+    auto_range: bool = True
+    auto_range_pct: float = 0.04  # ±4% del mid (era 8%) — grid más denso
+    paper_mode: bool = False
+    initial_usdt_paper: float = 400.0
 
     @classmethod
     def from_env(cls) -> "GridConfig":
@@ -71,13 +71,13 @@ class GridConfig:
             symbol=os.getenv("GRID_BOT_SYMBOL", "BTCUSDT"),
             low_price=float(os.getenv("GRID_BOT_LOW_PRICE", "0") or 0),
             high_price=float(os.getenv("GRID_BOT_HIGH_PRICE", "0") or 0),
-            n_levels=int(os.getenv("GRID_BOT_LEVELS", "10")),
-            quote_per_level_usdt=float(os.getenv("GRID_BOT_QUOTE_PER_LEVEL", "40")),
-            poll_interval_s=float(os.getenv("GRID_BOT_POLL_S", "15")),
-            max_concurrent_buys=int(os.getenv("GRID_BOT_MAX_BUYS", "10")),
+            n_levels=int(os.getenv("GRID_BOT_LEVELS", "20")),
+            quote_per_level_usdt=float(os.getenv("GRID_BOT_QUOTE_PER_LEVEL", "20")),
+            poll_interval_s=float(os.getenv("GRID_BOT_POLL_S", "8")),
+            max_concurrent_buys=int(os.getenv("GRID_BOT_MAX_BUYS", "20")),
             daily_loss_cap_usdt=float(os.getenv("GRID_BOT_DAILY_LOSS_CAP", "40")),
             auto_range=os.getenv("GRID_BOT_AUTO_RANGE", "true").lower() == "true",
-            auto_range_pct=float(os.getenv("GRID_BOT_AUTO_RANGE_PCT", "0.08")),
+            auto_range_pct=float(os.getenv("GRID_BOT_AUTO_RANGE_PCT", "0.04")),
             paper_mode=os.getenv("GRID_BOT_PAPER", _paper_default).lower() == "true",
             initial_usdt_paper=float(os.getenv("GRID_BOT_PAPER_USDT", "400")),
         )

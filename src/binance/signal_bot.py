@@ -36,34 +36,34 @@ log = logging.getLogger(__name__)
 class SignalConfig:
     enabled: bool = False
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
-    poll_s: float = 10.0
+    poll_s: float = 5.0  # más rápido (era 10s)
     rsi_period: int = 14
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 70.0
+    rsi_oversold: float = 35.0   # más permisivo (era 30) → más signals
+    rsi_overbought: float = 65.0  # más permisivo (era 70)
     ema_short: int = 9
     ema_long: int = 21
-    pump_threshold_pct: float = 2.0  # alert si move >2% en 1h
-    cooldown_s: int = 1800  # 30min entre signals del mismo tipo
-    auto_execute: bool = False
-    execute_quote_usdt: float = 20.0  # market BUY $20 si signal fuerte
+    pump_threshold_pct: float = 0.5  # micro-pumps 0.5% (era 2.0)
+    cooldown_s: int = 300  # 5min cooldown (era 30min)
+    auto_execute: bool = True  # AUTO-TRADE habilitado (paper safe)
+    execute_quote_usdt: float = 15.0  # market BUY $15 por signal
 
     @classmethod
     def from_env(cls) -> "SignalConfig":
-        # Default ON: solo alertas Telegram, no trades reales — siempre safe.
+        # Defaults agresivos: bot ya tiene predictor (RSI/EMA), usémoslo para tradear.
         symbols_csv = os.getenv("SIGNAL_BOT_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
         return cls(
             enabled=os.getenv("SIGNAL_BOT_ENABLED", "true").lower() == "true",
             symbols=tuple(s.strip().upper() for s in symbols_csv.split(",") if s.strip()),
-            poll_s=float(os.getenv("SIGNAL_BOT_POLL_S", "10")),
+            poll_s=float(os.getenv("SIGNAL_BOT_POLL_S", "5")),
             rsi_period=int(os.getenv("SIGNAL_BOT_RSI_PERIOD", "14")),
-            rsi_oversold=float(os.getenv("SIGNAL_BOT_RSI_OVERSOLD", "30")),
-            rsi_overbought=float(os.getenv("SIGNAL_BOT_RSI_OVERBOUGHT", "70")),
+            rsi_oversold=float(os.getenv("SIGNAL_BOT_RSI_OVERSOLD", "35")),
+            rsi_overbought=float(os.getenv("SIGNAL_BOT_RSI_OVERBOUGHT", "65")),
             ema_short=int(os.getenv("SIGNAL_BOT_EMA_SHORT", "9")),
             ema_long=int(os.getenv("SIGNAL_BOT_EMA_LONG", "21")),
-            pump_threshold_pct=float(os.getenv("SIGNAL_BOT_PUMP_PCT", "2.0")),
-            cooldown_s=int(os.getenv("SIGNAL_BOT_COOLDOWN_S", "1800")),
-            auto_execute=os.getenv("SIGNAL_BOT_AUTO_EXECUTE", "false").lower() == "true",
-            execute_quote_usdt=float(os.getenv("SIGNAL_BOT_EXECUTE_USDT", "20")),
+            pump_threshold_pct=float(os.getenv("SIGNAL_BOT_PUMP_PCT", "0.5")),
+            cooldown_s=int(os.getenv("SIGNAL_BOT_COOLDOWN_S", "300")),
+            auto_execute=os.getenv("SIGNAL_BOT_AUTO_EXECUTE", "true").lower() == "true",
+            execute_quote_usdt=float(os.getenv("SIGNAL_BOT_EXECUTE_USDT", "15")),
         )
 
 
@@ -135,6 +135,16 @@ class SignalBot:
         from src.binance.websocket import BinanceTickerWS
         self._ws = BinanceTickerWS(self.config.symbols)
         ws_task = asyncio.create_task(self._ws.run())
+        # Si auto_execute activo y no nos pasaron paper_client, creamos uno.
+        # Comparte WS para que los precios estén sync.
+        if self.config.auto_execute and self.paper_client is None:
+            from src.binance.spot_paper_client import BinanceSpotPaperClient
+            self.paper_client = BinanceSpotPaperClient(
+                initial_usdt=100.0, ws=self._ws,
+            )
+            await self.paper_client.__aenter__()
+            await self.paper_client.start()
+            log.warning("signal_bot: auto_execute ON — paper client $100 USDT virtual")
         log.warning(
             "signal_bot arrancado — symbols=%s RSI(%d) EMA(%d/%d) pump=%.1f%%",
             ",".join(self.config.symbols), self.config.rsi_period,
