@@ -53,6 +53,8 @@ class GridConfig:
     daily_loss_cap_usdt: float = 40.0  # pause si pnl_24h < -40
     auto_range: bool = True  # si True, calcula range dinámico al startup
     auto_range_pct: float = 0.08  # ±8% del mid actual
+    paper_mode: bool = False  # True = simulator, no API real
+    initial_usdt_paper: float = 400.0  # solo si paper_mode
 
     @classmethod
     def from_env(cls) -> "GridConfig":
@@ -68,6 +70,8 @@ class GridConfig:
             daily_loss_cap_usdt=float(os.getenv("GRID_BOT_DAILY_LOSS_CAP", "40")),
             auto_range=os.getenv("GRID_BOT_AUTO_RANGE", "true").lower() == "true",
             auto_range_pct=float(os.getenv("GRID_BOT_AUTO_RANGE_PCT", "0.08")),
+            paper_mode=os.getenv("GRID_BOT_PAPER", "false").lower() == "true",
+            initial_usdt_paper=float(os.getenv("GRID_BOT_PAPER_USDT", "400")),
         )
 
 
@@ -376,12 +380,37 @@ class GridBot:
         if not self.config.enabled:
             log.info("grid_bot: disabled (GRID_BOT_ENABLED!=true)")
             return
-        if not (os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET")):
+        if not self.config.paper_mode and not (
+            os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET")
+        ):
             log.warning("grid_bot: BINANCE_API_KEY/SECRET ausentes — no arrancado")
             return
         if self.client is None:
-            self.client = BinanceSpotClient()
-            await self.client.__aenter__()
+            if self.config.paper_mode:
+                from src.binance.spot_paper_client import BinanceSpotPaperClient
+                from src.binance.websocket import BinanceTickerWS
+                # WS público para precios. Importante: símbolo del grid debe
+                # ser parte de la lista de subscripción del WS.
+                ws = BinanceTickerWS([self.config.symbol.lower()])
+                self._ws = ws  # type: ignore[attr-defined]
+                await ws.start()
+                # Esperar primer tick para que el bot tenga precio del símbolo.
+                for _ in range(60):
+                    if ws.get_price(self.config.symbol) is not None:
+                        break
+                    await asyncio.sleep(0.5)
+                self.client = BinanceSpotPaperClient(  # type: ignore[assignment]
+                    initial_usdt=self.config.initial_usdt_paper, ws=ws,
+                )
+                await self.client.__aenter__()  # type: ignore[attr-defined]
+                await self.client.start()  # type: ignore[attr-defined]
+                log.warning(
+                    "grid_bot %s arrancado en PAPER MODE — $%.2f virtual",
+                    self.config.symbol, self.config.initial_usdt_paper,
+                )
+            else:
+                self.client = BinanceSpotClient()
+                await self.client.__aenter__()
         await self._init_grid()
         await self._post_initial_buys()
         while not self._stop.is_set():
@@ -399,12 +428,59 @@ class GridBot:
 
 
 async def maybe_start_grid_bot_in_background() -> Optional[asyncio.Task]:
-    cfg = GridConfig.from_env()
-    if not cfg.enabled:
+    """Arranca grid(s) — soporta multi-symbol via GRID_BOT_SYMBOLS env CSV.
+
+    Si GRID_BOT_SYMBOLS está definido (ej. "BTCUSDT,ETHUSDT,SOLUSDT"),
+    arranca un grid separado por símbolo con budget proporcional.
+    Sino, usa GRID_BOT_SYMBOL (single symbol legacy).
+    """
+    base_cfg = GridConfig.from_env()
+    if not base_cfg.enabled:
         return None
-    if not (os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET")):
-        log.warning("grid_bot: GRID_BOT_ENABLED=true pero falta BINANCE_API_KEY — no arrancado")
+    if not base_cfg.paper_mode and not (
+        os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET")
+    ):
+        log.warning("grid_bot: GRID_BOT_ENABLED=true pero falta key — no arrancado")
         return None
-    bot = GridBot(config=cfg)
-    await bot.__aenter__()
-    return asyncio.create_task(bot.run_loop())
+
+    symbols_csv = os.getenv("GRID_BOT_SYMBOLS", "")
+    if symbols_csv:
+        symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+    else:
+        symbols = [base_cfg.symbol]
+
+    if len(symbols) == 1:
+        cfg = base_cfg
+        cfg.symbol = symbols[0]
+        bot = GridBot(config=cfg)
+        return asyncio.create_task(bot.run_loop())
+
+    # Multi-symbol: split budget + levels entre symbols.
+    from dataclasses import replace
+    total_usdt = base_cfg.initial_usdt_paper if base_cfg.paper_mode else (
+        base_cfg.quote_per_level_usdt * base_cfg.n_levels
+    )
+    per_sym_usdt = total_usdt / len(symbols)
+    per_sym_levels = max(4, base_cfg.n_levels // len(symbols) + 4)
+    per_sym_bet = per_sym_usdt / per_sym_levels
+
+    tasks: list[asyncio.Task] = []
+    for sym in symbols:
+        sym_cfg = replace(
+            base_cfg,
+            symbol=sym, n_levels=per_sym_levels,
+            quote_per_level_usdt=per_sym_bet,
+            initial_usdt_paper=per_sym_usdt,
+            max_concurrent_buys=per_sym_levels,
+        )
+        bot = GridBot(config=sym_cfg)
+        tasks.append(asyncio.create_task(bot.run_loop()))
+        log.info(
+            "grid_bot multi: %s budget=$%.2f levels=%d bet=$%.2f",
+            sym, per_sym_usdt, per_sym_levels, per_sym_bet,
+        )
+
+    # Wrapper task que espera a todos. Caller solo recibe uno (compat).
+    async def _wait_all() -> None:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return asyncio.create_task(_wait_all())
