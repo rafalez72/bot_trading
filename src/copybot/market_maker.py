@@ -428,14 +428,53 @@ class MarketMaker:
                     secs_left = (end_dt - now).total_seconds()
                     if secs_left < self.config.max_time_to_close_s:
                         continue
+                    # _reconcile_pair requires: cid, token_id_yes, mid.
+                    # Parse clobTokenIds (gamma returns JSON string) + extract
+                    # outcome[0] price as mid approximation.
+                    ct_raw = m.get("clobTokenIds")
+                    if isinstance(ct_raw, str):
+                        try:
+                            import json as _j
+                            ct = _j.loads(ct_raw)
+                        except Exception:
+                            ct = None
+                    elif isinstance(ct_raw, list):
+                        ct = ct_raw
+                    else:
+                        ct = None
+                    if not (isinstance(ct, list) and len(ct) >= 2):
+                        continue  # binary market sin token_ids resolubles
+                    token_id_yes = str(ct[0])
+
+                    op_raw = m.get("outcomePrices")
+                    if isinstance(op_raw, str):
+                        try:
+                            import json as _j
+                            op = _j.loads(op_raw)
+                        except Exception:
+                            op = None
+                    elif isinstance(op_raw, list):
+                        op = op_raw
+                    else:
+                        op = None
+                    if not (isinstance(op, list) and len(op) >= 1):
+                        continue
+                    try:
+                        mid = float(op[0])
+                    except (ValueError, TypeError):
+                        continue
+                    # Filter precio razonable: MM no opera bordes (sin liquidez).
+                    if mid < 0.10 or mid > 0.90:
+                        continue
+
                     out.append({
                         "condition_id": m.get("conditionId"),
                         "slug": m.get("slug"),
                         "question": m.get("question"),
                         "end_ts": int(end_dt.timestamp()),
                         "secs_to_close": secs_left,
-                        "outcome_prices": m.get("outcomePrices"),
-                        "clob_token_ids": m.get("clobTokenIds"),
+                        "token_id_yes": token_id_yes,
+                        "mid": mid,
                     })
                     if len(out) >= limit:
                         break
