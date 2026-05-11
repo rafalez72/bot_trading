@@ -58,8 +58,16 @@ class GridConfig:
 
     @classmethod
     def from_env(cls) -> "GridConfig":
+        # Paper-safe defaults: si LIVE_MODE=false → arranca en paper con
+        # 3 symbols + $400 virtual. En live mode sigue gateado por .env explícito.
+        try:
+            from src.config import LIVE_MODE as _LIVE
+        except Exception:
+            _LIVE = False
+        _enable_default = "false" if _LIVE else "true"
+        _paper_default = "false" if _LIVE else "true"
         return cls(
-            enabled=os.getenv("GRID_BOT_ENABLED", "false").lower() == "true",
+            enabled=os.getenv("GRID_BOT_ENABLED", _enable_default).lower() == "true",
             symbol=os.getenv("GRID_BOT_SYMBOL", "BTCUSDT"),
             low_price=float(os.getenv("GRID_BOT_LOW_PRICE", "0") or 0),
             high_price=float(os.getenv("GRID_BOT_HIGH_PRICE", "0") or 0),
@@ -70,7 +78,7 @@ class GridConfig:
             daily_loss_cap_usdt=float(os.getenv("GRID_BOT_DAILY_LOSS_CAP", "40")),
             auto_range=os.getenv("GRID_BOT_AUTO_RANGE", "true").lower() == "true",
             auto_range_pct=float(os.getenv("GRID_BOT_AUTO_RANGE_PCT", "0.08")),
-            paper_mode=os.getenv("GRID_BOT_PAPER", "false").lower() == "true",
+            paper_mode=os.getenv("GRID_BOT_PAPER", _paper_default).lower() == "true",
             initial_usdt_paper=float(os.getenv("GRID_BOT_PAPER_USDT", "400")),
         )
 
@@ -443,7 +451,9 @@ async def maybe_start_grid_bot_in_background() -> Optional[asyncio.Task]:
         log.warning("grid_bot: GRID_BOT_ENABLED=true pero falta key — no arrancado")
         return None
 
-    symbols_csv = os.getenv("GRID_BOT_SYMBOLS", "")
+    # Default multi-symbol cuando paper (sin .env override).
+    default_symbols = "BTCUSDT,ETHUSDT,SOLUSDT" if base_cfg.paper_mode else base_cfg.symbol
+    symbols_csv = os.getenv("GRID_BOT_SYMBOLS", default_symbols)
     if symbols_csv:
         symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
     else:

@@ -49,9 +49,10 @@ class SignalConfig:
 
     @classmethod
     def from_env(cls) -> "SignalConfig":
+        # Default ON: solo alertas Telegram, no trades reales — siempre safe.
         symbols_csv = os.getenv("SIGNAL_BOT_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
         return cls(
-            enabled=os.getenv("SIGNAL_BOT_ENABLED", "false").lower() == "true",
+            enabled=os.getenv("SIGNAL_BOT_ENABLED", "true").lower() == "true",
             symbols=tuple(s.strip().upper() for s in symbols_csv.split(",") if s.strip()),
             poll_s=float(os.getenv("SIGNAL_BOT_POLL_S", "10")),
             rsi_period=int(os.getenv("SIGNAL_BOT_RSI_PERIOD", "14")),
