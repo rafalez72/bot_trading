@@ -393,34 +393,65 @@ class GridBot:
         ):
             log.warning("grid_bot: BINANCE_API_KEY/SECRET ausentes — no arrancado")
             return
-        if self.client is None:
-            if self.config.paper_mode:
-                from src.binance.spot_paper_client import BinanceSpotPaperClient
-                from src.binance.websocket import BinanceTickerWS
-                # WS público para precios. Importante: símbolo del grid debe
-                # ser parte de la lista de subscripción del WS.
-                ws = BinanceTickerWS([self.config.symbol.lower()])
-                self._ws = ws  # type: ignore[attr-defined]
-                await ws.start()
-                # Esperar primer tick para que el bot tenga precio del símbolo.
-                for _ in range(60):
-                    if ws.get_price(self.config.symbol) is not None:
-                        break
-                    await asyncio.sleep(0.5)
-                self.client = BinanceSpotPaperClient(  # type: ignore[assignment]
-                    initial_usdt=self.config.initial_usdt_paper, ws=ws,
-                )
-                await self.client.__aenter__()  # type: ignore[attr-defined]
-                await self.client.start()  # type: ignore[attr-defined]
+        # Setup client (paper o real)
+        try:
+            if self.client is None:
+                if self.config.paper_mode:
+                    from src.binance.spot_paper_client import BinanceSpotPaperClient
+                    from src.binance.websocket import BinanceTickerWS
+                    ws = BinanceTickerWS([self.config.symbol])
+                    self._ws = ws  # type: ignore[attr-defined]
+                    ws_task = asyncio.create_task(ws.run())
+                    self._ws_task = ws_task  # type: ignore[attr-defined]
+                    # Esperar primer tick — max 90s (más tolerante).
+                    for i in range(180):
+                        if ws.get_price(self.config.symbol) is not None:
+                            log.info(
+                                "grid_bot %s WS first tick recibido tras %.1fs",
+                                self.config.symbol, i * 0.5,
+                            )
+                            break
+                        await asyncio.sleep(0.5)
+                    else:
+                        log.error(
+                            "grid_bot %s: WS no entregó tick en 90s — reintento en 60s",
+                            self.config.symbol,
+                        )
+                        await asyncio.sleep(60)
+                        return
+                    self.client = BinanceSpotPaperClient(  # type: ignore[assignment]
+                        initial_usdt=self.config.initial_usdt_paper, ws=ws,
+                    )
+                    await self.client.__aenter__()  # type: ignore[attr-defined]
+                    await self.client.start()  # type: ignore[attr-defined]
+                    log.warning(
+                        "grid_bot %s arrancado en PAPER MODE — $%.2f virtual",
+                        self.config.symbol, self.config.initial_usdt_paper,
+                    )
+                else:
+                    self.client = BinanceSpotClient()
+                    await self.client.__aenter__()
+        except Exception as e:
+            log.exception("grid_bot %s setup_client failed: %s", self.config.symbol, e)
+            return
+
+        # Init grid + post buys con retry (no morir el task si falla la 1ra vez)
+        for attempt in range(5):
+            try:
+                await self._init_grid()
+                await self._post_initial_buys()
+                log.info("grid_bot %s init OK (attempt %d)", self.config.symbol, attempt + 1)
+                break
+            except Exception as e:
                 log.warning(
-                    "grid_bot %s arrancado en PAPER MODE — $%.2f virtual",
-                    self.config.symbol, self.config.initial_usdt_paper,
+                    "grid_bot %s init_attempt %d failed: %s",
+                    self.config.symbol, attempt + 1, e,
                 )
-            else:
-                self.client = BinanceSpotClient()
-                await self.client.__aenter__()
-        await self._init_grid()
-        await self._post_initial_buys()
+                await asyncio.sleep(15 * (attempt + 1))
+        else:
+            log.error("grid_bot %s init failed 5 attempts — exit", self.config.symbol)
+            return
+
         while not self._stop.is_set():
             try:
                 if await self._check_kill_switch():
