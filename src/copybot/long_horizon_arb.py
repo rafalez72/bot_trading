@@ -36,6 +36,8 @@ import logging
 import os
 import re
 import time
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -1055,6 +1057,13 @@ async def long_horizon_loop() -> None:
                 out.append(m)
                 if len(out) >= 200:
                     break
+        except (httpx.HTTPError, ConnectionError) as e:
+            # Transient net error (gamma close conn). Bot continúa siguiente
+            # ciclo. No spam Telegram con stacktrace.
+            log.warning(
+                "long_horizon_arb.list_markets transient_net %s — sigo",
+                type(e).__name__,
+            )
         except Exception:
             log.exception("long_horizon_arb.list_markets failed")
         return out
