@@ -154,6 +154,89 @@ def api_wallets_reactivate_recent(
     return {"reactivated": len(wallets), "wallets": wallets}
 
 
+@app.get("/api/admin/pnl-summary")
+def api_pnl_summary() -> dict:
+    """Resumen PnL acumulado agregado: Polymarket (todas tablas) + Binance Grid.
+
+    Devuelve:
+      - polymarket: pnl_24h, pnl_total, n_trades_total
+      - grid_bot: pnl_24h, pnl_total, n_fills, por símbolo
+      - grand_total: suma de todo
+    """
+    import time as _t
+    since_24h = int(_t.time()) - 86400
+    out: dict = {}
+    # Polymarket — usa el helper existente cross-table
+    try:
+        from src.copybot.validation import _total_pnl_since
+        with db() as conn:
+            pm_24h = _total_pnl_since(conn, since_24h)
+            pm_total = _total_pnl_since(conn, 0)
+            n_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trades WHERE status LIKE 'closed%'"
+            ).fetchone()
+            pm_trades = int(n_rows["n"] or 0) if n_rows else 0
+        out["polymarket"] = {
+            "pnl_24h_usdc": float(pm_24h),
+            "pnl_total_usdc": float(pm_total),
+            "n_trades_closed": pm_trades,
+        }
+    except Exception as e:
+        out["polymarket"] = {"error": str(e)}
+    # Binance grid_bot — agregado + per symbol
+    try:
+        with db() as conn:
+            row_total = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(pnl_usdc), 0) AS pnl_total,
+                    COALESCE(SUM(CASE WHEN filled_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+                    COUNT(*) AS n_fills
+                FROM binance_orders
+                WHERE strategy='grid_bot' AND status='FILLED' AND pnl_usdc IS NOT NULL
+                """,
+                (since_24h,),
+            ).fetchone()
+            row_per_symbol = conn.execute(
+                """
+                SELECT symbol,
+                    COALESCE(SUM(pnl_usdc), 0) AS pnl_total,
+                    COALESCE(SUM(CASE WHEN filled_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
+                    COUNT(*) AS n_fills
+                FROM binance_orders
+                WHERE strategy='grid_bot' AND status='FILLED' AND pnl_usdc IS NOT NULL
+                GROUP BY symbol
+                """,
+                (since_24h,),
+            ).fetchall()
+        out["grid_bot"] = {
+            "pnl_24h_usdc": float(row_total["pnl_24h"] or 0) if row_total else 0,
+            "pnl_total_usdc": float(row_total["pnl_total"] or 0) if row_total else 0,
+            "n_fills": int(row_total["n_fills"] or 0) if row_total else 0,
+            "by_symbol": [
+                {
+                    "symbol": r["symbol"],
+                    "pnl_24h_usdc": float(r["pnl_24h"] or 0),
+                    "pnl_total_usdc": float(r["pnl_total"] or 0),
+                    "n_fills": int(r["n_fills"] or 0),
+                }
+                for r in (row_per_symbol or [])
+            ],
+        }
+    except Exception as e:
+        out["grid_bot"] = {"error": str(e)}
+    # Grand total
+    pm_total = out.get("polymarket", {}).get("pnl_total_usdc", 0) if isinstance(out.get("polymarket"), dict) else 0
+    pm_24h = out.get("polymarket", {}).get("pnl_24h_usdc", 0) if isinstance(out.get("polymarket"), dict) else 0
+    gr_total = out.get("grid_bot", {}).get("pnl_total_usdc", 0) if isinstance(out.get("grid_bot"), dict) else 0
+    gr_24h = out.get("grid_bot", {}).get("pnl_24h_usdc", 0) if isinstance(out.get("grid_bot"), dict) else 0
+    out["grand_total"] = {
+        "pnl_24h_usdc": float(pm_24h) + float(gr_24h),
+        "pnl_total_usdc": float(pm_total) + float(gr_total),
+    }
+    return out
+
+
 @app.get("/api/admin/binance/status")
 def api_binance_status() -> dict:
     """Snapshot grid bot: balance, open orders, fills 24h, PnL 24h.
