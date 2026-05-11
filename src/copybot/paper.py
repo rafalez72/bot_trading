@@ -233,7 +233,7 @@ def open_position(
         timestamp=timestamp,
         raw=raw,
         trades_table="paper_trades",
-        capital_usdc=BOT_CAPITAL_USDC,
+        capital_usdc=__import__("src.copybot.threshold_overrides", fromlist=["get_bot_capital_usdc"]).get_bot_capital_usdc(),
         base_usdc=COPY_BASE_USDC,
         min_expected_pnl_usdc=PAPER_MIN_EXPECTED_PNL_USDC,
         log_reject=None,  # paper no persiste rejects; los rejects se ven en logs

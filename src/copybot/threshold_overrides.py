@@ -24,6 +24,7 @@ _ALLOWED = {
     "MARKET_HORIZON_MIN_SECS": float,
     "MIN_MARKET_LIQUIDITY_USDC": float,
     "MIN_MARKET_VOLUME_USDC": float,
+    "BOT_CAPITAL_USDC": float,
 }
 
 _KEY_PREFIX = "threshold_override:"
@@ -64,6 +65,11 @@ def get_min_market_volume_usdc() -> float:
     return float(_typed("MIN_MARKET_VOLUME_USDC", _read_db("MIN_MARKET_VOLUME_USDC"), MIN_MARKET_VOLUME_USDC))
 
 
+def get_bot_capital_usdc() -> float:
+    from src.config import BOT_CAPITAL_USDC
+    return float(_typed("BOT_CAPITAL_USDC", _read_db("BOT_CAPITAL_USDC"), BOT_CAPITAL_USDC))
+
+
 def set_override(name: str, value: float | None) -> dict:
     """Setea override. value=None limpia (vuelve a env/default)."""
     if name not in _ALLOWED:
@@ -89,6 +95,7 @@ def set_override(name: str, value: float | None) -> dict:
 def list_overrides() -> dict:
     """Snapshot de runtime values + sources para diagnóstico."""
     from src.config import (
+        BOT_CAPITAL_USDC,
         MARKET_HORIZON_MIN_SECS,
         MIN_MARKET_LIQUIDITY_USDC,
         MIN_MARKET_VOLUME_USDC,
@@ -98,6 +105,7 @@ def list_overrides() -> dict:
         ("MARKET_HORIZON_MIN_SECS", MARKET_HORIZON_MIN_SECS),
         ("MIN_MARKET_LIQUIDITY_USDC", MIN_MARKET_LIQUIDITY_USDC),
         ("MIN_MARKET_VOLUME_USDC", MIN_MARKET_VOLUME_USDC),
+        ("BOT_CAPITAL_USDC", BOT_CAPITAL_USDC),
     ):
         db_val = _read_db(name)
         runtime = _typed(name, db_val, default)
