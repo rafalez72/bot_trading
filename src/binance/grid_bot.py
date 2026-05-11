@@ -157,6 +157,25 @@ def _daily_pnl_grid(symbol: str) -> float:
         return 0.0
 
 
+def _daily_pnl_grid_all() -> float:
+    """Suma pnl_usdc 24h grid_bot ALL symbols (Binance total)."""
+    since = int(time.time()) - 86400
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl_usdc), 0) AS p
+            FROM binance_orders
+            WHERE strategy='grid_bot' AND status='FILLED'
+              AND filled_at >= ? AND pnl_usdc IS NOT NULL
+            """,
+            (since,),
+        ).fetchone()
+    try:
+        return float(row["p"] or 0)
+    except Exception:
+        return 0.0
+
+
 def _total_pnl_grid(symbol: str | None = None) -> float:
     """Suma pnl_usdc total grid_bot. Si symbol=None → todos."""
     with db() as conn:
@@ -358,11 +377,16 @@ class GridBot:
                     fill_qty=qty, filled_at=now,
                 )
                 del self.state.buy_orders[idx]
+                # Acumulados Binance (cross-symbols) para visibilidad
+                bin_24h = _daily_pnl_grid_all()
+                bin_total = _total_pnl_grid()
                 _notify(
                     f"🟢 *Grid BUY filled*\n"
                     f"Symbol: `{self.config.symbol}`\n"
                     f"Level: {idx} · Price: ${buy_price:.2f}\n"
-                    f"Qty: {qty:.6f} · Notional: ${self.config.quote_per_level_usdt:.2f}"
+                    f"Qty: {qty:.6f} · Notional: ${self.config.quote_per_level_usdt:.2f}\n"
+                    f"PnL trade: $0 (pendiente sell)\n"
+                    f"Acumulado Binance 24h: ${bin_24h:+.2f} · Total: ${bin_total:+.2f}"
                 )
                 # Postear SELL al nivel siguiente arriba
                 if idx + 1 < len(self.state.levels):
@@ -387,16 +411,17 @@ class GridBot:
                 )
                 del self.state.sell_orders[idx]
                 emoji = "💰" if pnl_net > 0 else "🔻"
-                # Acumular PnL del grid para el notif
-                acum_24h = _daily_pnl_grid(self.config.symbol)
-                acum_total = _total_pnl_grid(self.config.symbol)
+                # Acumulado Binance global (cross-symbols) — incluye este fill
+                bin_24h = _daily_pnl_grid_all()
+                bin_total = _total_pnl_grid()
+                sym_24h = _daily_pnl_grid(self.config.symbol)
                 _notify(
                     f"{emoji} *Grid round trip cerrado*\n"
                     f"Symbol: `{self.config.symbol}` lvl {idx-1}→{idx}\n"
                     f"Buy ${buy_price:.2f} → Sell ${sell_price:.2f}\n"
-                    f"PnL: ${pnl_net:+.4f} (gross ${pnl:+.4f} - fee ${fee:.4f})\n"
-                    f"Acumulado 24h: ${acum_24h + pnl_net:+.2f} · "
-                    f"Total: ${acum_total + pnl_net:+.2f}"
+                    f"PnL trade: ${pnl_net:+.4f} (gross ${pnl:+.4f} - fee ${fee:.4f})\n"
+                    f"{self.config.symbol} 24h: ${sym_24h:+.2f}\n"
+                    f"Acumulado Binance 24h: ${bin_24h:+.2f} · Total: ${bin_total:+.2f}"
                 )
                 # Re-postear BUY al nivel original
                 await self._place_buy_at(idx - 1, buy_price)
