@@ -199,7 +199,23 @@ def _total_pnl_since(conn, since_ts: int) -> float:
     UNION ALL con normalización: cada tabla expone su pnl_col propio
     (pnl_usdc o pnl_perp_usdc en hedge) como una columna unificada `pnl`,
     filtrando por exit_col >= since_ts.
+
+    Respeta bot_state.pnl_reset_at como floor — PnL pre-reset no cuenta.
     """
+    # Floor por reset manual: si pnl_reset_at > since_ts, usar reset_at.
+    try:
+        r = conn.execute(
+            "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+        ).fetchone()
+        if r:
+            try:
+                reset_at = int(r["value"])
+                if reset_at > since_ts:
+                    since_ts = reset_at
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
     specs = _available_specs(conn)
     if not specs:
         return 0.0

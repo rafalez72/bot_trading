@@ -154,6 +154,49 @@ def api_wallets_reactivate_recent(
     return {"reactivated": len(wallets), "wallets": wallets}
 
 
+@app.post("/api/admin/pnl/reset")
+def api_pnl_reset() -> dict:
+    """Reset acumulado PnL — setea bot_state.pnl_reset_at=now.
+
+    Todas las queries de PnL (Polymarket cross-table + Grid Bot) usan
+    este timestamp como floor. PnL pre-reset NO se cuenta.
+    No borra rows históricos (preserva audit trail).
+    También rebaselinea peak_balance del kill switch a EFFECTIVE_CAPITAL
+    para que drawdown viejo no dispare.
+    """
+    import time as _t
+    from src.db.schema import tx as _tx
+    now_ts = int(_t.time())
+    with _tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES ('pnl_reset_at', ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = datetime('now')
+            """,
+            (str(now_ts),),
+        )
+    # Reset peak balance también (kill switch drawdown layer)
+    try:
+        from src.copybot.risk import reset_kill_switch
+        reset_kill_switch(rebaseline_peak=True)
+    except Exception:
+        pass
+    # Notif Telegram
+    try:
+        from src.copybot.notifier import send
+        send(
+            f"🔄 *PnL Reset*\n"
+            f"Acumulado reiniciado a $0.\n"
+            f"Reset timestamp: {now_ts}\n"
+            f"Kill switch peak rebaselined."
+        )
+    except Exception:
+        pass
+    return {"ok": True, "reset_at": now_ts}
+
+
 @app.get("/api/admin/pnl-summary")
 def api_pnl_summary() -> dict:
     """Resumen PnL acumulado agregado: Polymarket (todas tablas) + Binance Grid.
@@ -165,13 +208,22 @@ def api_pnl_summary() -> dict:
     """
     import time as _t
     since_24h = int(_t.time()) - 86400
-    out: dict = {}
+    # Floor por pnl_reset_at — afecta total (24h ya se floorea internamente).
+    with db() as conn_floor:
+        r_reset = conn_floor.execute(
+            "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+        ).fetchone()
+    try:
+        floor_total = int(r_reset["value"]) if r_reset else 0
+    except (TypeError, ValueError):
+        floor_total = 0
+    out: dict = {"reset_at": floor_total}
     # Polymarket — usa el helper existente cross-table
     try:
         from src.copybot.validation import _total_pnl_since
         with db() as conn:
             pm_24h = _total_pnl_since(conn, since_24h)
-            pm_total = _total_pnl_since(conn, 0)
+            pm_total = _total_pnl_since(conn, floor_total)
             n_rows = conn.execute(
                 "SELECT COUNT(*) AS n FROM paper_trades WHERE status LIKE 'closed%'"
             ).fetchone()
@@ -183,7 +235,7 @@ def api_pnl_summary() -> dict:
         }
     except Exception as e:
         out["polymarket"] = {"error": str(e)}
-    # Binance grid_bot — agregado + per symbol
+    # Binance grid_bot — agregado + per symbol (respeta floor reset)
     try:
         with db() as conn:
             row_total = conn.execute(
@@ -194,8 +246,9 @@ def api_pnl_summary() -> dict:
                     COUNT(*) AS n_fills
                 FROM binance_orders
                 WHERE strategy='grid_bot' AND status='FILLED' AND pnl_usdc IS NOT NULL
+                  AND filled_at >= ?
                 """,
-                (since_24h,),
+                (since_24h, floor_total),
             ).fetchone()
             row_per_symbol = conn.execute(
                 """
@@ -205,9 +258,10 @@ def api_pnl_summary() -> dict:
                     COUNT(*) AS n_fills
                 FROM binance_orders
                 WHERE strategy='grid_bot' AND status='FILLED' AND pnl_usdc IS NOT NULL
+                  AND filled_at >= ?
                 GROUP BY symbol
                 """,
-                (since_24h,),
+                (since_24h, floor_total),
             ).fetchall()
         out["grid_bot"] = {
             "pnl_24h_usdc": float(row_total["pnl_24h"] or 0) if row_total else 0,

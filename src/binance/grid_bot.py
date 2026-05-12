@@ -138,9 +138,21 @@ def _update_order_canceled(*, exchange_order_id: str, canceled_at: int) -> None:
         )
 
 
+def _pnl_reset_floor() -> int:
+    """Floor de PnL queries — respeta bot_state.pnl_reset_at."""
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+            ).fetchone()
+        return int(r["value"]) if r else 0
+    except Exception:
+        return 0
+
+
 def _daily_pnl_grid(symbol: str) -> float:
     """Suma pnl_usdc de orders FILLED last 24h para `symbol`."""
-    since = int(time.time()) - 86400
+    since = max(int(time.time()) - 86400, _pnl_reset_floor())
     with db() as conn:
         row = conn.execute(
             """
@@ -159,7 +171,7 @@ def _daily_pnl_grid(symbol: str) -> float:
 
 def _daily_pnl_grid_all() -> float:
     """Suma pnl_usdc 24h grid_bot ALL symbols (Binance total)."""
-    since = int(time.time()) - 86400
+    since = max(int(time.time()) - 86400, _pnl_reset_floor())
     with db() as conn:
         row = conn.execute(
             """
@@ -177,7 +189,10 @@ def _daily_pnl_grid_all() -> float:
 
 
 def _total_pnl_grid(symbol: str | None = None) -> float:
-    """Suma pnl_usdc total grid_bot. Si symbol=None → todos."""
+    """Suma pnl_usdc total grid_bot. Si symbol=None → todos.
+    Respeta pnl_reset_at floor.
+    """
+    floor = _pnl_reset_floor()
     with db() as conn:
         if symbol:
             row = conn.execute(
@@ -185,17 +200,19 @@ def _total_pnl_grid(symbol: str | None = None) -> float:
                 SELECT COALESCE(SUM(pnl_usdc), 0) AS p
                 FROM binance_orders
                 WHERE strategy='grid_bot' AND symbol=? AND status='FILLED'
-                  AND pnl_usdc IS NOT NULL
+                  AND pnl_usdc IS NOT NULL AND filled_at >= ?
                 """,
-                (symbol,),
+                (symbol, floor),
             ).fetchone()
         else:
             row = conn.execute(
                 """
                 SELECT COALESCE(SUM(pnl_usdc), 0) AS p
                 FROM binance_orders
-                WHERE strategy='grid_bot' AND status='FILLED' AND pnl_usdc IS NOT NULL
+                WHERE strategy='grid_bot' AND status='FILLED'
+                  AND pnl_usdc IS NOT NULL AND filled_at >= ?
                 """,
+                (floor,),
             ).fetchone()
     try:
         return float(row["p"] or 0)
