@@ -588,9 +588,10 @@ def api_strategies_status() -> dict:
         """
         SELECT
           SUM(CASE WHEN status IN ('open','filled') THEN 1 ELSE 0 END) AS open_n,
-          COALESCE(SUM(CASE WHEN status='closed' AND filled_at >= ?
+          COALESCE(SUM(CASE WHEN status IN ('closed','settled') AND filled_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status='closed' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          COALESCE(SUM(CASE WHEN status IN ('closed','settled')
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(filled_at, created_at)) AS last_at
         FROM mm_orders
         """,
