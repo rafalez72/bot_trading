@@ -698,6 +698,49 @@ async def run_loop(*, once: bool = False) -> None:
                 except Exception as e:
                     log.exception("update_cluster_perf error: %s", e)
 
+            # Auto-undrop wallets cada 6h (2026-05-12): reactivar wallets
+            # dropeadas por loss_streak en últimas 6h con sizing_mult=0.5.
+            # Evita el ciclo vicioso: cambio threshold → drops por bad rows
+            # → bot inerte. Reactivación automática mantiene flow.
+            if cycle % max(1, 21600 // max(COPY_POLL_SECONDS, 1)) == 0:
+                try:
+                    from src.db.schema import tx as _tx
+                    from datetime import datetime, timedelta, timezone
+                    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+                    with db() as conn:
+                        rows = conn.execute(
+                            """
+                            SELECT wallet, stopped_at FROM copy_subscriptions
+                            WHERE status='dropped' AND stopped_at IS NOT NULL
+                            ORDER BY stopped_at DESC LIMIT 100
+                            """,
+                        ).fetchall()
+                    candidates = []
+                    for r in rows:
+                        ts_str = r["stopped_at"]
+                        if not ts_str:
+                            continue
+                        try:
+                            s = str(ts_str).replace("Z", "+00:00")
+                            ts = datetime.fromisoformat(s.split("+")[0]).replace(tzinfo=timezone.utc)
+                        except Exception:
+                            continue
+                        if ts >= cutoff:
+                            candidates.append(r["wallet"])
+                    if candidates:
+                        with _tx() as conn:
+                            for w in candidates:
+                                conn.execute(
+                                    "UPDATE copy_subscriptions "
+                                    "SET status='active', stopped_at=NULL, "
+                                    "sizing_mult=0.5, reason='auto-undrop 6h cron' "
+                                    "WHERE wallet=?",
+                                    (w,),
+                                )
+                        log.info("auto-undrop: reactivated %d wallets", len(candidates))
+                except Exception as e:
+                    log.warning("auto-undrop cron err: %s", e)
+
             # Reconciliador on-chain (cada ~5 min) — detecta trades fantasma
             # (BUYs ejecutados sin row en live_trades) y los trackea.
             # CRÍTICO: previene pérdidas como las del 2026-05-05.

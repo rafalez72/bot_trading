@@ -350,10 +350,10 @@ SPIKE_ARB_LIMIT_TTL_S = int(os.getenv("SPIKE_ARB_LIMIT_TTL_S", "60"))
 _ADV_DEFAULT = "false" if LIVE_MODE else "true"
 ADVERSARIAL_ENABLED = os.getenv("ADVERSARIAL_ENABLED", _ADV_DEFAULT).lower() == "true"
 ADVERSARIAL_MAX_SECS_TO_CLOSE = float(os.getenv("ADVERSARIAL_MAX_SECS_TO_CLOSE", "60"))
-# 2026-05-11: bajado 0.85→0.75. Adversarial 0 ops 30h con 0.85 — threshold
-# muy conservador. Con 0.75 captura más buckets pre-close (lado loser
-# probable >0.75 prob = lado ganador). Más false positives pero más signal.
-ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.75"))
+# 2026-05-12: bajado 0.75 → 0.65. Sigue sin disparar señales con 0.75.
+# 0.65 = lado opuesto p_winner >= 65% — más permisivo, más buckets eligibles
+# pre-close para postear ask basura.
+ADVERSARIAL_MIN_LOSER_PROB = float(os.getenv("ADVERSARIAL_MIN_LOSER_PROB", "0.65"))
 ADVERSARIAL_ASK_PRICE = float(os.getenv("ADVERSARIAL_ASK_PRICE", "0.05"))
 ADVERSARIAL_SIZE_USDC = float(os.getenv("ADVERSARIAL_SIZE_USDC", "2.0"))
 

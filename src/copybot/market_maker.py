@@ -267,12 +267,12 @@ def _simulate_paper_fills(since_ts: int) -> list[dict]:
         with _db() as conn:
             rows = conn.execute(
                 """
-                SELECT m.order_id, m.side, m.price, m.condition_id, mk.outcome_prices
+                SELECT m.order_id, m.side, m.price, m.condition_id,
+                       m.created_at, mk.outcome_prices
                 FROM mm_orders m
                 LEFT JOIN markets mk ON mk.condition_id = m.condition_id
                 WHERE m.status='open' AND m.order_id IS NOT NULL
-                  AND mk.outcome_prices IS NOT NULL
-                LIMIT 500
+                LIMIT 1000
                 """,
             ).fetchall()
     except Exception as e:
@@ -285,32 +285,40 @@ def _simulate_paper_fills(since_ts: int) -> list[dict]:
             order_id = r["order_id"]
             side = r["side"]
             limit_price = float(r["price"] or 0)
-            op_raw = r["outcome_prices"]
-            if isinstance(op_raw, str):
-                try:
-                    op = _j.loads(op_raw)
-                except Exception:
-                    continue
-            elif isinstance(op_raw, list):
-                op = op_raw
+            created_at = int(r["created_at"] or 0)
+            age = now - created_at if created_at else 0
+            # Fill prob por age (sin requerir outcome_prices). Markets MM en
+            # sports/politics: avg time to fill ~30-300s. Probability accordingly:
+            if age < 60:
+                fill_prob = 0.02
+            elif age < 300:
+                fill_prob = 0.04
+            elif age < 1800:
+                fill_prob = 0.06
             else:
-                continue
-            if not (isinstance(op, list) and len(op) >= 1):
-                continue
-            try:
-                mid_yes = float(op[0])
-            except (TypeError, ValueError):
-                continue
-            # BUY fillea si mid baja al/cruza nuestro bid
-            crossed = False
-            if side == "BUY" and mid_yes <= limit_price:
-                crossed = True
-            elif side == "SELL" and mid_yes >= limit_price:
-                crossed = True
-            if not crossed:
-                continue
-            # 50% probability fill por cycle (compite con otros bots)
-            if _rand.random() > 0.5:
+                fill_prob = 0.08
+            # Boost si outcome_prices indica cruce del limit
+            op_raw = r["outcome_prices"]
+            if op_raw:
+                try:
+                    if isinstance(op_raw, str):
+                        op = _j.loads(op_raw)
+                    elif isinstance(op_raw, list):
+                        op = op_raw
+                    else:
+                        op = None
+                    if isinstance(op, list) and len(op) >= 1:
+                        mid_yes = float(op[0])
+                        crossed = False
+                        if side == "BUY" and mid_yes <= limit_price:
+                            crossed = True
+                        elif side == "SELL" and mid_yes >= limit_price:
+                            crossed = True
+                        if crossed:
+                            fill_prob = min(0.6, fill_prob + 0.4)
+                except Exception:
+                    pass
+            if _rand.random() > fill_prob:
                 continue
             out.append({
                 "order_id": order_id,
