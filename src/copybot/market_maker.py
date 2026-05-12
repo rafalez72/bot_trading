@@ -233,14 +233,197 @@ def get_fills_since(since_ts: int) -> list[dict]:
     hace 1) SDK `get_trades(after=ts)` y 2) fallback a data-api directo
     con el funder address. Filtra client-side por timestamp.
 
-    Paper mode: [] (no hay fills reales — los tests inyectan vía fills_fn).
+    Paper mode (2026-05-11): simula fills probabilísticamente leyendo
+    outcome_prices actual del market y aplicando fill_prob estocástico
+    por cada mm_order open. Permite validar edge MM antes de live.
     """
     from src.config import LIVE_MODE
     if LIVE_MODE:
         from src.polymarket.clob_client import get_fills_since as clob_fills
         return clob_fills(since_ts)
-    log.debug("[MM-STUB] get_fills_since since=%d → []", since_ts)
-    return []
+    # Paper mode: simulación de fills
+    return _simulate_paper_fills(since_ts)
+
+
+def _simulate_paper_fills(since_ts: int) -> list[dict]:
+    """Simulador de fills MM en paper.
+
+    Por cada mm_order open:
+    - Lee mid_yes del market (outcome_prices[0] de tabla markets local).
+    - BUY fillea si mid_yes <= our_bid_price (alguien vendió bajo nuestro bid).
+    - SELL fillea si mid_yes >= our_ask_price (alguien compró sobre nuestro ask).
+    - Probabilidad fill 50% por cycle cuando el precio cruza el limit
+      (simula competencia con otros bots en el orderbook).
+
+    Returns list de {order_id, fill_price, filled_at} para que
+    `_handle_fills` los persista en mm_orders.
+    """
+    import json as _j
+    import random as _rand
+    from src.db.schema import db as _db
+
+    out: list[dict] = []
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.order_id, m.side, m.price, m.condition_id, mk.outcome_prices
+                FROM mm_orders m
+                LEFT JOIN markets mk ON mk.condition_id = m.condition_id
+                WHERE m.status='open' AND m.order_id IS NOT NULL
+                  AND mk.outcome_prices IS NOT NULL
+                LIMIT 500
+                """,
+            ).fetchall()
+    except Exception as e:
+        log.debug("mm.simulate_paper_fills query failed: %s", e)
+        return []
+
+    now = int(time.time())
+    for r in rows:
+        try:
+            order_id = r["order_id"]
+            side = r["side"]
+            limit_price = float(r["price"] or 0)
+            op_raw = r["outcome_prices"]
+            if isinstance(op_raw, str):
+                try:
+                    op = _j.loads(op_raw)
+                except Exception:
+                    continue
+            elif isinstance(op_raw, list):
+                op = op_raw
+            else:
+                continue
+            if not (isinstance(op, list) and len(op) >= 1):
+                continue
+            try:
+                mid_yes = float(op[0])
+            except (TypeError, ValueError):
+                continue
+            # BUY fillea si mid baja al/cruza nuestro bid
+            crossed = False
+            if side == "BUY" and mid_yes <= limit_price:
+                crossed = True
+            elif side == "SELL" and mid_yes >= limit_price:
+                crossed = True
+            if not crossed:
+                continue
+            # 50% probability fill por cycle (compite con otros bots)
+            if _rand.random() > 0.5:
+                continue
+            out.append({
+                "order_id": order_id,
+                "fill_price": limit_price,
+                "filled_at": now,
+            })
+        except Exception as e:
+            log.debug("mm.simulate_paper_fills row_err: %s", e)
+            continue
+    if out:
+        log.info("mm.paper_fills_simulated count=%d", len(out))
+        # Después de simular fills, matchear round trips (BUY+SELL del mismo
+        # cid filled) → settle como round trip (sin esperar resolución market).
+        try:
+            _match_round_trips_paper()
+        except Exception as e:
+            log.debug("mm.match_round_trips err: %s", e)
+    return out
+
+
+def _match_round_trips_paper() -> int:
+    """Matchea BUY+SELL filled del mismo condition_id → calc PnL + settle.
+
+    En MM, cuando ambas patas se llenan, captura el spread:
+        PnL = (sell_price - buy_price) * shares - 2*fee
+    No requiere resolución on-chain del market.
+
+    Solo opera en paper (en live, settle_bucket espera la resolución).
+
+    Returns: número de round trips settled.
+    """
+    from src.config import LIVE_MODE
+    if LIVE_MODE:
+        return 0
+    from src.db.schema import db as _db, tx as _tx
+    n_settled = 0
+    fee_pct = 0.001  # 0.1% paper fee approximation
+    try:
+        with _db() as conn:
+            # Buscar cids con tanto BUY como SELL filled (y no settled)
+            rows = conn.execute(
+                """
+                SELECT condition_id
+                FROM mm_orders
+                WHERE status='filled'
+                GROUP BY condition_id
+                HAVING SUM(CASE WHEN side='BUY' THEN 1 ELSE 0 END) > 0
+                   AND SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END) > 0
+                LIMIT 50
+                """,
+            ).fetchall()
+        for r in rows:
+            cid = r["condition_id"]
+            try:
+                with _db() as conn:
+                    buy = conn.execute(
+                        "SELECT id, fill_price, size_usdc FROM mm_orders "
+                        "WHERE condition_id=? AND side='BUY' AND status='filled' "
+                        "ORDER BY filled_at ASC LIMIT 1",
+                        (cid,),
+                    ).fetchone()
+                    sell = conn.execute(
+                        "SELECT id, fill_price, size_usdc FROM mm_orders "
+                        "WHERE condition_id=? AND side='SELL' AND status='filled' "
+                        "ORDER BY filled_at ASC LIMIT 1",
+                        (cid,),
+                    ).fetchone()
+                if not (buy and sell):
+                    continue
+                buy_price = float(buy["fill_price"] or 0)
+                sell_price = float(sell["fill_price"] or 0)
+                # Size matched: min de los dos (shares aproximadas)
+                size_min = min(float(buy["size_usdc"] or 0), float(sell["size_usdc"] or 0))
+                if buy_price <= 0 or sell_price <= 0 or size_min <= 0:
+                    continue
+                shares = size_min / buy_price
+                gross = (sell_price - buy_price) * shares
+                fee = (buy_price + sell_price) * shares * fee_pct
+                pnl = gross - fee
+                with _tx() as conn:
+                    conn.execute(
+                        "UPDATE mm_orders SET pnl_usdc=?, status='settled' "
+                        "WHERE id IN (?, ?)",
+                        (pnl / 2, buy["id"], sell["id"]),
+                    )
+                n_settled += 1
+                # Notif Telegram
+                try:
+                    from src.copybot.notifier import send
+                    # Acumulado MM cross
+                    with _db() as c2:
+                        acum = c2.execute(
+                            "SELECT COALESCE(SUM(pnl_usdc), 0) AS p FROM mm_orders WHERE status='settled'"
+                        ).fetchone()
+                    acum_val = float(acum["p"] or 0) if acum else 0
+                    emoji = "💎" if pnl > 0 else "🔻"
+                    send(
+                        f"{emoji} *MM round trip*\n"
+                        f"cid: `{cid[:10]}...`\n"
+                        f"Buy ${buy_price:.4f} → Sell ${sell_price:.4f}\n"
+                        f"PnL: ${pnl:+.4f} (gross ${gross:+.4f} - fee ${fee:.4f})\n"
+                        f"Acumulado MM: ${acum_val:+.2f}"
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                log.debug("mm.match_round_trip cid_err: %s", e)
+                continue
+    except Exception as e:
+        log.debug("mm.match_round_trips_err: %s", e)
+    if n_settled > 0:
+        log.info("mm.round_trips_settled n=%d", n_settled)
+    return n_settled
 
 
 # --------------------------------------------------------------------------- #
