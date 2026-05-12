@@ -154,6 +154,93 @@ def api_wallets_reactivate_recent(
     return {"reactivated": len(wallets), "wallets": wallets}
 
 
+@app.get("/api/admin/binance/balance")
+def api_binance_balance() -> dict:
+    """Lee balances reales del exchange (requiere BINANCE_API_KEY).
+
+    Útil para verificar saldo pre-live + post-trades. En paper retorna
+    los balances virtuales del paper client.
+    """
+    import asyncio as _aio
+    has_key = bool(os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET"))
+    paper_mode = os.getenv("GRID_BOT_PAPER", "true").lower() == "true"
+    out = {"configured": has_key, "paper_mode": paper_mode, "balances": {}}
+    if paper_mode or not has_key:
+        # Paper: no podemos consultar balance virtual sin acceso al instance,
+        # devolvemos config esperado.
+        out["balances"]["USDT_paper"] = float(os.getenv("GRID_BOT_PAPER_USDT", "400"))
+        return out
+    # Real: query Binance API
+    async def _fetch():
+        from src.binance.spot_client import BinanceSpotClient
+        async with BinanceSpotClient() as c:
+            return await c.get_account()
+    try:
+        acc = _aio.run(_fetch())
+        for b in acc.get("balances", []):
+            try:
+                free = float(b.get("free", 0))
+                if free > 0:
+                    out["balances"][b.get("asset")] = free
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
+@app.get("/api/admin/preflight-live")
+def api_preflight_live() -> dict:
+    """Audit pre-live: verifica que todo esté listo para activar real money.
+
+    Checks:
+    - BINANCE_API_KEY + SECRET presentes
+    - GRID_BOT_DAILY_LOSS_CAP configurado
+    - Strategies actuales operando bien (paper PnL acumulado positivo)
+    - Kill switch off
+    - Capital balance esperado vs configurado
+    """
+    import time as _t
+    checks = []
+    has_key = bool(os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET"))
+    checks.append({"name": "binance_api_key", "ok": has_key,
+                   "detail": "Presente" if has_key else "Falta BINANCE_API_KEY/SECRET en .env"})
+    paper_mode = os.getenv("GRID_BOT_PAPER", "true").lower() == "true"
+    checks.append({"name": "currently_paper", "ok": paper_mode,
+                   "detail": f"GRID_BOT_PAPER={paper_mode}"})
+    daily_cap = float(os.getenv("GRID_BOT_DAILY_LOSS_CAP", "40"))
+    checks.append({"name": "daily_loss_cap_safe", "ok": daily_cap <= 100,
+                   "detail": f"${daily_cap} (recomendado <=10% del capital)"})
+    # Kill switch
+    try:
+        from src.copybot.risk import kill_switch_status
+        ks = kill_switch_status()
+        checks.append({"name": "kill_switch_off", "ok": not ks.get("active"),
+                       "detail": ks.get("reason", "") or "off"})
+    except Exception as e:
+        checks.append({"name": "kill_switch_off", "ok": False, "detail": str(e)})
+    # PnL paper acumulado debe ser positivo (validación 24h+)
+    try:
+        from src.copybot.validation import _total_pnl_since
+        with db() as conn:
+            since_24h = int(_t.time()) - 86400
+            pnl_24h = _total_pnl_since(conn, since_24h)
+        checks.append({"name": "pnl_24h_positive", "ok": pnl_24h > 0,
+                       "detail": f"${pnl_24h:+.2f} 24h"})
+    except Exception as e:
+        checks.append({"name": "pnl_24h_positive", "ok": False, "detail": str(e)})
+    all_ok = all(c["ok"] for c in checks)
+    return {
+        "ready_for_live": all_ok,
+        "checks": checks,
+        "recommendation": (
+            "Setear GRID_BOT_PAPER=false en .env y restart. Empezar con 1 symbol "
+            "$50 USDT antes de full $400."
+        ) if all_ok else "Resolver checks fallidos antes de live.",
+    }
+
+
 @app.post("/api/admin/pnl/reset")
 def api_pnl_reset() -> dict:
     """Reset acumulado PnL — setea bot_state.pnl_reset_at=now.

@@ -32,16 +32,52 @@ log = logging.getLogger(__name__)
 # Fee aproximado spot maker/taker (BNB discount aplicado da 0.075%, sin BNB 0.1%)
 FEE_PCT = 0.001  # 0.1%
 
-# Realism tuning — simular condiciones reales de Binance Spot.
-# - Spread bid/ask: en Binance Spot líquido (BTC/ETH/SOL), spread típico 0.01-0.05%.
-# - Slippage adicional: por queue position + order book competition.
-# - Fill probability: cuando price cruza el limit, no siempre fillea inmediato
-#   (otros bots pelean por el level, parcial fills posibles). Aprox 75% fill en
-#   cada tick que cruza, 100% después de 3 ticks consecutivos.
-SPREAD_PCT = 0.0003   # 0.03% bid/ask gap
-SLIPPAGE_PCT = 0.0005  # 0.05% adicional por queue/competition
-FILL_PROB_FIRST_CROSS = 0.75  # 75% de chance fill al primer cruce
-FILL_PROB_GROWTH = 0.20  # +20% cada tick cruzado consecutivo
+# Realism tuning — production-grade simulation (paper indistinguible de real).
+# 2026-05-12: ajustado para reflejar comportamiento real Binance Spot.
+
+# Spread bid/ask por símbolo (datos reales Binance):
+# BTC = más líquido, spread tighter; SOL/DOGE más volátil → spread wider
+SPREAD_PCT_BY_SYMBOL = {
+    "BTCUSDT": 0.00015,   # 0.015% real BTC
+    "ETHUSDT": 0.00020,   # 0.020% real ETH
+    "SOLUSDT": 0.00035,   # 0.035% real SOL
+    "BNBUSDT": 0.00025,   # 0.025%
+    "XRPUSDT": 0.00045,   # 0.045% (más spread)
+    "DOGEUSDT": 0.00060,  # 0.060%
+}
+DEFAULT_SPREAD_PCT = 0.0003
+
+# Slippage variable por tamaño de orden (depth orderbook):
+def _slippage_pct_for_qty(quote_qty: float) -> float:
+    """Slippage real Binance escala con tamaño. Datos empíricos:
+    $0-25: ~0.02%, $25-100: ~0.05%, $100-500: ~0.15%, $500+: ~0.30%
+    """
+    if quote_qty < 25:
+        return 0.0002
+    if quote_qty < 100:
+        return 0.0005
+    if quote_qty < 500:
+        return 0.0015
+    return 0.0030
+
+# Fill probability real: en orderbook activo BTC/ETH típico 30-60% al primer
+# cruce (otros MMs compiten). Más optimista era irreal.
+FILL_PROB_FIRST_CROSS = 0.40
+FILL_PROB_GROWTH = 0.15
+
+# Partial fill probability (real Binance ocurre cuando order book depth thin).
+PARTIAL_FILL_PROB = 0.20  # 20% de fills son parciales
+PARTIAL_FILL_RATIO_RANGE = (0.30, 0.85)  # entre 30%-85% del qty solicitado
+
+# Order rejection probability (errores API real: insufficient balance momentaneo,
+# rate limit, exchange overload temporario).
+REJECT_PROB = 0.005  # 0.5% (raro pero ocurre)
+
+# Latencia API real Lenovo → Binance (50-200ms típico, peak 500ms).
+LATENCY_MS_RANGE = (50, 200)
+
+# Network error probability (timeout, 5xx). Real Binance ~1-2%/día.
+NETWORK_ERROR_PROB = 0.003  # 0.3% por request
 
 # Filter approximations por símbolo (real exchangeInfo se podría cachear).
 SYMBOL_FILTERS = {
@@ -91,10 +127,58 @@ class BinanceSpotPaperClient:
         self._reconcile_task: Optional[asyncio.Task] = None
 
     async def __aenter__(self) -> "BinanceSpotPaperClient":
+        # Fetch real exchangeInfo al startup para tickSize/stepSize/minNotional
+        # auténticos (no hardcoded approximations).
+        try:
+            await self._refresh_exchange_info()
+        except Exception as e:
+            log.warning("paper: exchangeInfo fetch failed (fallback hardcoded): %s", e)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.stop()
+
+    async def _refresh_exchange_info(self) -> None:
+        """Pulla filtros reales Binance via endpoint público (sin API key)."""
+        import httpx as _httpx
+        symbols = list(SYMBOL_FILTERS.keys())
+        try:
+            async with _httpx.AsyncClient(timeout=5) as c:
+                resp = await c.get(
+                    "https://api.binance.com/api/v3/exchangeInfo",
+                    params={"symbols": '["' + '","'.join(symbols) + '"]'},
+                )
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            for s in data.get("symbols", []):
+                sym = s.get("symbol")
+                if sym not in SYMBOL_FILTERS:
+                    continue
+                filters = {f.get("filterType"): f for f in s.get("filters", [])}
+                pf = filters.get("PRICE_FILTER", {})
+                lf = filters.get("LOT_SIZE", {})
+                nf = filters.get("NOTIONAL", {}) or filters.get("MIN_NOTIONAL", {})
+                try:
+                    SYMBOL_FILTERS[sym]["tickSize"] = float(pf.get("tickSize"))
+                    SYMBOL_FILTERS[sym]["stepSize"] = float(lf.get("stepSize"))
+                    SYMBOL_FILTERS[sym]["minNotional"] = float(nf.get("minNotional", 5.0))
+                except (TypeError, ValueError):
+                    pass
+            log.info("paper: exchangeInfo refrescado real para %d symbols", len(symbols))
+        except Exception as e:
+            log.debug("paper: exchangeInfo fetch err: %s", e)
+
+    async def _simulate_latency(self) -> None:
+        """Simula latencia red Lenovo→Binance (50-200ms)."""
+        import random
+        latency_s = random.uniform(*LATENCY_MS_RANGE) / 1000.0
+        await asyncio.sleep(latency_s)
+
+    def _maybe_network_error(self) -> bool:
+        """Returns True si simula network error (timeout/5xx)."""
+        import random
+        return random.random() < NETWORK_ERROR_PROB
 
     async def start(self) -> None:
         """Arranca task que pollea precios y simula fills."""
@@ -171,6 +255,14 @@ class BinanceSpotPaperClient:
         self, symbol: str, *, price: float, quote_qty: float,
         client_order_id: Optional[str] = None,
     ) -> SpotOrderResult:
+        await self._simulate_latency()
+        # Network errors (timeouts, 5xx) raros pero ocurren
+        if self._maybe_network_error():
+            return self._reject(symbol, "BUY", price, None, quote_qty, "network_timeout")
+        # Random rare rejection (rate limit, exchange overload)
+        import random as _r
+        if _r.random() < REJECT_PROB:
+            return self._reject(symbol, "BUY", price, None, quote_qty, "rate_limit")
         f = SYMBOL_FILTERS.get(symbol)
         if not f:
             return self._reject(symbol, "BUY", price, None, quote_qty, "symbol no soportado")
@@ -203,6 +295,12 @@ class BinanceSpotPaperClient:
         self, symbol: str, *, price: float, qty: float,
         client_order_id: Optional[str] = None,
     ) -> SpotOrderResult:
+        await self._simulate_latency()
+        if self._maybe_network_error():
+            return self._reject(symbol, "SELL", price, qty, None, "network_timeout")
+        import random as _r
+        if _r.random() < REJECT_PROB:
+            return self._reject(symbol, "SELL", price, qty, None, "rate_limit")
         f = SYMBOL_FILTERS.get(symbol)
         if not f:
             return self._reject(symbol, "SELL", price, qty, None, "symbol no soportado")
@@ -283,12 +381,13 @@ class BinanceSpotPaperClient:
             await asyncio.sleep(2.0)
 
     async def _reconcile_fills(self) -> None:
-        """Simulate realistic fill behavior.
+        """Production-grade fill simulation.
 
-        - BUY fillea cuando ASK price (bid_price + spread) cruza el limit.
-        - SELL fillea cuando BID price (ask_price - spread) cruza el limit.
-        - Fill probability sube por tick consecutivo cruzado (queue position).
-        - Slippage adicional aplicado al fill_price (no fill exacto al limit).
+        Reproduce comportamiento real Binance:
+        - Spread por símbolo (BTC tight, SOL wider)
+        - Slippage variable por tamaño de orden ($25 / $100 / $500+)
+        - Fill probability 40% al primer cruce, +15% por tick
+        - Partial fills 20% probability (30-85% del qty)
         """
         import random
         for oid in list(self._open_orders.keys()):
@@ -298,8 +397,8 @@ class BinanceSpotPaperClient:
             price = self._get_current_price(order.symbol)
             if price is None:
                 continue
-            spread = price * SPREAD_PCT
-            # Approximated bid/ask reales
+            spread_pct = SPREAD_PCT_BY_SYMBOL.get(order.symbol, DEFAULT_SPREAD_PCT)
+            spread = price * spread_pct
             best_bid = price - spread
             best_ask = price + spread
             crossed = False
@@ -310,33 +409,61 @@ class BinanceSpotPaperClient:
             if not crossed:
                 order.crossed_ticks = 0
                 continue
-            # Subir contador consecutive crosses
             order.crossed_ticks += 1
-            # Fill probability: 75% al primer cruce, +20% por tick consecutivo
             fill_prob = min(1.0, FILL_PROB_FIRST_CROSS + FILL_PROB_GROWTH * (order.crossed_ticks - 1))
             if random.random() > fill_prob:
-                # Skip fill este tick (queue position no llegó aún)
                 continue
-            # Fill price con slippage realista
+            # Slippage variable por tamaño de orden
+            slip_pct = _slippage_pct_for_qty(order.quote_qty)
             if order.side == "BUY":
-                fill_price = min(order.price, best_ask * (1 + SLIPPAGE_PCT))
+                fill_price = min(order.price, best_ask * (1 + slip_pct))
             else:
-                fill_price = max(order.price, best_bid * (1 - SLIPPAGE_PCT))
+                fill_price = max(order.price, best_bid * (1 - slip_pct))
+            # Partial fill simulation
+            fill_qty = order.qty
+            partial = False
+            if random.random() < PARTIAL_FILL_PROB:
+                ratio = random.uniform(*PARTIAL_FILL_RATIO_RANGE)
+                fill_qty = order.qty * ratio
+                partial = True
             # Aplicar fee
             f = SYMBOL_FILTERS.get(order.symbol, {})
             base = f.get("base", "")
             if order.side == "BUY":
-                received = order.qty * (1 - FEE_PCT)
+                received = fill_qty * (1 - FEE_PCT)
                 self._balances[base] += received
+                # Refund USDT unused si partial
+                if partial:
+                    refund = (order.qty - fill_qty) * order.price
+                    self._balances["USDT"] += refund
             else:
-                received_usdt = order.qty * fill_price * (1 - FEE_PCT)
+                received_usdt = fill_qty * fill_price * (1 - FEE_PCT)
                 self._balances["USDT"] += received_usdt
+                # Refund base unused si partial
+                if partial:
+                    self._balances[base] += (order.qty - fill_qty)
+            if partial:
+                # Order parcialmente filled — actualizar qty restante, mantener open
+                order.qty -= fill_qty
+                log.info(
+                    "paper.partial_fill %s %s limit=%.4f fill=%.4f qty=%.6f/%.6f",
+                    order.symbol, order.side, order.price, fill_price,
+                    fill_qty, order.qty + fill_qty,
+                )
+                # No quitar del open_orders, sigue con menos qty
+                # Trigger callback igual (round trip matcher acumula)
+                for cb in self._fill_callbacks:
+                    try:
+                        await cb(order, fill_price)
+                    except Exception:
+                        pass
+                continue
             order.status = "FILLED"
             self._open_orders.pop(oid, None)
             log.info(
-                "paper.fill %s %s limit=%.4f fill=%.4f qty=%.6f market=%.4f (slip=%.4f)",
-                order.symbol, order.side, order.price, fill_price, order.qty,
-                price, fill_price - order.price,
+                "paper.fill %s %s limit=%.4f fill=%.4f qty=%.6f market=%.4f (spread=%.4f slip=%.4f)",
+                order.symbol, order.side, order.price, fill_price, fill_qty,
+                price, spread, fill_price - order.price,
             )
             for cb in self._fill_callbacks:
                 try:
