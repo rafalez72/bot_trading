@@ -287,13 +287,7 @@ class GridBot:
             self.config.symbol, low, high, len(levels), step,
             self.config.quote_per_level_usdt,
         )
-        _notify(
-            f"🟦 *Grid Bot* arrancado\n"
-            f"Symbol: `{self.config.symbol}`\n"
-            f"Range: ${low:.2f}–${high:.2f}\n"
-            f"Levels: {len(levels)} (step ${step:.2f})\n"
-            f"Bet/level: ${self.config.quote_per_level_usdt:.2f} USDT"
-        )
+        # Notif arranque silenciado (modo limpio: solo gain/loss + acumulado)
 
     async def _post_initial_buys(self) -> None:
         """Postea BUY en cada nivel <= mid (debajo del precio actual)."""
@@ -394,17 +388,8 @@ class GridBot:
                     fill_qty=qty, filled_at=now,
                 )
                 del self.state.buy_orders[idx]
-                # Acumulados Binance (cross-symbols) para visibilidad
-                bin_24h = _daily_pnl_grid_all()
-                bin_total = _total_pnl_grid()
-                _notify(
-                    f"🟢 *Grid BUY filled*\n"
-                    f"Symbol: `{self.config.symbol}`\n"
-                    f"Level: {idx} · Price: ${buy_price:.2f}\n"
-                    f"Qty: {qty:.6f} · Notional: ${self.config.quote_per_level_usdt:.2f}\n"
-                    f"PnL trade: $0 (pendiente sell)\n"
-                    f"Acumulado Binance 24h: ${bin_24h:+.2f} · Total: ${bin_total:+.2f}"
-                )
+                # Notif BUY filled silenciado (no es gain/loss — sólo apertura).
+                # Solo round trip cerrado dispara notif Telegram.
                 # Postear SELL al nivel siguiente arriba
                 if idx + 1 < len(self.state.levels):
                     sell_price = self.state.levels[idx + 1]
@@ -431,14 +416,10 @@ class GridBot:
                 # Acumulado Binance global (cross-symbols) — incluye este fill
                 bin_24h = _daily_pnl_grid_all()
                 bin_total = _total_pnl_grid()
-                sym_24h = _daily_pnl_grid(self.config.symbol)
+                word = "Ganó" if pnl_net > 0 else "Perdió"
                 _notify(
-                    f"{emoji} *Grid round trip cerrado*\n"
-                    f"Symbol: `{self.config.symbol}` lvl {idx-1}→{idx}\n"
-                    f"Buy ${buy_price:.2f} → Sell ${sell_price:.2f}\n"
-                    f"PnL trade: ${pnl_net:+.4f} (gross ${pnl:+.4f} - fee ${fee:.4f})\n"
-                    f"{self.config.symbol} 24h: ${sym_24h:+.2f}\n"
-                    f"Acumulado Binance 24h: ${bin_24h:+.2f} · Total: ${bin_total:+.2f}"
+                    f"{emoji} *Grid {self.config.symbol}*: {word} ${abs(pnl_net):.4f}\n"
+                    f"Acumulado Grid: ${bin_total:+.2f}"
                 )
                 # Re-postear BUY al nivel original
                 await self._place_buy_at(idx - 1, buy_price)

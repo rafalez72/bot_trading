@@ -433,10 +433,7 @@ def _match_round_trips_paper() -> int:
                     acum_val = float(acum["p"] or 0) if acum else 0
                     emoji = "💎" if pnl > 0 else "🔻"
                     send(
-                        f"{emoji} *MM round trip*\n"
-                        f"cid: `{cid[:10]}...`\n"
-                        f"Buy ${buy_price:.4f} → Sell ${sell_price:.4f}\n"
-                        f"PnL: ${pnl:+.4f} (gross ${gross:+.4f} - fee ${fee:.4f})\n"
+                        f"{emoji} MM: {'Ganó' if pnl > 0 else 'Perdió'} ${abs(pnl):.4f}\n"
                         f"Acumulado MM: ${acum_val:+.2f}"
                     )
                 except Exception:

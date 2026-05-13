@@ -111,11 +111,13 @@ class _SymbolState:
 
 
 def _notify(text: str) -> None:
-    try:
-        from src.copybot.notifier import send
-        send(text)
-    except Exception as e:
-        log.debug("signal_bot notify failed: %s", e)
+    """Signal bot notif desactivado (modo limpio).
+
+    Usuario: "solo ganado/perdido + acumulado MM". Las alertas
+    indicador (RSI, EMA cross, pumps) son ruido sin ganancia/pérdida
+    concreta. Silenciados — solo log para debugging.
+    """
+    log.debug("signal_bot notif (silenciado): %s", text[:80])
 
 
 class SignalBot:
