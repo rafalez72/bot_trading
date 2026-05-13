@@ -660,7 +660,17 @@ def api_strategies_status() -> dict:
     import os
     import time as _t
 
-    today_ts = int(_t.time()) - 86400
+    # Floor por pnl_reset_at — afecta pnl_total y pnl_24h en todas las queries.
+    try:
+        with db() as conn_f:
+            r = conn_f.execute(
+                "SELECT value FROM bot_state WHERE key='pnl_reset_at'"
+            ).fetchone()
+        reset_floor = int(r["value"]) if r else 0
+    except Exception:
+        reset_floor = 0
+
+    today_ts = max(int(_t.time()) - 86400, reset_floor)
 
     def _safe_query(q: str, params: tuple = ()) -> dict:
         """Devuelve {'open': n, 'pnl_24h': x, 'pnl_total': y, 'last_at': ts}
@@ -687,12 +697,12 @@ def api_strategies_status() -> dict:
           COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
                               AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
           COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
-                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+                              AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(exit_at, entry_at)) AS last_at
         FROM paper_trades
         WHERE source_wallet NOT IN ('crypto_arb', 'crypto_arb_hedge')
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     n1["enabled"] = True
 
@@ -704,12 +714,12 @@ def api_strategies_status() -> dict:
           COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
                               AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
           COALESCE(SUM(CASE WHEN status IN ('closed_win','closed_loss','settled_win','settled_loss')
-                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+                              AND exit_at >= ? THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(exit_at, entry_at)) AS last_at
         FROM paper_trades
         WHERE source_wallet='crypto_arb'
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     ca["enabled"] = os.getenv("CRYPTO_ARB_ENABLED", "false").lower() == "true"
     try:
@@ -731,12 +741,12 @@ def api_strategies_status() -> dict:
           SUM(CASE WHEN status IN ('open','filled') THEN 1 ELSE 0 END) AS open_n,
           COALESCE(SUM(CASE WHEN status IN ('closed','settled') AND filled_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status IN ('closed','settled')
+          COALESCE(SUM(CASE WHEN status IN ('closed','settled') AND filled_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(filled_at, created_at)) AS last_at
         FROM mm_orders
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     mm["enabled"] = os.getenv("MM_ENABLED", "false").lower() == "true"
 
@@ -747,11 +757,12 @@ def api_strategies_status() -> dict:
           SUM(CASE WHEN status IN ('open','posted','filled') THEN 1 ELSE 0 END) AS open_n,
           COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(closed_at, filled_at, signal_at)) AS last_at
         FROM spike_arb_trades
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     sa["enabled"] = os.getenv("SPIKE_ARB_ENABLED", "false").lower() == "true"
 
@@ -762,11 +773,12 @@ def api_strategies_status() -> dict:
           SUM(CASE WHEN status IN ('detected','posted','filled') THEN 1 ELSE 0 END) AS open_n,
           COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND filled_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND filled_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(filled_at, signal_at)) AS last_at
         FROM adversarial_orders
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     ad["enabled"] = os.getenv("ADVERSARIAL_ENABLED", "false").lower() == "true"
 
@@ -777,11 +789,12 @@ def api_strategies_status() -> dict:
           SUM(CASE WHEN status IN ('open','posted','filled') THEN 1 ELSE 0 END) AS open_n,
           COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
                               THEN pnl_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status LIKE 'closed%' THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
+          COALESCE(SUM(CASE WHEN status LIKE 'closed%' AND closed_at >= ?
+                              THEN pnl_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(closed_at, opened_at)) AS last_at
         FROM long_horizon_trades
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     lh["enabled"] = os.getenv("LONG_HORIZON_ENABLED", "false").lower() == "true"
 
@@ -792,11 +805,12 @@ def api_strategies_status() -> dict:
           SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_n,
           COALESCE(SUM(CASE WHEN status='closed' AND closed_at >= ?
                               THEN pnl_total_usdc ELSE 0 END), 0) AS pnl_24h,
-          COALESCE(SUM(CASE WHEN status='closed' THEN pnl_total_usdc ELSE 0 END), 0) AS pnl_total,
+          COALESCE(SUM(CASE WHEN status='closed' AND closed_at >= ?
+                              THEN pnl_total_usdc ELSE 0 END), 0) AS pnl_total,
           MAX(COALESCE(closed_at, opened_at)) AS last_at
         FROM hedge_trades
         """,
-        (today_ts,),
+        (today_ts, reset_floor),
     )
     # Hedge "enabled" refleja si efectivamente arrancó (mismo gate que runner.py):
     # requiere HEDGE_ENABLED=true Y BINANCE_API_KEY presente.
