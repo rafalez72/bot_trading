@@ -20,5 +20,10 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
 
+      # Instala el proyecto + extras de prod para auditar el set REAL de deps.
+      # (pip-audit ya no acepta --requirement pyproject.toml; audita el entorno.)
+      - name: Install project deps
+        run: pip install -e ".[live,postgres,analytics,dashboard]"
+
       - name: Run pip-audit (strict)
-        run: pip-audit --requirement pyproject.toml --strict
+        run: pip-audit --strict

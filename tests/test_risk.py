@@ -69,6 +69,24 @@ def test_kill_switch_activates_on_loss_threshold(isolated_db, now_ts):
     assert "PnL" in status["reason"]
 
 
+def test_kill_switch_total_loss_floor(isolated_db, now_ts):
+    """Layer 4 (total_loss_floor): pérdidas chicas acumuladas FUERA de la
+    ventana 24h, que ni el cap diario ni la racha consecutiva ven, pero que
+    suman bajo el piso total ($-8) → disparan el kill.
+
+    4 losses de -2.5 (=-$10) hace ~2 días: <5 → no dispara consecutive; fuera
+    de 24h → no dispara daily/legacy; pero acumulado -$10 <= -$8 → total_floor.
+    """
+    old = now_ts - 86400 * 2
+    for i in range(4):
+        _insert_closed_trade(pnl=-2.5, exit_at=old - i * 100)
+
+    assert risk.check_kill_switch() is True
+    status = risk.kill_switch_status()
+    assert status["active"] is True
+    assert "total_loss_floor" in status["reason"]
+
+
 def test_kill_switch_inactive_after_reset(isolated_db, now_ts):
     """Reset clears the active flag AND ignores pre-reset losses going forward."""
     # Activate via losses.

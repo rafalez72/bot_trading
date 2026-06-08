@@ -20,6 +20,7 @@ from src.config import (
     DAILY_LOSS_CAP_USDC,
     DATA_API,
     LIVE_CAPITAL_USDC,
+    LIVE_MAX_TOTAL_LOSS_USDC,
     LIVE_MODE,
     MAX_CONSECUTIVE_LOSSES,
     MAX_DRAWDOWN_PCT,
@@ -266,6 +267,29 @@ def _check_drawdown(now_ts: int, reset_at: int) -> tuple[bool, dict]:
     }
 
 
+def _check_total_loss_floor(now_ts: int, reset_at: int) -> tuple[bool, dict]:
+    """Layer 4: SUM(pnl) ACUMULADA desde `reset_at` <= -LIVE_MAX_TOTAL_LOSS_USDC.
+
+    A diferencia del layer 1 (daily_loss_cap, que se limpia cada 00:00 UTC),
+    suma TODO el período desde el último reset manual. Cierra el hueco del
+    sangrado lento multi-día: muchas pérdidas chicas que nunca disparan el cap
+    diario pero acumulan una pérdida total grande. `reset_at` actúa como
+    baseline — tras un reset (y re-fondeo) el conteo arranca de cero.
+    """
+    from src.copybot.validation import _total_pnl_since
+
+    with db() as conn:
+        pnl = _total_pnl_since(conn, reset_at)
+    threshold = -float(LIVE_MAX_TOTAL_LOSS_USDC)
+    triggered = pnl <= threshold
+    return triggered, {
+        "layer": "total_loss_floor",
+        "pnl": pnl,
+        "threshold": threshold,
+        "since": reset_at,
+    }
+
+
 def _format_layer_reason(ctx: dict) -> str:
     """Mensaje conciso por layer para guardar en bot_state.kill_switch_reason."""
     layer = ctx.get("layer", "?")
@@ -287,6 +311,11 @@ def _format_layer_reason(ctx: dict) -> str:
         return (
             f"drawdown: ${ctx['current']:.2f} vs peak ${ctx['peak']:.2f} "
             f"({ctx['dd_pct']*100:+.1f}%)"
+        )
+    if layer == "total_loss_floor":
+        return (
+            f"total_loss_floor: PnL acumulado ${ctx['pnl']:+.2f} "
+            f"<= ${ctx['threshold']:.2f}"
         )
     return f"{layer}: triggered"
 
@@ -321,6 +350,12 @@ def _notify_layer(ctx: dict, reason: str) -> None:
             f"Balance: ${ctx['current']:.2f} (peak ${ctx['peak']:.2f})\n"
             f"Drawdown: {ctx['dd_pct']*100:+.1f}% "
             f"(cap {ctx['threshold_pct']*100:.0f}%)"
+        )
+    elif layer == "total_loss_floor":
+        detail = (
+            f"layer={layer}\n"
+            f"PnL acumulado desde reset: ${ctx['pnl']:+.2f}\n"
+            f"Piso total: ${-ctx['threshold']:.2f}"
         )
     try:
         from src.copybot.notifier import kill_switch_activated
@@ -391,6 +426,7 @@ def check_kill_switch() -> bool:
             _check_daily_loss_cap,
             _check_consecutive_losses,
             _check_drawdown,
+            _check_total_loss_floor,
         ):
             triggered, ctx = checker(now_ts, reset_at)
             if triggered:
