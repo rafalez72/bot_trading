@@ -50,6 +50,11 @@ MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "3000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
+# Selección anti-survivorship: net PnL mínimo (realizado + NO-realizado) para
+# copiar un trader. El win_rate sobre solo-realizados engaña cuando el trader
+# aguanta perdedores ABIERTOS; este piso exige que el neto sea positivo.
+MIN_NET_PNL_USDC = float(os.getenv("MIN_NET_PNL_USDC", "0.0"))
+
 # ---------- Kill switch HARD 3-layer (2026-05-10) ----------
 # Tres layers complementarios al DAILY_KILL_SWITCH_PCT (que es % capital
 # rolling-24h). Estos son CAPS HARD adicionales y se evalúan en orden:
@@ -62,6 +67,13 @@ STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 DAILY_LOSS_CAP_USDC = float(os.getenv("DAILY_LOSS_CAP_USDC", "10.0"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.20"))
+#   4) Total loss floor (LIVE_MAX_TOTAL_LOSS_USDC): suma pnl ACUMULADA desde el
+#      último reset (NO se resetea cada día como el layer 1). Cierra el hueco de
+#      sangrado lento multi-día: muchas pérdidas chicas que nunca disparan el
+#      cap diario pero acumulan una pérdida total grande. Default $8: con balance
+#      ~$19 frena el drenaje antes de perder la mitad. Subí el baseline con un
+#      reset manual tras re-fondear.
+LIVE_MAX_TOTAL_LOSS_USDC = float(os.getenv("LIVE_MAX_TOTAL_LOSS_USDC", "8.0"))
 
 # Trailing stop: cuando la posición está +TRAIL_ACTIVATION_PCT en ganancia,
 # se activa el trailing. Si el precio cae TRAIL_DROP_PCT desde el peak,
