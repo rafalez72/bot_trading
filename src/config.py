@@ -50,6 +50,11 @@ MIN_MARKET_VOLUME_USDC = float(os.getenv("MIN_MARKET_VOLUME_USDC", "3000"))
 DAILY_KILL_SWITCH_PCT = float(os.getenv("DAILY_KILL_SWITCH_PCT", "0.10"))
 STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 
+# Selección anti-survivorship: net PnL mínimo (realizado + NO-realizado) para
+# copiar un trader. El win_rate sobre solo-realizados engaña cuando el trader
+# aguanta perdedores ABIERTOS; este piso exige que el neto sea positivo.
+MIN_NET_PNL_USDC = float(os.getenv("MIN_NET_PNL_USDC", "0.0"))
+
 # ---------- Kill switch HARD 3-layer (2026-05-10) ----------
 # Tres layers complementarios al DAILY_KILL_SWITCH_PCT (que es % capital
 # rolling-24h). Estos son CAPS HARD adicionales y se evalúan en orden:

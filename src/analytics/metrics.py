@@ -306,6 +306,12 @@ def composite_score(m: WalletMetrics) -> float:
         return 0.0
     if m.total_volume_usdc < 500:                 # ruido si vol < $500
         return 0.0
+    # Anti-survivorship: el win_rate sobre solo-realizados engaña si el trader
+    # aguanta perdedores ABIERTOS. Contamos el PnL no-realizado: si el neto
+    # (realizado + no-realizado) no supera el piso, no se copia.
+    from src.config import MIN_NET_PNL_USDC
+    if (m.realized_pnl_usdc + m.unrealized_pnl_usdc) <= MIN_NET_PNL_USDC:
+        return 0.0
     # ROI confiable solo si hubo cost basis razonable (>= $200 invertido en cerradas).
     # Si no, el ROI viene inflado por shares con cost-basis pre-cap (incompleto).
     # En ese caso usamos solo PnL absoluto + sharpe + win_rate para rankear.
@@ -330,7 +336,10 @@ def composite_score(m: WalletMetrics) -> float:
         + 0.10 * vol_c
         + 0.05 * dd_penalty
     )
-    return score
+    # Penalización por arrastre no-realizado: traders con perdedores ABIERTOS
+    # grandes (relativo a su ganancia realizada) bajan en el ranking. drag=0 → x1.
+    unrealized_drag = max(0.0, -m.unrealized_pnl_usdc) / max(m.realized_pnl_usdc, 1.0)
+    return score / (1.0 + unrealized_drag)
 
 
 # ---------------- batch / persistencia ----------------
