@@ -55,6 +55,12 @@ STOPLOSS_SWEEP_SECONDS = int(os.getenv("STOPLOSS_SWEEP_SECONDS", "60"))
 # aguanta perdedores ABIERTOS; este piso exige que el neto sea positivo.
 MIN_NET_PNL_USDC = float(os.getenv("MIN_NET_PNL_USDC", "0.0"))
 
+# Brick B — sesgo de selección por horizonte. Excluye scalpers (muchos
+# trades/día) que operan mercados ultra-cortos que el filtro de ejecución
+# (market_too_short) rechaza siempre → 0 copias. Sesga hacia traders de
+# horizonte más largo, copiables. 0 = desactivado. PROXY a tunear con paper.
+MAX_TRADES_PER_DAY = float(os.getenv("MAX_TRADES_PER_DAY", "40"))
+
 # ---------- Kill switch HARD 3-layer (2026-05-10) ----------
 # Tres layers complementarios al DAILY_KILL_SWITCH_PCT (que es % capital
 # rolling-24h). Estos son CAPS HARD adicionales y se evalúan en orden:

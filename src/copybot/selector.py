@@ -207,6 +207,17 @@ def _hft_bucket_recent_pnl(window_hours: int = 24) -> tuple[float, int]:
     return float(r["pnl"] or 0.0), int(r["n"] or 0)
 
 
+def _trades_per_day(metric: dict) -> float:
+    """Trades/día del trader. Usa el valor pre-computado (bucket HFT) o lo
+    deriva de total_trades / active_days (bucket clásico). Proxy de horizonte:
+    muy alto = scalper de mercado corto (no copiable)."""
+    tpd = metric.get("trades_per_day")
+    if tpd is not None:
+        return float(tpd)
+    days = max(1.0, float(metric.get("active_days") or metric.get("days_active") or 1))
+    return float(metric.get("total_trades") or 0) / days
+
+
 def select_traders(
     top_n: int = DEFAULT_TOP_N,
     *,
@@ -305,6 +316,26 @@ def select_traders(
                 cand_wallets.add(w)
                 cand_by_wallet[w] = hft
                 hft_only_wallets.add(w)
+
+    # Brick B: excluir scalpers de mercado corto. Operan mercados ultra-cortos
+    # que el filtro de ejecución (market_too_short) rechaza siempre → 0 copias.
+    # Proxy: trades_per_day. Sesga la selección hacia horizonte copiable.
+    from src.config import MAX_TRADES_PER_DAY
+    if MAX_TRADES_PER_DAY > 0:
+        excluded = {
+            w for w in cand_wallets
+            if _trades_per_day(cand_by_wallet[w]) > MAX_TRADES_PER_DAY
+        }
+        if excluded:
+            log.info(
+                "selección: %d scalpers excluidos (trades/día > %.0f)",
+                len(excluded), MAX_TRADES_PER_DAY,
+            )
+            cand_wallets -= excluded
+            for w in excluded:
+                cand_by_wallet.pop(w, None)
+                hft_only_wallets.discard(w)
+        summary["excluded_scalpers"] = len(excluded)
 
     with tx() as conn:
         # 1) Activar / promover candidatos
